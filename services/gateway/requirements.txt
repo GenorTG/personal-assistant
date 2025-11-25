@@ -1,0 +1,30 @@
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+httpx>=0.26.0
+aiohttp>=3.9.0
+python-multipart>=0.0.9
+websockets>=12.0
+pydantic>=2.6.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+aiofiles>=23.2.1
+
+# Database
+aiosqlite>=0.20.0
+
+# Memory/Embeddings (for chat context)
+sentence-transformers>=2.2.0
+chromadb>=0.4.0
+
+# LLM Client
+openai>=1.0.0
+
+# Utilities
+jsonschema>=4.0.0
+huggingface_hub>=0.20.0
+psutil>=5.9.0
+nvidia-ml-py>=12.535.0
+cryptography>=41.0.0
+pyttsx3>=2.90
+
