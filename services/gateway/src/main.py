@@ -47,8 +47,10 @@ chromadb_telemetry_logger.disabled = True
 logger.info("ChromaDB telemetry disabled")
 
 logger.info("Importing FastAPI and dependencies...")
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -78,8 +80,53 @@ app = FastAPI(
 )
 logger.info("FastAPI app created")
 
-# CORS middleware
+# CORS middleware - use a custom implementation for more reliable CORS handling
 import os
+
+class CORSMiddlewareCustom(BaseHTTPMiddleware):
+    """Custom CORS middleware that ensures headers are always present."""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Handle preflight OPTIONS requests
+        if request.method == "OPTIONS":
+            return Response(
+                content="",
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Credentials": "true",
+                    "Access-Control-Max-Age": "600",
+                }
+            )
+        
+        try:
+            response = await call_next(request)
+            # Add CORS headers to ALL responses
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            return response
+        except Exception as e:
+            # On any error, still return response with CORS headers
+            logger.error(f"Error in request: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={"detail": str(e)},
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Credentials": "true",
+                }
+            )
+
+# Add custom CORS middleware FIRST (before other middleware)
+app.add_middleware(CORSMiddlewareCustom)
+
+# Also keep the standard CORS middleware as a fallback
 cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
 if settings.debug:
     # In debug mode, allow all origins for development
@@ -93,11 +140,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add exception handler to ensure CORS headers on error responses
+@app.exception_handler(StarletteHTTPException)
+async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Handle HTTP exceptions with CORS headers."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle all uncaught exceptions with CORS headers."""
+    import traceback
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {str(exc)}"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
 # Add request logging middleware - completely suppress frequent polling endpoints
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     # Endpoints that are polled frequently - completely suppress logging
     QUIET_PATHS = [
-        "/api/settings",
+        # "/api/settings", # Enable logging for settings to debug issues
         "/api/voice/stt/settings",
         "/api/voice/tts/settings",
         "/api/conversations",
@@ -180,23 +256,8 @@ async def startup_event():
     logger.info(f"Total API routes found: {len(api_routes)}")
     logger.info("=" * 60)
     
-    # Check hardware acceleration status
-    try:
-        from .services.llm.cuda_installer import check_cuda_available, check_llama_cuda_support
-        cuda_available = check_cuda_available()
-        llama_cuda, error = check_llama_cuda_support()
-        
-        if cuda_available:
-            if llama_cuda:
-                logger.info("✅ Hardware Acceleration: CUDA detected and llama-cpp-python supports it.")
-            else:
-                logger.warning("⚠️  PERFORMANCE WARNING: CUDA GPU detected but llama-cpp-python is NOT using it!")
-                logger.warning(f"   Reason: {error}")
-                logger.warning("   Run 'backend/scripts/install_dependencies.py' to fix this.")
-        else:
-            logger.info("ℹ️  Hardware Acceleration: No CUDA GPU detected. Running in CPU mode.")
-    except Exception as e:
-        logger.error(f"Failed to check hardware acceleration: {e}")
+    # Note: CUDA detection is handled by the LLM service, not the gateway
+    # The gateway just proxies requests to the LLM service
 
     logger.info("Initializing services (this may take a moment)...")
     from .services.service_manager import service_manager

@@ -13,12 +13,16 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 import json
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 
 class ModelInfoExtractor:
-    """Extract metadata from LLM model files."""
+    """Extract metadata from LLM model files.
+    
+    Optimized with caching to avoid repeated file I/O and GGUF parsing.
+    """
     
     # Architecture name mappings
     ARCH_NAMES = {
@@ -35,6 +39,10 @@ class ModelInfoExtractor:
     
     def __init__(self, models_dir: Path):
         self.models_dir = Path(models_dir)
+        # Cache for model info to avoid repeated extraction
+        self._info_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_timestamps: Dict[str, float] = {}
+        self._cache_ttl = 3600  # Cache for 1 hour
     
     def _parse_param_count(self, model_name: str) -> Optional[str]:
         """Extract parameter count from model name (e.g., '7B', '13B')."""
@@ -71,24 +79,71 @@ class ModelInfoExtractor:
         
         return "Unknown"
     
-    def _detect_moe(self, config: Dict) -> Optional[Dict[str, Any]]:
-        """Detect if model is MoE and extract expert configuration."""
-        if not config:
-            return None
+    def _detect_moe(self, config: Dict, model_name: str = "") -> Optional[Dict[str, Any]]:
+        """Detect if model is MoE and extract expert configuration.
         
-        # Check for MoE indicators
-        num_experts = config.get("num_local_experts") or config.get("num_experts")
-        experts_per_tok = config.get("num_experts_per_tok")
+        Enhanced detection that checks:
+        1. Config file (num_local_experts, num_experts)
+        2. Model name patterns (8x7B, etc.)
+        3. Architecture name (mixtral, etc.)
         
-        if num_experts and num_experts > 1:
-            return {
-                "is_moe": True,
-                "num_experts": num_experts,
-                "experts_per_token": experts_per_tok or 2,
-                "router_aux_loss_coef": config.get("router_aux_loss_coef", 0.001)
-            }
+        Args:
+            config: Model config dictionary
+            model_name: Model name for pattern matching
+            
+        Returns:
+            MoE info dictionary with is_moe, num_experts, experts_per_token
+        """
+        moe_info = {"is_moe": False}
         
-        return {"is_moe": False}
+        # Check config first (most reliable)
+        if config:
+            num_experts = config.get("num_local_experts") or config.get("num_experts")
+            experts_per_tok = config.get("num_experts_per_tok")
+            
+            if num_experts and num_experts > 1:
+                moe_info = {
+                    "is_moe": True,
+                    "num_experts": num_experts,
+                    "experts_per_token": experts_per_tok or 2,
+                    "router_aux_loss_coef": config.get("router_aux_loss_coef", 0.001)
+                }
+                return moe_info
+        
+        # Check model name for MoE patterns (e.g., 8x7B, mixtral)
+        if model_name:
+            import re
+            model_lower = model_name.lower()
+            
+            # Check for MoE architecture names
+            if "mixtral" in model_lower:
+                # Mixtral is always MoE (8x7B typically)
+                moe_info = {
+                    "is_moe": True,
+                    "num_experts": 8,  # Default for Mixtral
+                    "experts_per_token": 2,
+                    "router_aux_loss_coef": 0.001
+                }
+                # Try to extract actual expert count from name
+                expert_match = re.search(r'(\d+)x(\d+)', model_name, re.IGNORECASE)
+                if expert_match:
+                    moe_info["num_experts"] = int(expert_match.group(1))
+                return moe_info
+            
+            # Check for NxM pattern (e.g., 8x7B, 4x3B)
+            expert_pattern = re.search(r'(\d+)x(\d+)', model_name, re.IGNORECASE)
+            if expert_pattern:
+                num_experts = int(expert_pattern.group(1))
+                if num_experts > 1:
+                    moe_info = {
+                        "is_moe": True,
+                        "num_experts": num_experts,
+                        "experts_per_token": 2,  # Default
+                        "router_aux_loss_coef": 0.001
+                    }
+                    return moe_info
+        
+        return moe_info
     
     def _get_context_length(self, config: Dict) -> int:
         """Extract max context length from config."""
@@ -159,7 +214,7 @@ class ModelInfoExtractor:
                 else:
                     info["parameters"] = f"{param_count / 1e6:.1f}M"
             
-            # MoE Info
+            # MoE Info - Enhanced detection from GGUF
             moe_info = {"is_moe": False}
             expert_count_key = f"{arch_key}.expert_count"
             if expert_count_key in reader.fields:
@@ -168,12 +223,20 @@ class ModelInfoExtractor:
                     moe_info = {
                         "is_moe": True,
                         "num_experts": count,
-                        "experts_per_token": 2 # Default, hard to extract sometimes
+                        "experts_per_token": 2  # Default, hard to extract sometimes
                     }
                     # Try to find experts used count
                     used_key = f"{arch_key}.expert_used_count"
                     if used_key in reader.fields:
                         moe_info["experts_per_token"] = int(reader.fields[used_key].parts[-1][0])
+            else:
+                # Fallback: check architecture name for MoE models
+                if "mixtral" in arch_key.lower():
+                    moe_info = {
+                        "is_moe": True,
+                        "num_experts": 8,  # Default for Mixtral
+                        "experts_per_token": 2
+                    }
             info["moe"] = moe_info
             
             # Layer count
@@ -195,16 +258,26 @@ class ModelInfoExtractor:
             logger.error(f"Error reading GGUF metadata: {e}")
             return {}
 
-    def extract_info(self, model_name: str) -> Dict[str, Any]:
+    def extract_info(self, model_name: str, use_cache: bool = True) -> Dict[str, Any]:
         """
         Extract comprehensive model information.
         
+        Optimized with caching to avoid repeated file I/O.
+        
         Args:
             model_name: Name of the model (folder name or file name)
+            use_cache: Whether to use cached results (default: True)
             
         Returns:
             Dict with model metadata
         """
+        # Check cache first
+        if use_cache and model_name in self._info_cache:
+            cache_time = self._cache_timestamps.get(model_name, 0)
+            if time.time() - cache_time < self._cache_ttl:
+                logger.debug(f"Using cached model info for {model_name}")
+                return self._info_cache[model_name].copy()
+        
         model_path = self.models_dir / model_name
         
         # Load config if available (for HF models)
@@ -220,7 +293,11 @@ class ModelInfoExtractor:
         # Extract information (prioritize GGUF info, fallback to config/name)
         architecture = gguf_info.get("architecture") or self._detect_architecture(model_name, config)
         param_count = gguf_info.get("parameters") or self._parse_param_count(model_name)
-        moe_info = gguf_info.get("moe") or (self._detect_moe(config) if config else {"is_moe": False})
+        
+        # Enhanced MoE detection (checks config, GGUF, and name patterns)
+        moe_info = gguf_info.get("moe")
+        if not moe_info or not moe_info.get("is_moe"):
+            moe_info = self._detect_moe(config, model_name)
         context_length = gguf_info.get("context_length") or (self._get_context_length(config) if config else 2048)
         
         # Get model parameters
@@ -253,7 +330,7 @@ class ModelInfoExtractor:
             if total_size > 0:
                 file_size_gb = total_size / (1024 ** 3)
         
-        return {
+        result = {
             "name": model_name,
             "architecture": architecture,
             "parameters": param_count,
@@ -269,6 +346,26 @@ class ModelInfoExtractor:
             "moe": moe_info,
             "config": config
         }
+        
+        # Cache the result
+        if use_cache:
+            self._info_cache[model_name] = result.copy()
+            self._cache_timestamps[model_name] = time.time()
+        
+        return result
+    
+    def clear_cache(self, model_name: Optional[str] = None):
+        """Clear model info cache.
+        
+        Args:
+            model_name: Specific model to clear, or None to clear all
+        """
+        if model_name:
+            self._info_cache.pop(model_name, None)
+            self._cache_timestamps.pop(model_name, None)
+        else:
+            self._info_cache.clear()
+            self._cache_timestamps.clear()
     
     def _detect_quantization(self, model_name: str) -> Optional[str]:
         """Detect quantization type from model name."""

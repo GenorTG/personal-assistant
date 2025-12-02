@@ -70,7 +70,30 @@ class ServiceManager:
         
         
         # Service configurations
+        # Note: Order matters for "Start All" - Memory/Tools start before Gateway
         self.services = {
+            "memory": {
+                "name": "Memory Service",
+                "port": 8005,
+                "url": "http://localhost:8005",
+                "health_endpoint": "/health",
+                "start_cmd": lambda: self._get_python_service_start_cmd("memory", "main:app", 8005),
+                "install_cmd": lambda: self._install_python_service("memory"),
+                "dir": self.root_dir / "services" / "memory",
+                "venv": self.root_dir / "services" / "memory" / ".venv",
+                "optional": False
+            },
+            "tools": {
+                "name": "Tool Service",
+                "port": 8006,
+                "url": "http://localhost:8006",
+                "health_endpoint": "/health",
+                "start_cmd": lambda: self._get_python_service_start_cmd("tools", "main:app", 8006),
+                "install_cmd": lambda: self._install_python_service("tools"),
+                "dir": self.root_dir / "services" / "tools",
+                "venv": self.root_dir / "services" / "tools" / ".venv",
+                "optional": True
+            },
             "gateway": {
                 "name": "API Gateway",
                 "port": 8000,
@@ -87,7 +110,7 @@ class ServiceManager:
                 "port": 8001,
                 "url": "http://localhost:8001",
                 "health_endpoint": "/health",
-                "start_cmd": lambda: self._get_python_service_start_cmd("llm", "main:app", 8001),
+                "start_cmd": lambda: [],  # LLM is managed by Gateway, not directly started
                 "install_cmd": lambda: self._install_python_service("llm"),
                 "dir": self.root_dir / "services" / "llm",
                 "venv": self.root_dir / "services" / "llm" / ".venv",
@@ -178,12 +201,132 @@ class ServiceManager:
         return [python_exe, "-m", "pip", "install", "-r", "requirements.txt"]
 
     def _get_frontend_install_cmd(self) -> List[str]:
-        """Get frontend install command."""
-        # We need to run install AND build. This is tricky with a single list.
-        # We'll return a special marker or handle it in install_service
-        if platform.system() == "Windows":
-            return "npm install && npm run build"
-        return ["bash", "-c", "npm install && npm run build"]
+        """Get frontend install command.
+        Returns a Python script that executes npm install and npm run build.
+        """
+        import tempfile
+        import os
+        
+        # Create a temporary Python script that runs npm commands
+        frontend_dir = str(self.services['frontend']['dir'])
+        # Escape backslashes for raw string in Python script
+        frontend_dir_escaped = frontend_dir.replace('\\', '\\\\')
+        
+        install_script = f"""import sys
+import subprocess
+import os
+import atexit
+import platform
+
+# Script path for cleanup (will be replaced with actual path)
+script_path = r"__SCRIPT_PATH_PLACEHOLDER__"
+
+def cleanup():
+    try:
+        if script_path and os.path.exists(script_path):
+            os.remove(script_path)
+    except Exception:
+        pass
+
+atexit.register(cleanup)
+
+# Change to frontend directory
+frontend_dir = r"{frontend_dir_escaped}"
+if not os.path.exists(frontend_dir):
+    print(f"[FAIL] Frontend directory does not exist: {{frontend_dir}}")
+    sys.exit(1)
+
+os.chdir(frontend_dir)
+print("[INFO] Installing frontend dependencies...")
+print(f"[INFO] Working directory: {{os.getcwd()}}")
+
+# Check if Node.js is available
+try:
+    # Use shell on Windows, direct call on Unix
+    use_shell = platform.system() == "Windows"
+    result = subprocess.run(
+        ["node", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        shell=use_shell
+    )
+    if result.returncode != 0:
+        print("[FAIL] Node.js not found. Please install Node.js first.")
+        sys.exit(1)
+    print(f"[OK] Node.js version: {{result.stdout.strip()}}")
+except FileNotFoundError:
+    print("[FAIL] Node.js not found. Please install Node.js first.")
+    sys.exit(1)
+except Exception as e:
+    print(f"[FAIL] Error checking Node.js: {{e}}")
+    sys.exit(1)
+
+# Determine npm command based on platform
+use_shell = platform.system() == "Windows"
+# On Windows with shell=True, use "npm", otherwise use "npm.cmd"
+npm_cmd = "npm" if use_shell else ("npm.cmd" if platform.system() == "Windows" else "npm")
+
+# Run npm install
+print("[INFO] Running npm install...")
+try:
+    result = subprocess.run(
+        [npm_cmd, "install"],
+        shell=use_shell,
+        check=False,
+        cwd=frontend_dir,
+        stdout=sys.stdout,
+        stderr=subprocess.STDOUT
+    )
+    if result.returncode != 0:
+        print("[FAIL] npm install failed")
+        sys.exit(1)
+    print("[OK] npm install completed")
+except Exception as e:
+    print(f"[FAIL] Error running npm install: {{e}}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+# Run npm run build
+print("[INFO] Running npm run build...")
+try:
+    result = subprocess.run(
+        [npm_cmd, "run", "build"],
+        shell=use_shell,
+        check=False,
+        cwd=frontend_dir,
+        stdout=sys.stdout,
+        stderr=subprocess.STDOUT
+    )
+    if result.returncode != 0:
+        print("[FAIL] npm run build failed")
+        sys.exit(1)
+    print("[OK] npm run build completed")
+    print("[OK] Frontend installation completed successfully!")
+except Exception as e:
+    print(f"[FAIL] Error running npm run build: {{e}}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+"""
+        
+        # Write script to temporary file
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as script_file:
+                script_path = script_file.name
+                # Update script to include the actual script path
+                final_script = install_script.replace(
+                    '__SCRIPT_PATH_PLACEHOLDER__',
+                    script_path.replace('\\', '\\\\')
+                )
+                script_file.write(final_script)
+            
+            # Return command to execute the script
+            return [sys.executable, script_path]
+        except Exception as e:
+            self._print(f"Failed to create install script: {e}", "red")
+            return [sys.executable, "-c", "import sys; print('[FAIL] Failed to create install script'); sys.exit(1)"]
 
     def _get_kokoro_install_cmd(self) -> List[str]:
         """Get Kokoro install command."""
@@ -247,53 +390,319 @@ class ServiceManager:
             return [str(venv_python), "-m", "uvicorn", app_module, "--host", "0.0.0.0", "--port", str(port)]
         return []
 
-    def _install_python_service(self, service_key: str) -> List[str]:
+    def _check_venv_locks(self, venv_dir: Path) -> bool:
+        """Check if venv is locked by running processes. Returns True if safe to proceed."""
+        if not venv_dir.exists():
+            return True
+        
+        if platform.system() == "Windows":
+            try:
+                # Check if any Python processes are using files in the venv
+                import psutil
+                venv_str = str(venv_dir).lower()
+                for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                    try:
+                        if proc.info['name'] and 'python' in proc.info['name'].lower():
+                            # Check if process is using files in venv
+                            try:
+                                for file in proc.open_files():
+                                    if venv_str in file.path.lower():
+                                        self._print(f"Warning: Python process (PID {proc.info['pid']}) is using files in venv", "yellow")
+                                        self._print("Please stop all services before reinstalling", "yellow")
+                                        return False
+                            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                                pass
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except ImportError:
+                # psutil not available, skip check
+                pass
+            except Exception:
+                # Any other error, continue anyway
+                pass
+        
+        return True
+
+    def _install_python_service(self, service_key: str, force_reinstall: bool = False) -> List[str]:
         """Install a Python service using a virtual environment and pip.
         Executes commands directly to avoid shell quoting issues.
+        Special handling for LLM service to build llama-cpp-python with CUDA.
+        
+        Args:
+            service_key: Key of the service to install
+            force_reinstall: If True, reinstall even if already installed. If False, skip if installed.
         """
         service = self.services[service_key]
         venv_dir = service["venv"]
         req_file = service["dir"] / "requirements.txt"
         service_dir = service["dir"]
         
-        self._print(f"Setting up {service['name']} environment...", "cyan")
+        # Check if already installed (unless force_reinstall is True)
+        if not force_reinstall:
+            if venv_dir.exists():
+                # Check if venv is valid
+                if platform.system() == "Windows":
+                    python_exe = venv_dir / "Scripts" / "python.exe"
+                else:
+                    python_exe = venv_dir / "bin" / "python"
+                
+                if python_exe.exists():
+                    # Service is already installed, skip
+                    print(f"[SKIP] {service['name']} is already installed. Use force_reinstall=True to reinstall.")
+                    return [sys.executable, "-c", "print('[SKIP] Service already installed')"]
+        
+        print(f"Setting up {service['name']} environment...")
+
+        # 0. Check for locked files
+        if not self._check_venv_locks(venv_dir):
+            print("[ERROR] Cannot proceed - venv is locked by running processes")
+            return [sys.executable, "-c", "import sys; print('[ERROR] Venv locked'); sys.exit(1)"]
+
+        # 1. Remove existing venv if it exists (with retries for Windows file locks)
+        if venv_dir.exists():
+            print("Removing existing virtual environment...")
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # On Windows, files might be locked - try to remove with retries
+                    if platform.system() == "Windows":
+                        # Try to remove read-only files
+                        for root, dirs, files in os.walk(venv_dir):
+                            for d in dirs:
+                                os.chmod(os.path.join(root, d), 0o777)
+                            for f in files:
+                                try:
+                                    os.chmod(os.path.join(root, f), 0o777)
+                                except (OSError, PermissionError):
+                                    pass
+                    
+                    shutil.rmtree(str(venv_dir), ignore_errors=True)
+                    # Wait a bit for Windows to release file handles
+                    if platform.system() == "Windows":
+                        time.sleep(1)
+                    
+                    if not venv_dir.exists():
+                        break
+                except (PermissionError, OSError) as e:
+                    if attempt < max_retries - 1:
+                        print(f"Retrying venv removal (attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(2)
+                    else:
+                        print(f"Warning: Could not fully remove existing venv: {e}")
+                        print("Trying to continue anyway...")
+                        break
 
         # 1. Create virtual environment
-        self._print("Creating virtual environment...", "dim")
+        print("Creating virtual environment...")
         try:
-            subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+            # Use CREATE_NO_WINDOW on Windows
+            creation_flags = 0
+            if platform.system() == "Windows":
+                creation_flags = subprocess.CREATE_NO_WINDOW
+            
+            result = subprocess.run(
+                [sys.executable, "-m", "venv", str(venv_dir)], 
+                check=True, 
+                timeout=60,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=creation_flags
+            )
+            if result.stdout:
+                print(result.stdout)
         except subprocess.CalledProcessError as e:
-            self._print(f"Failed to create venv: {e}", "red")
-            return [sys.executable, "-c", "import sys; sys.exit(1)"]
+            error_msg = e.stdout or str(e) if hasattr(e, 'stdout') else str(e)
+            print(f"[ERROR] Failed to create venv: {error_msg}")
+            return [sys.executable, "-c", "import sys; print('[ERROR] Failed to create venv'); sys.exit(1)"]
+        except subprocess.TimeoutExpired:
+            print("[ERROR] Timeout creating venv")
+            return [sys.executable, "-c", "import sys; print('[ERROR] Timeout creating venv'); sys.exit(1)"]
 
         # 2. Install dependencies
-        self._print("Installing dependencies (this may take a while)...", "dim")
-        pip_exe = venv_dir / ("Scripts" if platform.system() == "Windows" else "bin") / "pip"
+        python_exe = venv_dir / ("Scripts" if platform.system() == "Windows" else "bin") / "python"
         if platform.system() == "Windows":
-            pip_exe = pip_exe.with_suffix(".exe")
+            python_exe = python_exe.with_suffix(".exe")
+        
+        # Verify python executable exists
+        if not python_exe.exists():
+            print(f"[ERROR] Python executable not found at {python_exe}")
+            return [sys.executable, "-c", "import sys; print('[ERROR] Python executable not found'); sys.exit(1)"]
+        
+        # Use CREATE_NO_WINDOW on Windows for all subprocess calls
+        creation_flags = 0
+        if platform.system() == "Windows":
+            creation_flags = subprocess.CREATE_NO_WINDOW
         
         try:
-            # Upgrade pip first
-            subprocess.run([str(pip_exe), "install", "--upgrade", "pip"], check=False)
-            # Install requirements
-            subprocess.run([str(pip_exe), "install", "-r", str(req_file)], check=True)
-        except subprocess.CalledProcessError as e:
-            self._print(f"Failed to install dependencies: {e}", "red")
+            # Upgrade pip and install build tools
+            print("Upgrading pip and installing build tools...")
+            result = subprocess.run(
+                [str(python_exe), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools", "cmake"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=300,
+                creationflags=creation_flags
+            )
+            if result.stdout:
+                print(result.stdout)
+            if result.returncode != 0:
+                print(f"[WARNING] pip upgrade had issues: {result.stdout[:200] if result.stdout else 'Unknown error'}")
+            
+            # Special handling for LLM service - build llama-cpp-python with CUDA
+            if service_key == "llm":
+                self._print("Installing LLM service with CUDA support...", "cyan")
+                self._print("This will take 10-20 minutes to compile...", "yellow")
+                
+                # Detect GPU and set build flags
+                cores = os.cpu_count() or 4
+                
+                # Check for CUDA
+                try:
+                    nvcc_result = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5)
+                    has_cuda = nvcc_result.returncode == 0
+                except (FileNotFoundError, subprocess.TimeoutError):
+                    has_cuda = False
+                
+                if has_cuda:
+                    self._print("CUDA detected - building with GPU support", "green")
+                    # RTX 3080 = compute capability 8.6 (sm_86)
+                    # Build optimized for this GPU only + use all cores
+                    os.environ["CMAKE_ARGS"] = "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_NATIVE=on"
+                    os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = str(cores)
+                    os.environ["FORCE_CMAKE"] = "1"
+                else:
+                    self._print("No CUDA detected - building CPU-only version", "yellow")
+                    os.environ["CMAKE_ARGS"] = "-DLLAMA_NATIVE=on"
+                    os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = str(cores)
+                    os.environ["FORCE_CMAKE"] = "1"
+                
+                # Install llama-cpp-python with CUDA first
+                self._print(f"Building llama-cpp-python (using {cores} CPU cores)...", "dim")
+                self._print("This will take 10-20 minutes. Please be patient...", "yellow")
+                try:
+                    result = subprocess.run(
+                        [str(python_exe), "-m", "pip", "install", "llama-cpp-python[server]", "--no-cache-dir", "--force-reinstall"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=3600  # 1 hour timeout
+                    )
+                    
+                    if result.returncode != 0:
+                        error_msg = result.stderr or result.stdout or "Unknown error"
+                        if "Permission denied" in error_msg or "Access is denied" in error_msg:
+                            self._print("Permission denied error. Make sure:", "red")
+                            self._print("  1. No other programs are using files in the venv", "red")
+                            self._print("  2. You have write permissions to the service directory", "red")
+                            self._print("  3. Antivirus is not blocking file access", "red")
+                            return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                        
+                        self._print("Failed to build llama-cpp-python with CUDA. Trying CPU-only fallback...", "yellow")
+                        # Fallback to CPU
+                        os.environ["CMAKE_ARGS"] = "-DLLAMA_NATIVE=on"
+                        os.environ.pop("CMAKE_BUILD_PARALLEL_LEVEL", None)
+                        result = subprocess.run(
+                            [str(python_exe), "-m", "pip", "install", "llama-cpp-python[server]", "--no-cache-dir", "--force-reinstall"],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=3600
+                        )
+                        if result.returncode != 0:
+                            error_msg = result.stderr or result.stdout or "Unknown error"
+                            self._print(f"Failed to install llama-cpp-python: {error_msg[:500]}", "red")
+                            return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                except subprocess.TimeoutExpired:
+                    self._print("Build timed out after 1 hour. This is unusual.", "red")
+                    return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                except Exception as e:
+                    self._print(f"Unexpected error during build: {e}", "red")
+                    return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                
+                # Install other requirements (skip llama-cpp-python)
+                self._print("Installing other dependencies...", "dim")
+                other_deps = []
+                with open(req_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and 'llama-cpp-python' not in line:
+                            other_deps.append(line)
+                
+                if other_deps:
+                    # Create temp requirements file without llama-cpp-python
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
+                        tmp.write('\n'.join(other_deps))
+                        tmp_req = tmp.name
+                    
+                    try:
+                        result = subprocess.run(
+                            [str(python_exe), "-m", "pip", "install", "-r", tmp_req],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=600
+                        )
+                    except subprocess.CalledProcessError as e:
+                        error_msg = e.stderr or e.stdout or str(e)
+                        if "Permission denied" in error_msg or "Access is denied" in error_msg:
+                            self._print("Permission denied installing dependencies", "red")
+                            self._print("Make sure you have write access to the venv directory", "red")
+                        else:
+                            self._print(f"Failed to install dependencies: {error_msg[:500]}", "red")
+                        return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                    except subprocess.TimeoutExpired:
+                        self._print("Installation timed out", "red")
+                        return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                    finally:
+                        if os.path.exists(tmp_req):
+                            try:
+                                os.remove(tmp_req)
+                            except (PermissionError, OSError):
+                                pass
+            else:
+                # Normal installation for other services
+                self._print("Installing dependencies (this may take a while)...", "dim")
+                try:
+                    result = subprocess.run(
+                        [str(python_exe), "-m", "pip", "install", "-r", str(req_file)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=600
+                    )
+                except subprocess.CalledProcessError as e:
+                    error_msg = e.stderr or e.stdout or str(e)
+                    if "Permission denied" in error_msg or "Access is denied" in error_msg:
+                        self._print("Permission denied installing dependencies", "red")
+                        self._print("Make sure you have write access to the venv directory", "red")
+                    else:
+                        self._print(f"Failed to install dependencies: {error_msg[:500]}", "red")
+                    return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                except subprocess.TimeoutExpired:
+                    self._print("Installation timed out", "red")
+                    return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                
+        except Exception as e:
+            self._print(f"Unexpected error during installation: {e}", "red")
             return [sys.executable, "-c", "import sys; sys.exit(1)"]
 
         # 3. Copy .env.example -> .env
         env_example = service_dir / ".env.example"
         env_target = service_dir / ".env"
         if env_example.exists() and not env_target.exists():
-            self._print("Copying .env.example to .env", "dim")
+            print("Copying .env.example to .env")
             try:
-                import shutil
                 shutil.copy(str(env_example), str(env_target))
             except Exception as e:
-                self._print(f"Failed to copy .env: {e}", "yellow")
+                print(f"[WARNING] Failed to copy .env: {e}")
         
+        print(f"[SUCCESS] {service['name']} installation completed successfully")
         # Return a dummy success command since we already did the work
-        return [sys.executable, "-c", "print('Installation steps completed successfully')"]
+        return [sys.executable, "-c", "print('[SUCCESS] Installation completed')"]
 
     def _ensure_external_service(self, service_name: str) -> bool:
         """Ensure external service is cloned and configured."""
@@ -487,8 +896,12 @@ class ServiceManager:
                 pass
         
         # Check frontend dependencies
-        frontend_node_modules = self.root_dir / "frontend-next" / "node_modules"
-        deps["frontend_deps"] = frontend_node_modules.exists()
+        frontend_dir = self.services.get("frontend", {}).get("dir")
+        if frontend_dir:
+            frontend_node_modules = frontend_dir / "node_modules"
+            deps["frontend_deps"] = frontend_node_modules.exists()
+        else:
+            deps["frontend_deps"] = False
         
         return deps
 
@@ -1310,17 +1723,19 @@ except Exception as e:
         try:
             if background:
                 if platform.system() == "Windows":
-                    # On Windows, create new console window for visibility
-                    # The console window will show errors if startup fails
-                    creation_flags = subprocess.CREATE_NEW_CONSOLE
+                    # On Windows, hide console window - logs go to launcher GUI
+                    creation_flags = subprocess.CREATE_NO_WINDOW
                     process = subprocess.Popen(
                         cmd,
                         cwd=str(service["dir"]),
                         env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
                         creationflags=creation_flags
                     )
                     if service_id == "backend":
-                        self._print("Backend starting in new console window. Check console for errors.", style="cyan")
+                        self._print("Backend starting (check launcher logs for output).", style="cyan")
                         self._print("Backend may take 15-30 seconds to fully initialize.", style="cyan")
                 else:
                     # On Unix, run in background
@@ -1428,7 +1843,7 @@ except Exception as e:
             return False
     
     def stop_service(self, service_id: str) -> bool:
-        """Stop a service."""
+        """Stop a service with graceful shutdown procedure."""
         service = self.services.get(service_id)
         if not service:
             return False
@@ -1437,39 +1852,56 @@ except Exception as e:
         if service_id in self.processes:
             process = self.processes[service_id]
             try:
+                # Step 1: Send graceful shutdown signal (like Ctrl+C)
                 if platform.system() == "Windows":
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                    self._print(f"Sending shutdown signal to {service['name']}...", style="yellow")
+                    process.terminate()  # SIGTERM on Windows
                 else:
-                    process.terminate()
+                    # On Unix, send SIGINT (Ctrl+C equivalent)
+                    self._print(f"Sending SIGINT to {service['name']}...", style="yellow")
+                    process.send_signal(signal.SIGINT)
+                
+                # Step 2: Wait for graceful shutdown (10 seconds)
+                try:
+                    process.wait(timeout=10)
+                    self._print(f"{service['name']} shut down gracefully", style="green")
+                except subprocess.TimeoutExpired:
+                    # Step 3: Force kill if graceful shutdown times out
+                    self._print(f"{service['name']} did not shut down gracefully, force killing...", style="yellow")
+                    process.kill()
                     try:
-                        process.wait(timeout=5)
+                        process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        process.kill()
-            except Exception:
-                pass
+                        self._print(f"Warning: {service['name']} process may still be running", style="red")
+            except Exception as e:
+                self._print(f"Error during shutdown: {e}", style="red")
+            
             del self.processes[service_id]
         
-        # Also try to kill by port
+        # Step 4: Verify port is freed and force kill any stragglers
         if HAS_PSUTIL:
             try:
+                killed_any = False
                 for proc in psutil.process_iter(['pid', 'name', 'connections']):
                     try:
                         for conn in proc.info['connections'] or []:
                             if conn.laddr.port == service["port"]:
+                                if not killed_any:
+                                    self._print(f"Warning: Found straggler process on port {service['port']}", style="yellow")
+                                    killed_any = True
                                 proc_obj = psutil.Process(proc.info['pid'])
-                                proc_obj.terminate()
+                                proc_obj.kill()
                                 try:
-                                    proc_obj.wait(timeout=5)
+                                    proc_obj.wait(timeout=2)
                                 except psutil.TimeoutExpired:
-                                    proc_obj.kill()
+                                    pass
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
-            except Exception:
-                pass
+                
+                if not killed_any:
+                    self._print(f"Port {service['port']} is now free", style="green")
+            except Exception as e:
+                self._print(f"Warning: Error checking port: {e}", style="yellow")
         
         self.service_status[service_id] = ServiceStatus.STOPPED
         self._print(f"[OK] {service['name']} stopped", style="green")

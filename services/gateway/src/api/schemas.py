@@ -45,17 +45,39 @@ class CharacterCard(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """Chat request schema."""
+    """Chat request schema with optional sampler settings override.
+    
+    All sampler parameters are optional - if not provided, saved settings are used.
+    """
     message: str = Field(..., description="User message")
     conversation_id: Optional[str] = Field(None, description="Conversation ID for context")
     stream: bool = Field(False, description="Whether to stream the response")
+    
     # User and character settings (optional, will use defaults if not provided)
     character_card: Optional[CharacterCard] = Field(None, description="Character card for this conversation")
     user_profile: Optional[UserProfile] = Field(None, description="User profile for this conversation")
-    temperature: Optional[float] = Field(None, ge=0.0, le=2.0, description="Override temperature setting")
-    top_p: Optional[float] = Field(None, ge=0.0, le=1.0, description="Override top_p setting")
-    top_k: Optional[int] = Field(None, ge=0, description="Override top_k setting")
-    repeat_penalty: Optional[float] = Field(None, ge=0.0, description="Override repeat_penalty setting")
+    
+    # Sampler settings (optional - override saved settings for this request)
+    temperature: Optional[float] = Field(None, ge=0.0, le=2.0, description="Sampling temperature")
+    top_p: Optional[float] = Field(None, ge=0.0, le=1.0, description="Top-p sampling")
+    top_k: Optional[int] = Field(None, ge=0, description="Top-k sampling")
+    min_p: Optional[float] = Field(None, ge=0.0, le=1.0, description="Minimum probability threshold")
+    repeat_penalty: Optional[float] = Field(None, ge=1.0, le=2.0, description="Repeat penalty")
+    presence_penalty: Optional[float] = Field(None, ge=-2.0, le=2.0, description="Presence penalty")
+    frequency_penalty: Optional[float] = Field(None, ge=-2.0, le=2.0, description="Frequency penalty")
+    typical_p: Optional[float] = Field(None, ge=0.0, le=1.0, description="Typical sampling")
+    tfs_z: Optional[float] = Field(None, ge=0.0, description="Tail-free sampling")
+    mirostat_mode: Optional[int] = Field(None, ge=0, le=2, description="Mirostat mode")
+    mirostat_tau: Optional[float] = Field(None, ge=0.0, le=10.0, description="Mirostat tau")
+    mirostat_eta: Optional[float] = Field(None, ge=0.0, le=1.0, description="Mirostat eta")
+    max_tokens: Optional[int] = Field(None, ge=-1, le=32768, description="Max tokens to generate")
+    stop: Optional[List[str]] = Field(None, description="Stop sequences")
+    seed: Optional[int] = Field(None, description="Random seed (-1=random)")
+    grammar: Optional[str] = Field(None, description="GBNF grammar string")
+    logit_bias: Optional[Dict[int, float]] = Field(None, description="Token ID bias map")
+    penalty_range: Optional[int] = Field(None, ge=0, description="Repetition penalty range")
+    penalty_alpha: Optional[float] = Field(None, ge=0.0, description="Contrastive search penalty")
+    n_probs: Optional[int] = Field(None, ge=0, description="Return top N probabilities")
 
 
 class ChatResponse(BaseModel):
@@ -77,6 +99,7 @@ class ConversationHistory(BaseModel):
     # Conversation-level metadata
     total_messages: Optional[int] = None
     model_used: Optional[str] = None
+    pinned: Optional[bool] = False
 
 
 class ConversationRenameRequest(BaseModel):
@@ -103,33 +126,146 @@ class TTSRequest(BaseModel):
 
 
 class ModelLoadOptions(BaseModel):
-    """Model loading options schema."""
-    n_ctx: Optional[int] = Field(None, ge=512, le=32768, description="Context window size")
+    """Model loading options schema for llama-cpp-python server.
+    
+    These parameters match the llama-cpp-python server config format.
+    See: https://github.com/abetlen/llama-cpp-python
+    """
+    # Core parameters
+    n_ctx: Optional[int] = Field(None, ge=512, le=131072, description="Context window size")
+    n_batch: Optional[int] = Field(None, ge=1, le=4096, description="Batch size for prompt processing")
     n_threads: Optional[int] = Field(None, ge=1, le=128, description="Number of CPU threads")
+    n_threads_batch: Optional[int] = Field(None, ge=1, le=128, description="Number of threads for batch processing")
+    
+    # GPU settings
     n_gpu_layers: Optional[int] = Field(None, ge=-1, description="Number of GPU layers (-1 = all, 0 = CPU only)")
-    use_flash_attention: Optional[bool] = Field(None, description="Enable flash attention (if supported)")
-    use_mmap: Optional[bool] = Field(None, description="Use memory mapping")
-    use_mlock: Optional[bool] = Field(None, description="Lock memory in RAM")
-    # Advanced options
-    n_batch: Optional[int] = Field(None, ge=1, le=512, description="Batch size for prompt processing")
-    n_predict: Optional[int] = Field(None, ge=-1, description="Maximum tokens to predict (-1 = infinite)")
-    rope_freq_base: Optional[float] = Field(None, description="RoPE frequency base")
-    rope_freq_scale: Optional[float] = Field(None, description="RoPE frequency scale")
-    low_vram: Optional[bool] = Field(None, description="Enable low VRAM mode")
-    main_gpu: Optional[int] = Field(None, ge=0, description="Main GPU device ID")
-    tensor_split: Optional[List[float]] = Field(None, description="Split model across multiple GPUs")
-    n_cpu_moe: Optional[int] = Field(None, description="Number of experts to offload to CPU (for MoE models)")
-    cache_type_k: Optional[str] = Field(None, description="KV cache data type for K (f16, q8_0, q4_0)")
-    cache_type_v: Optional[str] = Field(None, description="KV cache data type for V (f16, q8_0, q4_0)")
-    offload_kqv: Optional[bool] = Field(None, description="Offload KV cache to GPU")
+    main_gpu: Optional[int] = Field(None, ge=0, description="Main GPU device ID for multi-GPU")
+    tensor_split: Optional[List[float]] = Field(None, description="Split model across multiple GPUs (e.g., [0.5, 0.5])")
+    
+    # Memory settings
+    use_mmap: Optional[bool] = Field(None, description="Use memory mapping for model loading")
+    use_mlock: Optional[bool] = Field(None, description="Lock model in RAM to prevent swapping")
+    
+    # Performance settings
+    flash_attn: Optional[bool] = Field(None, description="Enable Flash Attention (requires compatible GPU)")
+    
+    # RoPE settings (for extended context)
+    rope_freq_base: Optional[float] = Field(None, description="RoPE frequency base (for context extension)")
+    rope_freq_scale: Optional[float] = Field(None, description="RoPE frequency scale (for context extension)")
+    rope_scaling_type: Optional[int] = Field(None, description="RoPE scaling type: -1=unspecified, 0=none, 1=linear, 2=yarn")
+    yarn_ext_factor: Optional[float] = Field(None, description="YaRN extrapolation factor (-1.0 = auto)")
+    yarn_attn_factor: Optional[float] = Field(None, description="YaRN attention factor")
+    yarn_beta_fast: Optional[float] = Field(None, description="YaRN beta fast")
+    yarn_beta_slow: Optional[float] = Field(None, description="YaRN beta slow")
+    yarn_orig_ctx: Optional[int] = Field(None, description="YaRN original context size")
+    
+    # KV cache settings
+    cache_type_k: Optional[str] = Field(None, pattern="^(f16|f32|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1)$", description="KV cache type for K")
+    cache_type_v: Optional[str] = Field(None, pattern="^(f16|f32|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1)$", description="KV cache type for V")
+    
+    # MoE (Mixture of Experts) settings
+    n_cpu_moe: Optional[int] = Field(None, ge=1, le=128, description="Number of CPU threads for MoE experts")
+    
+    # Deprecated/removed - kept for backwards compatibility, will be ignored
+    use_flash_attention: Optional[bool] = Field(None, description="DEPRECATED: Use flash_attn instead")
+    offload_kqv: Optional[bool] = Field(None, description="DEPRECATED: Not supported by llama-cpp-python")
+
+
+class SamplerSettings(BaseModel):
+    """Complete sampler settings for llama-cpp-python server.
+    
+    These parameters control text generation and match the llama-cpp-python API.
+    """
+    # Basic sampling
+    temperature: float = Field(0.7, ge=0.0, le=2.0, description="Sampling temperature (0=deterministic, 2=very random)")
+    top_p: float = Field(0.9, ge=0.0, le=1.0, description="Nucleus sampling threshold")
+    top_k: int = Field(40, ge=0, description="Top-k sampling (0=disabled)")
+    min_p: float = Field(0.0, ge=0.0, le=1.0, description="Minimum probability threshold")
+    
+    # Repetition control
+    repeat_penalty: float = Field(1.1, ge=1.0, le=2.0, description="Repetition penalty (1.0=disabled)")
+    presence_penalty: float = Field(0.0, ge=-2.0, le=2.0, description="OpenAI-style presence penalty")
+    frequency_penalty: float = Field(0.0, ge=-2.0, le=2.0, description="OpenAI-style frequency penalty")
+    repeat_last_n: int = Field(64, ge=-1, description="Tokens to look back for repetition (-1=context)")
+    
+    # Advanced sampling
+    typical_p: float = Field(1.0, ge=0.0, le=1.0, description="Typical sampling (1.0=disabled)")
+    tfs_z: float = Field(1.0, ge=0.0, description="Tail-free sampling (1.0=disabled)")
+    
+    # Mirostat entropy-based sampling
+    mirostat_mode: int = Field(0, ge=0, le=2, description="Mirostat mode (0=off, 1=v1, 2=v2)")
+    mirostat_tau: float = Field(5.0, ge=0.0, le=10.0, description="Mirostat target entropy")
+    mirostat_eta: float = Field(0.1, ge=0.0, le=1.0, description="Mirostat learning rate")
+    
+    # Output control
+    max_tokens: int = Field(512, ge=-1, le=32768, description="Max tokens to generate (-1=unlimited)")
+    stop: Optional[List[str]] = Field(None, description="Stop sequences")
+    seed: int = Field(-1, description="Random seed (-1=random)")
+    grammar: Optional[str] = Field(None, description="GBNF grammar string for structured output")
+    
+    # Advanced parameters
+    logit_bias: Optional[Dict[int, float]] = Field(None, description="Bias specific token IDs")
+    penalty_range: Optional[int] = Field(None, ge=0, description="Range of tokens for repetition penalty")
+    penalty_alpha: Optional[float] = Field(None, ge=0.0, description="Contrastive search penalty alpha")
+    n_probs: Optional[int] = Field(None, ge=0, description="Return top N token probabilities (debug)")
+    
+    # DRY (Dynamic Repetition Penalty) - sequence-based repetition control
+    # Formula: penalty = multiplier * base^(length - allowed_length)
+    dry_multiplier: Optional[float] = Field(None, ge=0.0, description="DRY multiplier: penalty strength (0.0=disabled)")
+    dry_base: Optional[float] = Field(None, ge=0.0, description="DRY base: penalty scaling factor for sequence length")
+    dry_allowed_length: Optional[int] = Field(None, ge=0, description="DRY allowed length: minimum sequence length to penalize")
+    
+    # XTC (Extended Temperature Control)
+    xtc_enabled: Optional[bool] = Field(None, description="Enable XTC temperature control")
+    xtc_temperature_min: Optional[float] = Field(None, ge=0.0, le=2.0, description="XTC minimum temperature")
+    xtc_temperature_max: Optional[float] = Field(None, ge=0.0, le=2.0, description="XTC maximum temperature")
+    xtc_adaptation_rate: Optional[float] = Field(None, ge=0.0, le=1.0, description="XTC adaptation rate")
+    
+    # Dynamic Temperature
+    dynamic_temp_enabled: Optional[bool] = Field(None, description="Enable dynamic temperature")
+    dynamic_temp_schedule: Optional[str] = Field(None, pattern="^(linear|exponential|cosine)$", description="Dynamic temperature schedule")
+    dynamic_temp_range: Optional[List[float]] = Field(None, min_length=2, max_length=2, description="Dynamic temperature range [min, max]")
+    
+    # Repetition Penalty Block
+    rep_penalty_range: Optional[int] = Field(None, ge=0, description="Repetition penalty block range (token count)")
+    rep_penalty_slope: Optional[float] = Field(None, ge=0.0, description="Repetition penalty block slope")
+    rep_penalty_alpha: Optional[float] = Field(None, ge=0.0, description="Repetition penalty block alpha")
 
 
 class AISettings(BaseModel):
-    """AI settings schema."""
+    """AI settings schema combining sampler and persona settings."""
+    # Sampler settings (flattened for easier access)
     temperature: float = Field(0.7, ge=0.0, le=2.0, description="Sampling temperature")
     top_p: float = Field(0.9, ge=0.0, le=1.0, description="Top-p sampling")
     top_k: int = Field(40, ge=0, description="Top-k sampling")
-    repeat_penalty: float = Field(1.1, ge=0.0, description="Repeat penalty")
+    min_p: float = Field(0.0, ge=0.0, le=1.0, description="Minimum probability threshold")
+    repeat_penalty: float = Field(1.1, ge=1.0, le=2.0, description="Repeat penalty")
+    presence_penalty: float = Field(0.0, ge=-2.0, le=2.0, description="Presence penalty")
+    frequency_penalty: float = Field(0.0, ge=-2.0, le=2.0, description="Frequency penalty")
+    typical_p: float = Field(1.0, ge=0.0, le=1.0, description="Typical sampling")
+    tfs_z: float = Field(1.0, ge=0.0, description="Tail-free sampling")
+    mirostat_mode: int = Field(0, ge=0, le=2, description="Mirostat mode")
+    mirostat_tau: float = Field(5.0, ge=0.0, le=10.0, description="Mirostat tau")
+    mirostat_eta: float = Field(0.1, ge=0.0, le=1.0, description="Mirostat eta")
+    max_tokens: int = Field(512, ge=-1, le=32768, description="Max tokens")
+    
+    # Advanced Samplers
+    # DRY (Dynamic Repetition Penalty) - sequence-based repetition control
+    dry_multiplier: Optional[float] = Field(None, ge=0.0, description="DRY multiplier: penalty strength (0.0=disabled)")
+    dry_base: Optional[float] = Field(None, ge=0.0, description="DRY base: penalty scaling factor for sequence length")
+    dry_allowed_length: Optional[int] = Field(None, ge=0, description="DRY allowed length: minimum sequence length to penalize")
+    xtc_enabled: Optional[bool] = Field(None, description="Enable XTC temperature control")
+    xtc_temperature_min: Optional[float] = Field(None, ge=0.0, le=2.0, description="XTC minimum temperature")
+    xtc_temperature_max: Optional[float] = Field(None, ge=0.0, le=2.0, description="XTC maximum temperature")
+    xtc_adaptation_rate: Optional[float] = Field(None, ge=0.0, le=1.0, description="XTC adaptation rate")
+    dynamic_temp_enabled: Optional[bool] = Field(None, description="Enable dynamic temperature")
+    dynamic_temp_schedule: Optional[str] = Field(None, description="Dynamic temperature schedule (linear/exponential/cosine)")
+    dynamic_temp_range: Optional[List[float]] = Field(None, description="Dynamic temperature range [min, max]")
+    rep_penalty_range: Optional[int] = Field(None, ge=0, description="Repetition penalty block range")
+    rep_penalty_slope: Optional[float] = Field(None, ge=0.0, description="Repetition penalty block slope")
+    rep_penalty_alpha: Optional[float] = Field(None, ge=0.0, description="Repetition penalty block alpha")
+    
+    # Persona settings
     system_prompt: Optional[str] = Field(None, description="System prompt")
     character_card: Optional[CharacterCard] = Field(None, description="Character card for personality")
     user_profile: Optional[UserProfile] = Field(None, description="User profile information")
@@ -143,6 +279,7 @@ class AISettingsResponse(BaseModel):
     settings: AISettings
     model_loaded: bool
     current_model: Optional[str] = None
+    supports_tool_calling: bool = False
 
 
 class ModelInfo(BaseModel):
@@ -154,6 +291,13 @@ class ModelInfo(BaseModel):
     size: Optional[str] = None
     format: str = "gguf"
     downloaded: bool = False
+    # Enhanced metadata from model_info.json
+    repo_id: Optional[str] = None
+    author: Optional[str] = None
+    description: Optional[str] = None
+    huggingface_url: Optional[str] = None
+    downloaded_at: Optional[str] = None
+    has_metadata: bool = False
 
 
 class ModelMetadata(BaseModel):

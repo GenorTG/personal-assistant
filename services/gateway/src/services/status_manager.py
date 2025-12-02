@@ -16,13 +16,15 @@ class ServiceStatus(str, Enum):
 
 
 class ServiceStatusManager:
-    """Manages health status for all microservices with background polling."""
+    """Manages health status for all microservices with adaptive background polling."""
     
     def __init__(self):
         self.status_cache: Dict[str, Dict[str, Any]] = {}
         self.polling_task: Optional[asyncio.Task] = None
         self.is_running = False
-        self.poll_interval = 10  # Industry standard: 10 seconds
+        self.poll_interval = 30  # Start with 30 seconds (stable interval)
+        self.stable_count = 0  # Track consecutive stable checks
+        self.last_logged_state: Dict[str, str] = {}  # Track last logged state for each service
         
         # Service registry with health endpoints
         self.services = {
@@ -32,22 +34,22 @@ class ServiceStatusManager:
                 "type": "stt"
             },
             "tts_piper": {
-                "url": "http://localhost:8001",
+                "url": "http://localhost:8004",
                 "health_path": "/health",
                 "type": "tts"
             },
             "tts_chatterbox": {
-                "url": "http://localhost:8005",
+                "url": "http://localhost:4123",
                 "health_path": "/health",
                 "type": "tts"
             },
             "tts_kokoro": {
-                "url": "http://localhost:8006",
+                "url": "http://localhost:8880",
                 "health_path": "/health",
                 "type": "tts"
             },
             "llm": {
-                "url": "http://localhost:8002",
+                "url": "http://localhost:8001",
                 "health_path": "/health",
                 "type": "llm"
             }
@@ -70,7 +72,7 @@ class ServiceStatusManager:
             
         self.is_running = True
         self.polling_task = asyncio.create_task(self._polling_loop())
-        logger.info(f"Service status manager started (polling every {self.poll_interval}s)")
+        logger.info(f"Service status manager started (adaptive polling: {self.poll_interval}s initial, adjusts based on stability)")
     
     async def stop(self):
         """Stop background polling task."""
@@ -84,12 +86,34 @@ class ServiceStatusManager:
         logger.info("Service status manager stopped")
     
     async def _polling_loop(self):
-        """Background task that continuously polls all services."""
+        """Background task that continuously polls all services with adaptive intervals."""
         while self.is_running:
             try:
                 await self._poll_all_services()
+                
+                # Adaptive polling: check if all services are stable
+                all_stable = all(
+                    status.get("status") == ServiceStatus.READY 
+                    for status in self.status_cache.values()
+                )
+                
+                if all_stable:
+                    self.stable_count += 1
+                    # After 3 consecutive stable checks, increase interval to 30s
+                    if self.stable_count >= 3 and self.poll_interval != 30:
+                        self.poll_interval = 30
+                        logger.debug(f"All services stable, increasing poll interval to {self.poll_interval}s")
+                else:
+                    self.stable_count = 0
+                    # If any service is unstable, reduce interval to 10s
+                    if self.poll_interval != 10:
+                        self.poll_interval = 10
+                        logger.debug(f"Services unstable, reducing poll interval to {self.poll_interval}s")
+                
             except Exception as e:
                 logger.error(f"Error in polling loop: {e}")
+                self.stable_count = 0
+                self.poll_interval = 10  # Reduce interval on error
             
             await asyncio.sleep(self.poll_interval)
     
@@ -104,6 +128,7 @@ class ServiceStatusManager:
     async def _check_service(self, name: str, config: Dict[str, str]):
         """Check health of a single service."""
         start_time = datetime.now()
+        previous_status = self.status_cache.get(name, {}).get("status")
         
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
@@ -113,29 +138,37 @@ class ServiceStatusManager:
                 response_time = (datetime.now() - start_time).total_seconds() * 1000
                 
                 if response.status_code == 200:
+                    new_status = ServiceStatus.READY
                     self.status_cache[name] = {
-                        "status": ServiceStatus.READY,
+                        "status": new_status,
                         "last_check": datetime.now().isoformat(),
                         "response_time_ms": round(response_time, 2),
                         "error": None,
                         "type": config["type"]
                     }
                 else:
+                    new_status = ServiceStatus.ERROR
                     self.status_cache[name] = {
-                        "status": ServiceStatus.ERROR,
+                        "status": new_status,
                         "last_check": datetime.now().isoformat(),
                         "response_time_ms": round(response_time, 2),
                         "error": f"HTTP {response.status_code}",
                         "type": config["type"]
                     }
         except Exception as e:
+            new_status = ServiceStatus.OFFLINE
             self.status_cache[name] = {
-                "status": ServiceStatus.OFFLINE,
+                "status": new_status,
                 "last_check": datetime.now().isoformat(),
                 "response_time_ms": None,
                 "error": str(e),
                 "type": config["type"]
             }
+        
+        # Only log state changes (not every check)
+        if previous_status != new_status:
+            logger.info(f"Service {name} status changed: {previous_status} -> {new_status}")
+            self.last_logged_state[name] = new_status
     
     def get_all_statuses(self) -> Dict[str, Dict[str, Any]]:
         """Get cached status for all services."""

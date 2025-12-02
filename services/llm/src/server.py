@@ -1,9 +1,10 @@
-"""Service for managing the llama-cpp-python server process."""
+"""Service for managing the llama-cpp-python server process from cloned repository."""
 import asyncio
 import logging
 import subprocess
 import sys
 import time
+import platform
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 import aiohttp
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class LLMServerService:
-    """Manages the llama-cpp-python server subprocess."""
+    """Manages the llama-cpp-python server subprocess from cloned repository."""
     
     def __init__(self):
         self.process: Optional[asyncio.subprocess.Process] = None
@@ -22,7 +23,25 @@ class LLMServerService:
         self.port = 8001  # Use 8001 to avoid conflict with backend (8000)
         self.current_model_path: Optional[str] = None
         self.startup_options: Dict[str, Any] = {}
-        self.venv_python = sys.executable
+        
+        # Path to cloned llama-cpp-python repository
+        # Calculate from config: services/llm/src/server.py -> parent(src) -> parent(llm) -> parent(services) -> parent(root)
+        base_dir = Path(__file__).parent.parent.parent.parent
+        self.repo_dir = base_dir / "external_services" / "llama-cpp-python"
+        self.repo_venv = self.repo_dir / ".venv"
+        
+        # Determine Python executable from cloned repo venv
+        if self.repo_venv.exists():
+            venv_python = self.repo_venv / ("Scripts" if platform.system() == "Windows" else "bin") / "python"
+            if platform.system() == "Windows":
+                venv_python = venv_python.with_suffix(".exe")
+            if venv_python.exists():
+                self.venv_python = str(venv_python)
+            else:
+                self.venv_python = sys.executable
+        else:
+            # Fallback to system Python if venv doesn't exist yet
+            self.venv_python = sys.executable
         
     def is_running(self) -> bool:
         """Check if server is running."""
@@ -48,8 +67,14 @@ class LLMServerService:
         if self.is_running():
             logger.info("Stopping existing LLM server...")
             await self.stop_server()
+        
+        # Convert model_path to absolute path to ensure it works from any directory
+        model_path = Path(model_path).resolve()
+        if not model_path.exists():
+            logger.error(f"Model file not found: {model_path}")
+            return False
             
-        self.current_model_path = model_path
+        self.current_model_path = str(model_path)
         self.startup_options = {
             "n_gpu_layers": n_gpu_layers,
             "n_ctx": n_ctx,
@@ -67,12 +92,13 @@ class LLMServerService:
             self.startup_options["n_threads"] = n_threads
             
         # Create config for the server
+        # Use absolute path for model to ensure it works from any directory
         config = {
             "host": self.host,
             "port": self.port,
             "models": [
                 {
-                    "model": model_path,
+                    "model": str(model_path),  # Absolute path
                     "model_alias": "current_model",
                     "n_gpu_layers": n_gpu_layers,
                     "n_ctx": n_ctx,
@@ -105,28 +131,34 @@ class LLMServerService:
 
         # Write config to temp file
         import json
-        import tempfile
         
-        # Use a fixed path for config to avoid clutter
-        config_path = Path(model_path).parent / "server_config.json"
+        # Use a fixed path for config (in data directory, not model directory)
+        # This keeps configs separate from models
+        # Calculate data_dir from base_dir (services/llm/src/server.py -> parent(src) -> parent(llm) -> parent(services) -> parent(root))
+        base_dir = Path(__file__).parent.parent.parent.parent
+        data_dir = base_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        config_path = data_dir / "llm_server_config.json"
         try:
             with open(config_path, "w") as f:
                 json.dump(config, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to write config file: {e}")
             return False
-            
+        
+        # Build command to run from cloned repo directory
         cmd = [
             self.venv_python, "-m", "llama_cpp.server",
             "--config_file", str(config_path)
         ]
 
-        logger.info(f"Starting LLM server with config: {config_path}")
+        logger.info(f"Starting LLM server from {self.repo_dir} with config: {config_path}")
         
         try:
-            # Start process
+            # Start process from cloned repo directory
             self.process = await asyncio.create_subprocess_exec(
                 *cmd,
+                cwd=str(self.repo_dir) if self.repo_dir.exists() else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0

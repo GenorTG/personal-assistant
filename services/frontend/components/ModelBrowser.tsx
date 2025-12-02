@@ -1,11 +1,15 @@
 'use client';
 
 import { useState, useEffect, useMemo } from 'react';
-import { X, Search, RefreshCw, Filter, Download, Library, Globe } from 'lucide-react';
+import { X, Search, RefreshCw, Filter, Download, Library, Globe, FolderSearch, Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useSettings } from '@/contexts/SettingsContext';
 import LoadModelDialog from './LoadModelDialog';
 import ModelSearchResultCard from './ModelSearchResultCard';
 import SystemStatus from './SystemStatus';
+import RepoDetailsModal from './RepoDetailsModal';
+import DownloadManager, { DownloadBadge } from './DownloadManager';
+import ModelMetadataEditor from './ModelMetadataEditor';
 
 interface LoadDialogModel {
   id: string;
@@ -26,12 +30,18 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [loadDialogModel, setLoadDialogModel] = useState<LoadDialogModel | null>(null);
-  const [currentModel, setCurrentModel] = useState<string | null>(null);
-  const [modelLoaded, setModelLoaded] = useState(false);
+  const [modelMetadata, setModelMetadata] = useState<Record<string, any>>({});
+  const { modelLoaded, currentModel, refresh: refreshSettings } = useSettings();
+  const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
+  const [showDownloadManager, setShowDownloadManager] = useState(false);
+  const [editingModel, setEditingModel] = useState<any | null>(null);
   
   // Filters
-  const [sizeFilter, setSizeFilter] = useState<string>('all');
+  const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
+  const [minParams, setMinParams] = useState<number>(0);
+  const [maxParams, setMaxParams] = useState<number>(70);
   const [quantFilter, setQuantFilter] = useState<string>('all');
   
   // Advanced Settings
@@ -44,11 +54,46 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
 
   useEffect(() => {
     loadModels();
-    loadCurrentModelStatus();
     loadSystemInfo();
-    const interval = setInterval(loadCurrentModelStatus, 2000);
-    return () => clearInterval(interval);
+    loadModelMetadata();
+    // Model status is now managed by SettingsContext (auto-refreshes every 30s)
+    // No need for separate polling
   }, []);
+
+  const loadModelMetadata = async () => {
+    try {
+      const result = await api.getAllModelMetadata() as any;
+      if (result?.models) {
+        const metadataMap: Record<string, any> = {};
+        for (const model of result.models) {
+          metadataMap[model.model_id] = model;
+        }
+        setModelMetadata(metadataMap);
+      }
+    } catch (error) {
+      console.error('Error loading model metadata:', error);
+    }
+  };
+
+  const handleScanLocal = async (forceRefresh: boolean = false) => {
+    setScanning(true);
+    try {
+      const result = await api.discoverModels(forceRefresh) as any;
+      console.log('Discovery result:', result);
+      
+      // Reload models and metadata
+      await loadModels();
+      await loadModelMetadata();
+      
+      const count = result?.models?.length || 0;
+      alert(`Discovered ${count} model(s)! Check the Installed tab.`);
+    } catch (error) {
+      console.error('Error scanning for models:', error);
+      alert('Error scanning for models. Check the console for details.');
+    } finally {
+      setScanning(false);
+    }
+  };
 
   const loadSystemInfo = async () => {
     try {
@@ -88,15 +133,8 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
     }
   }, [activeTab]);
 
-  const loadCurrentModelStatus = async () => {
-    try {
-      const settings = await api.getSettings() as any;
-      setModelLoaded(settings?.model_loaded || false);
-      setCurrentModel(settings?.current_model || null);
-    } catch (error) {
-      console.error('Error loading model status:', error);
-    }
-  };
+  // Model status is now managed by SettingsContext
+  // No need for separate loadCurrentModelStatus function
 
   const loadModels = async () => {
     try {
@@ -121,45 +159,105 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
   };
 
   const handleDownload = async (repoId: string, filename?: string) => {
-    if (!confirm(`Download ${filename || repoId}?`)) return;
+    if (!filename) {
+      alert('Please select a specific file to download');
+      return;
+    }
+    
     try {
-      await api.downloadModel(repoId, filename);
-      alert('Download started! Check the console or logs for progress.');
-      await loadModels();
+      const result = await api.downloadModel(repoId, filename) as any;
+      console.log('Download started:', result);
+      
+      // Open download manager to show progress
+      setShowDownloadManager(true);
     } catch (error) {
-      console.error('Error downloading model:', error);
-      alert('Error downloading model');
+      console.error('Error starting download:', error);
+      alert('Error starting download: ' + (error as Error).message);
+    }
+  };
+  
+  const handleDownloadComplete = async () => {
+    // Refresh model list when a download completes
+    await loadModels();
+    await loadModelMetadata();
+  };
+
+  const handleDeleteModel = async (modelId: string) => {
+    try {
+      await api.deleteModel(modelId);
+      // Refresh the list after deletion
+      await loadModels();
+      await loadModelMetadata();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error('Failed to delete model:', err);
+      throw new Error(message || 'Failed to delete model');
     }
   };
 
   // Filter logic
   const filteredSearchResults = useMemo(() => {
     return searchResults.filter(model => {
-      if (sizeFilter !== 'all') {
-        // Rough heuristic for size filtering based on tags/name
-        const name = model.model_id.toLowerCase();
-        if (sizeFilter === 'small' && !name.match(/7b|13b|small|tiny/)) return false;
-        if (sizeFilter === 'medium' && !name.match(/30b|34b|medium/)) return false;
-        if (sizeFilter === 'large' && !name.match(/70b|large|huge/)) return false;
+      // Extract parameters from model name/tags
+      const extractParamsFromModel = (modelData: any): number | null => {
+        const name = modelData.model_id?.toLowerCase() || '';
+        const tags = modelData.tags || [];
+        
+        // Check tags first
+        for (const tag of tags) {
+          const match = tag.match(/(\d+)b/i);
+          if (match) return parseInt(match[1]);
+        }
+        
+        // Check name
+        const nameMatch = name.match(/(\d+)b/i);
+        if (nameMatch) return parseInt(nameMatch[1]);
+        
+        return null;
+      };
+      
+      const params = extractParamsFromModel(model);
+      
+      // Filter by parameter range
+      if (params !== null) {
+        if (params < minParams || params > maxParams) return false;
       }
+      
       return true;
     });
-  }, [searchResults, sizeFilter]);
+  }, [searchResults, minParams, maxParams]);
 
   const filteredInstalledModels = useMemo(() => {
     return models.filter(model => {
       const name = model.name.toLowerCase();
       if (searchQuery && !name.includes(searchQuery.toLowerCase())) return false;
       return true;
+    }).map(model => {
+      // Enhance with discovered metadata
+      const metadata = modelMetadata[model.model_id];
+      if (metadata) {
+        return {
+          ...model,
+          repo_id: metadata.repo_id,
+          repo_name: metadata.repo_name,
+          author: metadata.author,
+          architecture: metadata.architecture,
+          parameters: metadata.parameters,
+          quantization: metadata.quantization,
+          context_length: metadata.context_length,
+          discovered: true,
+        };
+      }
+      return model;
     });
-  }, [models, searchQuery]);
+  }, [models, searchQuery, modelMetadata]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 sm:p-8">
       <div className="bg-white w-full max-w-6xl h-[85vh] rounded-2xl shadow-2xl flex overflow-hidden border border-gray-200">
         
         {/* Sidebar Filters */}
-        <div className="w-64 bg-gray-50 border-r border-gray-200 p-6 flex flex-col gap-6">
+        <div className="w-64 bg-gray-50 border-r border-gray-200 p-6 flex flex-col gap-6 overflow-y-auto">
           <div>
             <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2 mb-6">
               <Filter size={20} /> Filters
@@ -168,23 +266,37 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
             <div className="space-y-6">
               <div>
                 <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3 block">
-                  Model Size
+                  Model Size (Billions of Parameters)
                 </label>
-                <div className="space-y-2">
-                  {['all', 'small', 'medium', 'large'].map((size) => (
-                    <label key={size} className="flex items-center gap-2 cursor-pointer group">
-                      <input
-                        type="radio"
-                        name="size"
-                        checked={sizeFilter === size}
-                        onChange={() => setSizeFilter(size)}
-                        className="w-4 h-4 text-primary-600 border-gray-300 focus:ring-primary-500"
-                      />
-                      <span className="text-sm text-gray-700 group-hover:text-gray-900 capitalize">
-                        {size === 'all' ? 'Any Size' : size}
-                      </span>
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-xs text-gray-600 block mb-1">
+                      Min: {minParams}B
                     </label>
-                  ))}
+                    <input
+                      type="range"
+                      min="0"
+                      max="70"
+                      step="1"
+                      value={minParams}
+                      onChange={(e) => setMinParams(Number(e.target.value))}
+                      className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary-600"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-600 block mb-1">
+                      Max: {maxParams}B
+                    </label>
+                    <input
+                      type="range"
+                      min="0"
+                      max="70"
+                      step="1"
+                      value={maxParams}
+                      onChange={(e) => setMaxParams(Number(e.target.value))}
+                      className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary-600"
+                    />
+                  </div>
                 </div>
               </div>
 
@@ -295,6 +407,43 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
                 Search for "GGUF" to find compatible models. Look for Q4_K_M quantization for best balance.
               </p>
             </div>
+            
+            {/* View Mode Toggle */}
+            {activeTab === 'discover' && (
+              <div className="flex bg-gray-100 p-1 rounded-lg">
+                <button
+                  onClick={() => setViewMode('grid')}
+                  className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
+                    viewMode === 'grid'
+                      ? 'bg-white text-gray-900 shadow-sm'
+                      : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                  title="Grid View"
+                >
+                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
+                    <rect x="1" y="1" width="6" height="6" rx="1"/>
+                    <rect x="9" y="1" width="6" height="6" rx="1"/>
+                    <rect x="1" y="9" width="6" height="6" rx="1"/>
+                    <rect x="9" y="9" width="6" height="6" rx="1"/>
+                  </svg>
+                </button>
+                <button
+                  onClick={() => setViewMode('list')}
+                  className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
+                    viewMode === 'list'
+                      ? 'bg-white text-gray-900 shadow-sm'
+                      : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                  title="List View"
+                >
+                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
+                    <rect x="1" y="2" width="14" height="2" rx="1"/>
+                    <rect x="1" y="7" width="14" height="2" rx="1"/>
+                    <rect x="1" y="12" width="14" height="2" rx="1"/>
+                  </svg>
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -333,7 +482,25 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
               </div>
             </div>
 
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              {/* Downloads Button */}
+              <DownloadBadge onClick={() => setShowDownloadManager(true)} />
+              
+              {/* Scan Local Models Button */}
+              <button
+                onClick={() => handleScanLocal(false)}
+                disabled={scanning}
+                className="btn-secondary flex items-center gap-2 py-2 px-4"
+                title="Scan data/models folder for manually added GGUF files and find their HuggingFace sources"
+              >
+                {scanning ? (
+                  <Loader2 size={16} className="animate-spin" />
+                ) : (
+                  <FolderSearch size={16} />
+                )}
+                {scanning ? 'Scanning...' : 'Scan Local'}
+              </button>
+              
               <button onClick={onClose} className="btn-icon text-gray-400 hover:text-gray-600 hover:bg-gray-100">
                 <X size={24} />
               </button>
@@ -367,14 +534,12 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
           {/* Content Area */}
           <div className="flex-1 overflow-y-auto px-8 pb-8">
             {activeTab === 'discover' ? (
-              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
+              <div className={viewMode === 'grid' ? 'grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6' : 'space-y-3'}>
                 {filteredSearchResults.map((model) => (
                   <ModelSearchResultCard
                     key={model.model_id}
                     model={model}
-                    onDownload={(id) => handleDownload(id)}
-                    availableVram={availableVram}
-                    targetContext={targetContext}
+                    onViewDetails={(id) => setSelectedModelId(id)}
                   />
                 ))}
                 {filteredSearchResults.length === 0 && !loading && (
@@ -410,6 +575,8 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
                           moeInfo: model.moe,
                         })
                       }
+                      onEditMetadata={(m) => setEditingModel(m)}
+                      onDelete={handleDeleteModel}
                     />
                   );
                 })}
@@ -438,8 +605,39 @@ export default function ModelBrowser({ onClose }: ModelBrowserProps) {
           onClose={() => setLoadDialogModel(null)}
           onSuccess={() => {
             setLoadDialogModel(null);
-            loadCurrentModelStatus();
+            refreshSettings(); // Refresh settings to get updated model status
             loadModels();
+          }}
+        />
+      )}
+
+      {/* Repo Details Modal */}
+      {selectedModelId && (
+        <RepoDetailsModal
+          modelId={selectedModelId}
+          onClose={() => setSelectedModelId(null)}
+          onDownload={(filename) => {
+            handleDownload(selectedModelId, filename);
+            setSelectedModelId(null);
+          }}
+        />
+      )}
+
+      {/* Download Manager */}
+      <DownloadManager
+        isOpen={showDownloadManager}
+        onClose={() => setShowDownloadManager(false)}
+        onDownloadComplete={handleDownloadComplete}
+      />
+
+      {/* Metadata Editor */}
+      {editingModel && (
+        <ModelMetadataEditor
+          model={editingModel}
+          onClose={() => setEditingModel(null)}
+          onSave={() => {
+            loadModels();
+            loadModelMetadata();
           }}
         />
       )}

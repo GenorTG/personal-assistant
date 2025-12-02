@@ -1,4 +1,4 @@
-import aiohttp
+
 import io
 import subprocess
 import sys
@@ -90,10 +90,12 @@ class KokoroBackend(TTSBackend):
     async def is_service_running(self) -> bool:
         """Check if service is running via health check."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.service_url}/health", timeout=1.0) as response:
-                    return response.status == 200
-        except:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{self.service_url}/health")
+                return response.status_code == 200
+        except Exception as e:
+            # logger.debug(f"Kokoro health check failed: {e}")
             return False
 
     async def initialize(self) -> bool:
@@ -105,6 +107,7 @@ class KokoroBackend(TTSBackend):
         
         if await self.is_service_running():
             self.status = TTSBackendStatus.READY
+            self.error_message = None  # Clear any previous error
             return True
             
         # Auto-start if not running?

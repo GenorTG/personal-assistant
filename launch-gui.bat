@@ -1,4 +1,15 @@
 @echo off
+if "%1"=="hidden" goto :hidden
+:: If launched directly, use VBS wrapper to hide window
+set "BAT_DIR=%~dp0"
+if exist "%BAT_DIR%launch-gui.vbs" (
+    wscript.exe "%BAT_DIR%launch-gui.vbs"
+    exit
+)
+:: Fallback: launch hidden via cmd
+cmd /c start /min "" "%~f0" hidden
+exit
+:hidden
 setlocal
 
 set "PROJECT_ROOT=%~dp0"
@@ -36,13 +47,9 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
 )
 
 :: Run the launcher
-echo [INFO] Starting Launcher...
-:: Use pythonw to run without a console window if desired, but python allows seeing startup errors
-"%VENV_DIR%\Scripts\python" "%LAUNCHER_DIR%\launcher.py"
+:: Use pythonw to run without a console window
+:: Use start with /B to run in background without showing console
+start "" "%VENV_DIR%\Scripts\pythonw.exe" "%LAUNCHER_DIR%\launcher.py"
 
-if %errorlevel% neq 0 (
-    echo [ERROR] Launcher exited with error code %errorlevel%
-    pause
-)
-
-endlocal
+:: Exit immediately - the launcher runs independently
+exit /b

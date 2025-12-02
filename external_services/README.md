@@ -34,12 +34,14 @@ The launcher handles cloning, setup, and dependency installation automatically:
 You can also manage services manually:
 
 **Update to latest version:**
+
 ```bash
 cd external_services/chatterbox-tts-api
 git pull
 ```
 
 **Check service status:**
+
 ```bash
 cd external_services/chatterbox-tts-api
 git status
@@ -47,6 +49,7 @@ git log -1
 ```
 
 **Reconfigure:**
+
 ```bash
 cd external_services/chatterbox-tts-api
 cp .env.example .env
@@ -64,15 +67,18 @@ To add a new external service:
 ## Troubleshooting
 
 **Service won't clone:**
+
 - Ensure Git is installed and accessible
 - Check internet connectivity
 - Verify repository URL is correct
 
 **Service won't start:**
+
 - Check if dependencies are installed (click "Install" button)
 - Verify the service's `.env` file is configured
 - Check service logs in the launcher GUI
 
 **Service out of date:**
+
 - Navigate to service directory and run `git pull`
 - Or delete the service directory and let launcher re-clone it

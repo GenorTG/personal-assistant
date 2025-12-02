@@ -1,28 +1,43 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { Send, Mic, Volume2 } from 'lucide-react';
+import { Send, Mic, Volume2, Zap, Search, Code, FileText, Brain, Calendar, Info, Paperclip, X, Square, RefreshCw, Edit2, Check, X as XIcon } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useSamplerSettings } from '@/contexts/SamplerSettingsContext';
+import { useSettings } from '@/contexts/SettingsContext';
+import { formatError, isNotFoundError, showError } from '@/lib/utils';
 import AudioVisualizer from './AudioVisualizer';
 
 interface ChatPanelProps {
   conversationId: string | null;
+  onConversationNotFound?: (conversationId: string) => void;
+  onConversationCreated?: (conversationId: string) => void;
 }
 
-export default function ChatPanel({ conversationId }: ChatPanelProps) {
+export default function ChatPanel({ conversationId, onConversationNotFound, onConversationCreated }: ChatPanelProps) {
+  const { settings: samplerSettings } = useSamplerSettings();
+  const { userName: contextUserName, botName: contextBotName } = useSettings();
+  
   const [messages, setMessages] = useState<any[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [abortController, setAbortController] = useState<AbortController | null>(null);
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [editContent, setEditContent] = useState<string>('');
   const [recording, setRecording] = useState(false);
   const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
-  const [userName, setUserName] = useState<string>('You');
-  const [botName, setBotName] = useState<string>('Assistant');
+  const [userName, setUserName] = useState<string>(contextUserName || 'You');
+  const [botName, setBotName] = useState<string>(contextBotName || 'Assistant');
+  const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Update names when context changes
   useEffect(() => {
-    loadUserNames();
-  }, []);
+    if (contextUserName) setUserName(contextUserName);
+    if (contextBotName) setBotName(contextBotName);
+  }, [contextUserName, contextBotName]);
 
   useEffect(() => {
     if (conversationId) {
@@ -32,28 +47,8 @@ export default function ChatPanel({ conversationId }: ChatPanelProps) {
     }
   }, [conversationId]);
 
-  const loadUserNames = async () => {
-    try {
-      // Wait for backend to be ready first
-      const ready = await api.checkBackendHealth();
-      if (!ready) {
-        // Backend not ready yet, will retry later
-        return;
-      }
-      const data = await api.getSettings() as any;
-      if (data.settings?.user_profile?.name) {
-        setUserName(data.settings.user_profile.name);
-      }
-      if (data.settings?.character_card?.name) {
-        setBotName(data.settings.character_card.name);
-      }
-    } catch (error) {
-      // Only log if it's not a "backend not ready" error
-      if (error instanceof Error && !error.message.includes('Backend is not responding')) {
-        console.error('Error loading user names:', error);
-      }
-    }
-  };
+  // User names are now managed by SettingsContext
+  // No need for separate loadUserNames function
 
   useEffect(() => {
     scrollToBottom();
@@ -71,48 +66,204 @@ export default function ChatPanel({ conversationId }: ChatPanelProps) {
     try {
       const conv = await api.getConversation(conversationId) as any;
       setMessages(conv.messages || []);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error loading conversation:', error);
-      // If conversation doesn't exist, clear messages
+      
+      // Check if it's a 404 (conversation not found)
+      if (isNotFoundError(error)) {
+        // Conversation not found, will be removed from list
+        // Notify parent to remove this conversation
+        if (onConversationNotFound) {
+          onConversationNotFound(conversationId);
+        }
+      }
+      
+      // Clear messages for any error
       setMessages([]);
     }
   };
 
-  const handleSend = async () => {
-    if (!input.trim() || loading) return;
+  const handleFileUpload = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
 
-    const userMessage = input.trim();
-    setInput('');
+    const fileArray = Array.from(files);
+    
+    // Upload files to data/files/
+    for (const file of fileArray) {
+      try {
+        await api.uploadFile(file);
+        setUploadedFiles((prev) => [...prev, file]);
+      } catch (error) {
+        console.error(`Error uploading ${file.name}:`, error);
+        showError(formatError(error), `Error uploading ${file.name}`);
+      }
+    }
+    
+    // Reset file input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const handleRemoveFile = (index: number) => {
+    setUploadedFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const handleStop = () => {
+    if (abortController) {
+      abortController.abort();
+      setAbortController(null);
+      setLoading(false);
+    }
+  };
+
+  const handleRegenerate = async () => {
+    if (!conversationId || loading) return;
+    
     setLoading(true);
+    try {
+      const response = await api.regenerateLastResponse(
+        conversationId,
+        samplerSettings
+      ) as any;
+      
+      // Remove the last assistant message from local state (if any)
+      setMessages((prev) => {
+        // Find last assistant message and remove it
+        let lastAssistantIdx = prev.length - 1;
+        while (lastAssistantIdx >= 0 && prev[lastAssistantIdx].role !== 'assistant') {
+          lastAssistantIdx--;
+        }
+        if (lastAssistantIdx >= 0) {
+          return prev.slice(0, lastAssistantIdx);
+        }
+        return prev;
+      });
+      
+      // Add the new regenerated response
+      const assistantMessage = {
+        role: 'assistant',
+        content: response.response,
+        timestamp: new Date().toISOString(),
+        tool_calls: response.tool_calls || [],
+        context_used: response.context_used || [],
+      };
+      setMessages((prev) => [...prev, assistantMessage]);
+    } catch (error) {
+      console.error('Error regenerating:', error);
+      showError(formatError(error), 'Error regenerating response');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleStartEdit = (index: number) => {
+    setEditingIndex(index);
+    setEditContent(messages[index].content);
+  };
+
+  const handleCancelEdit = () => {
+    setEditingIndex(null);
+    setEditContent('');
+  };
+
+  const handleSaveEdit = async () => {
+    if (editingIndex === null || !conversationId) return;
+    
+    const message = messages[editingIndex];
+    try {
+      await api.updateMessage(
+        conversationId,
+        editingIndex,
+        editContent,
+        message.role
+      );
+      
+      // Update local state
+      setMessages((prev) => {
+        const updated = [...prev];
+        updated[editingIndex] = { ...updated[editingIndex], content: editContent };
+        return updated;
+      });
+      
+      setEditingIndex(null);
+      setEditContent('');
+      
+      // If we edited the last user message, we might want to regenerate
+      // But for now, just save the edit
+    } catch (error) {
+      console.error('Error updating message:', error);
+      showError(formatError(error), 'Error updating message');
+    }
+  };
+
+  const handleSend = async () => {
+    if ((!input.trim() && uploadedFiles.length === 0) || loading) return;
+
+    let userMessage = input.trim();
+    
+    // Add file references to message
+    if (uploadedFiles.length > 0) {
+      const fileNames = uploadedFiles.map(f => f.name).join(', ');
+      userMessage = userMessage 
+        ? `${userMessage}\n\n[Files: ${fileNames}]`
+        : `[Files: ${fileNames}]`;
+    }
+
+    setInput('');
+    setUploadedFiles([]);
+    setLoading(true);
+
+    // Create abort controller for this request
+    const controller = new AbortController();
+    setAbortController(controller);
 
     // Add user message immediately
     const newUserMessage = {
       role: 'user',
       content: userMessage,
       timestamp: new Date().toISOString(),
+      files: uploadedFiles.map(f => ({ name: f.name, size: f.size, type: f.type })),
     };
     setMessages((prev) => [...prev, newUserMessage]);
 
     try {
-      const response = await api.sendMessage(userMessage, conversationId || undefined) as any;
+      // Send message with current sampler settings from context
+      const response = await api.sendMessage(
+        userMessage, 
+        conversationId || undefined,
+        samplerSettings,
+        controller
+      ) as any;
       
-      // Update conversation ID if new
+      // Update conversation ID if new conversation was created
       if (response.conversation_id && response.conversation_id !== conversationId) {
-        window.location.reload(); // Reload to update conversation list
+        // Notify parent to update conversation list
+        if (onConversationCreated) {
+          onConversationCreated(response.conversation_id);
+        }
       }
 
-      // Add assistant response
+      // Add assistant response with tool calls and context
       const assistantMessage = {
         role: 'assistant',
         content: response.response,
         timestamp: new Date().toISOString(),
+        tool_calls: response.tool_calls || [],
+        context_used: response.context_used || [],
       };
       setMessages((prev) => [...prev, assistantMessage]);
-    } catch (error) {
-      console.error('Error sending message:', error);
-      alert(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } catch (error: any) {
+      // Don't show error if it was a cancellation
+      if (error.name !== 'AbortError') {
+        console.error('Error sending message:', error);
+        showError(formatError(error), 'Error sending message');
+        // Remove the user message if request failed (unless it was cancelled)
+        setMessages((prev) => prev.slice(0, -1));
+      }
     } finally {
       setLoading(false);
+      setAbortController(null);
     }
   };
 
@@ -185,6 +336,16 @@ export default function ChatPanel({ conversationId }: ChatPanelProps) {
           messages.map((msg, idx) => {
             const isUser = msg.role === 'user';
             const displayName = isUser ? userName : botName;
+            const toolCalls = msg.tool_calls || [];
+            const contextUsed = msg.context_used || [];
+            
+            const toolIcons: Record<string, any> = {
+              web_search: Search,
+              execute_code: Code,
+              file_access: FileText,
+              memory: Brain,
+              calendar: Calendar,
+            };
             
             return (
             <div
@@ -199,6 +360,41 @@ export default function ChatPanel({ conversationId }: ChatPanelProps) {
             >
                   {displayName}
                 </span>
+                
+                {/* Context indicator */}
+                {!isUser && contextUsed.length > 0 && (
+                  <div className="mb-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700 flex items-center gap-2 max-w-3xl">
+                    <Info size={14} />
+                    <span>Used {contextUsed.length} relevant context{contextUsed.length > 1 ? 's' : ''} from past conversations</span>
+                  </div>
+                )}
+                
+                {/* Tool calls indicator */}
+                {!isUser && toolCalls.length > 0 && (
+                  <div className="mb-2 space-y-1 max-w-3xl">
+                    {toolCalls.map((toolCall: any, toolIdx: number) => {
+                      const ToolIcon = toolIcons[toolCall.name] || Zap;
+                      return (
+                        <div
+                          key={toolIdx}
+                          className="px-3 py-2 bg-purple-50 border border-purple-200 rounded-lg text-xs flex items-center gap-2"
+                        >
+                          <ToolIcon size={14} className="text-purple-600" />
+                          <span className="text-purple-700 font-medium capitalize">
+                            {toolCall.name?.replace(/_/g, ' ') || 'Tool'}
+                          </span>
+                          {toolCall.result && (
+                            <span className="text-purple-600 ml-auto">✓ Executed</span>
+                          )}
+                          {toolCall.error && (
+                            <span className="text-red-600 ml-auto">✗ Failed</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                
                 {/* Message bubble */}
               <div
                 className={`max-w-3xl rounded-lg px-4 py-2 ${
@@ -207,23 +403,103 @@ export default function ChatPanel({ conversationId }: ChatPanelProps) {
                     : 'bg-gray-100 text-gray-800'
                 }`}
               >
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="whitespace-pre-wrap flex-1">{msg.content}</p>
-                    {!isUser && msg.content && (
-                      <button
-                        onClick={() => handleTTS(msg.content)}
-                        className={`p-1.5 rounded transition-colors ${
-                          isUser
-                            ? 'hover:bg-primary-700 text-white'
-                            : 'hover:bg-gray-200 text-gray-600'
-                        }`}
-                        title="Text to Speech"
-                      >
-                        <Volume2 size={16} />
-                      </button>
-                    )}
-                  </div>
+                  {editingIndex === idx ? (
+                    // Edit mode
+                    <div className="space-y-2">
+                      <textarea
+                        value={editContent}
+                        onChange={(e) => setEditContent(e.target.value)}
+                        className="w-full p-2 border border-gray-300 rounded text-gray-800 bg-white resize-none"
+                        rows={4}
+                        autoFocus
+                      />
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleSaveEdit}
+                          className="px-3 py-1.5 bg-green-600 text-white rounded hover:bg-green-700 transition-colors flex items-center gap-1.5 text-sm"
+                        >
+                          <Check size={14} />
+                          Save
+                        </button>
+                        <button
+                          onClick={handleCancelEdit}
+                          className="px-3 py-1.5 bg-gray-300 text-gray-700 rounded hover:bg-gray-400 transition-colors flex items-center gap-1.5 text-sm"
+                        >
+                          <XIcon size={14} />
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1">
+                        <p className="whitespace-pre-wrap">{msg.content}</p>
+                        {/* Show uploaded files in message */}
+                        {msg.files && msg.files.length > 0 && (
+                          <div className={`mt-2 pt-2 flex flex-wrap gap-2 ${
+                            isUser ? 'border-t border-white/30' : 'border-t border-gray-300'
+                          }`}>
+                            {msg.files.map((file: any, fileIdx: number) => (
+                              <div
+                                key={fileIdx}
+                                className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs ${
+                                  isUser
+                                    ? 'bg-white/20 text-white'
+                                    : 'bg-gray-200 text-gray-700'
+                                }`}
+                              >
+                                <FileText size={12} />
+                                <span className="truncate max-w-[150px]">{file.name}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1 flex-shrink-0">
+                        {/* Edit button */}
+                        <button
+                          onClick={() => handleStartEdit(idx)}
+                          className={`p-1.5 rounded transition-colors ${
+                            isUser
+                              ? 'hover:bg-primary-700 text-white'
+                              : 'hover:bg-gray-200 text-gray-600'
+                          }`}
+                          title="Edit message"
+                        >
+                          <Edit2 size={14} />
+                        </button>
+                        {/* TTS button for assistant messages */}
+                        {!isUser && msg.content && (
+                          <button
+                            onClick={() => handleTTS(msg.content)}
+                            className={`p-1.5 rounded transition-colors ${
+                              isUser
+                                ? 'hover:bg-primary-700 text-white'
+                                : 'hover:bg-gray-200 text-gray-600'
+                            }`}
+                            title="Text to Speech"
+                          >
+                            <Volume2 size={14} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
+                
+                {/* Regenerate button for last assistant message */}
+                {!isUser && idx === messages.length - 1 && !loading && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      onClick={handleRegenerate}
+                      className="px-3 py-1.5 text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 rounded transition-colors flex items-center gap-1.5"
+                      title="Regenerate response"
+                    >
+                      <RefreshCw size={12} />
+                      Regenerate
+                    </button>
+                  </div>
+                )}
               </div>
             );
           })
@@ -233,8 +509,16 @@ export default function ChatPanel({ conversationId }: ChatPanelProps) {
             <span className="text-xs font-medium mb-1 px-2 text-gray-600">
               {botName}
             </span>
-            <div className="bg-gray-100 rounded-lg px-4 py-2">
+            <div className="bg-gray-100 rounded-lg px-4 py-2 flex items-center gap-3">
               <p className="text-gray-500">Thinking...</p>
+              <button
+                onClick={handleStop}
+                className="px-3 py-1.5 bg-red-500 hover:bg-red-600 text-white rounded transition-colors flex items-center gap-1.5 text-sm"
+                title="Stop generation"
+              >
+                <Square size={12} />
+                Stop
+              </button>
             </div>
           </div>
         )}
@@ -242,7 +526,29 @@ export default function ChatPanel({ conversationId }: ChatPanelProps) {
       </div>
 
       {/* Input */}
-      <div className="border-t border-gray-200 p-4">
+      <div className="border-t border-gray-200 p-4 bg-white">
+        {/* Uploaded Files Preview */}
+        {uploadedFiles.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-2">
+            {uploadedFiles.map((file, idx) => (
+              <div
+                key={idx}
+                className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg text-sm"
+              >
+                <FileText size={14} className="text-blue-600" />
+                <span className="text-blue-700 truncate max-w-[200px]">{file.name}</span>
+                <button
+                  onClick={() => handleRemoveFile(idx)}
+                  className="p-0.5 hover:bg-blue-200 rounded transition-colors"
+                  title="Remove file"
+                >
+                  <X size={14} className="text-blue-600" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        
         <div className="flex gap-2 items-end">
           <div className="flex-1 relative">
             <textarea
@@ -256,9 +562,23 @@ export default function ChatPanel({ conversationId }: ChatPanelProps) {
               }}
               placeholder="Type your message..."
               rows={1}
-              className="input resize-none pr-12"
+              className="input resize-none pr-32"
             />
             <div className="absolute right-2 bottom-2 flex items-center gap-2">
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={(e) => handleFileUpload(e.target.files)}
+                multiple
+                className="hidden"
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="p-2 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 transition-colors"
+                title="Upload File"
+              >
+                <Paperclip size={20} />
+              </button>
               {recording && audioStream && (
                 <div className="w-24 h-8 bg-gray-100 rounded-lg overflow-hidden border border-gray-200">
                   <AudioVisualizer stream={audioStream} />
@@ -277,13 +597,22 @@ export default function ChatPanel({ conversationId }: ChatPanelProps) {
               </button>
             </div>
           </div>
-          <button
-            onClick={handleSend}
-            disabled={!input.trim() || loading}
-            className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <Send size={20} />
-          </button>
+          {loading ? (
+            <button
+              onClick={handleStop}
+              className="btn-primary bg-red-500 hover:bg-red-600"
+            >
+              <Square size={20} />
+            </button>
+          ) : (
+            <button
+              onClick={handleSend}
+              disabled={!input.trim() && uploadedFiles.length === 0}
+              className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Send size={20} />
+            </button>
+          )}
         </div>
       </div>
     </div>

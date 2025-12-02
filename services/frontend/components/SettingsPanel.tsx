@@ -4,15 +4,20 @@ import { useState, useEffect } from 'react';
 import { Loader, CheckCircle, XCircle, Volume2 } from 'lucide-react';
 import { X } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useSettings } from '@/contexts/SettingsContext';
 import TTSSettings from './TTSSettings';
 import STTSettings from './STTSettings';
 import { ServiceStatusPanel } from './ServiceStatusPanel';
+import SystemPromptEditor from './SystemPromptEditor';
+import ToolSettings from './ToolSettings';
+import MemorySettings from './MemorySettings';
+import SamplerSettings from './SamplerSettings';
 
 interface SettingsPanelProps {
   onClose: () => void;
 }
 
-type SettingsTab = 'ai' | 'tts' | 'stt' | 'character' | 'profile';
+type SettingsTab = 'ai' | 'tts' | 'stt' | 'character' | 'profile' | 'system-prompt' | 'tools' | 'memory';
 
 // TTS Settings Component (deprecated - using separate component)
 function TTSSettingsSection() {
@@ -296,22 +301,32 @@ function TTSSettingsSection() {
 }
 
 export default function SettingsPanel({ onClose }: SettingsPanelProps) {
-  const [settings, setSettings] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
+  const { settings: contextSettings, isLoading: settingsLoading, refresh: refreshSettings } = useSettings();
+  const [settings, setSettings] = useState<any>(contextSettings?.settings || null);
   const [activeTab, setActiveTab] = useState<SettingsTab>('ai');
+  const [llmServiceStatus, setLlmServiceStatus] = useState<any>(null);
+  const [llmServiceLoading, setLlmServiceLoading] = useState(false);
+
+  // Update local settings when context changes
+  useEffect(() => {
+    if (contextSettings?.settings) {
+      setSettings(contextSettings.settings);
+    }
+  }, [contextSettings]);
 
   useEffect(() => {
-    loadSettings();
+    loadLLMServiceStatus();
   }, []);
 
-  const loadSettings = async () => {
+  const loadLLMServiceStatus = async () => {
     try {
-      const data = await api.getSettings() as any;
-      setSettings(data.settings);
+      setLlmServiceLoading(true);
+      const serviceStatus = await api.getLLMServiceStatus() as any;
+      setLlmServiceStatus(serviceStatus);
     } catch (error) {
-      console.error('Error loading settings:', error);
+      console.error('Error loading LLM service status:', error);
     } finally {
-      setLoading(false);
+      setLlmServiceLoading(false);
     }
   };
 
@@ -327,6 +342,9 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   const tabs: { id: SettingsTab; label: string }[] = [
     { id: 'ai', label: 'AI' },
+    { id: 'system-prompt', label: 'System Prompt' },
+    { id: 'tools', label: 'Tools' },
+    { id: 'memory', label: 'Memory' },
     { id: 'tts', label: 'TTS' },
     { id: 'stt', label: 'STT' },
     { id: 'character', label: 'Character' },
@@ -368,7 +386,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
       
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4">
-        {loading ? (
+        {settingsLoading ? (
           <div className="flex items-center justify-center py-8">
             <p className="text-gray-500">Loading settings...</p>
           </div>
@@ -380,87 +398,36 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           <>
             {activeTab === 'ai' && (
               <div className="space-y-4">
-          <h3 className="font-semibold mb-4">AI Settings</h3>
-            <div>
-              <label className="block text-sm font-medium mb-1">
-                Temperature: {settings?.temperature || 0.7}
-              </label>
-              <input
-                type="range"
-                min="0"
-                max="2"
-                step="0.1"
-                value={settings?.temperature || 0.7}
-                onChange={(e) =>
-                  setSettings({ ...settings, temperature: parseFloat(e.target.value) })
-                }
-                className="w-full"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">
-                Top P: {settings?.top_p || 0.9}
-              </label>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                value={settings?.top_p || 0.9}
-                onChange={(e) =>
-                  setSettings({ ...settings, top_p: parseFloat(e.target.value) })
-                }
-                className="w-full"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">Top K</label>
-              <input
-                type="number"
-                value={settings?.top_k || 40}
-                onChange={(e) =>
-                  setSettings({ ...settings, top_k: parseInt(e.target.value) })
-                }
-                className="input"
-              />
-            </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">
-                    CPU Threads: {settings?.llm_n_threads || navigator.hardwareConcurrency || 'Auto'}
-                  </label>
-                  <input
-                    type="range"
-                    min="1"
-                    max={navigator.hardwareConcurrency || 16}
-                    step="1"
-                    value={settings?.llm_n_threads || Math.floor((navigator.hardwareConcurrency || 8) / 2)}
-                    onChange={(e) =>
-                      setSettings({ ...settings, llm_n_threads: parseInt(e.target.value) })
-                    }
-                    className="w-full"
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    Available: {navigator.hardwareConcurrency || 'Unknown'} threads
-                  </p>
+                <h3 className="font-semibold mb-4">AI Sampler Settings</h3>
+                
+                {/* LLM Service Status */}
+                <div className="border-b border-gray-200 pb-4 mb-4">
+                  <label className="block text-sm font-medium mb-2">LLM Service Status</label>
+                  <div className="p-3 border rounded-lg bg-gray-50">
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium">llama-cpp-python Server</span>
+                      <div className="text-sm">
+                        {llmServiceStatus?.running ? (
+                          <span className="text-green-600 font-medium">● Running</span>
+                        ) : (
+                          <span className="text-gray-400">○ Stopped</span>
+                        )}
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-1">Port 8001 - Load a model to start</p>
+                  </div>
                 </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">
-                Repeat Penalty: {settings?.repeat_penalty || 1.1}
-              </label>
-              <input
-                type="range"
-                min="0.5"
-                max="2"
-                step="0.1"
-                value={settings?.repeat_penalty || 1.1}
-                onChange={(e) =>
-                  setSettings({ ...settings, repeat_penalty: parseFloat(e.target.value) })
-                }
-                className="w-full"
-              />
-            </div>
-          </div>
+
+                {/* Full Sampler Settings Component */}
+                <SamplerSettings />
+              </div>
             )}
+
+            {activeTab === 'system-prompt' && <SystemPromptEditor />}
+
+            {activeTab === 'tools' && <ToolSettings />}
+
+            {activeTab === 'memory' && <MemorySettings />}
 
             {activeTab === 'tts' && <TTSSettings />}
 
@@ -549,15 +516,15 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         )}
       </div>
       
-      {/* Footer */}
-      {!loading && settings && (activeTab === 'ai' || activeTab === 'character' || activeTab === 'profile') && (
+      {/* Footer - only for tabs without their own save button */}
+      {!settingsLoading && settings && (activeTab === 'character' || activeTab === 'profile') && (
         <div className="p-4 border-t border-gray-200 flex-shrink-0 bg-gray-50">
           <button 
             onClick={handleSave} 
             className="btn-primary w-full"
-            disabled={loading}
+            disabled={settingsLoading}
           >
-            {activeTab === 'character' ? 'Save Character' : activeTab === 'profile' ? 'Save User Profile' : 'Save Settings'}
+            {activeTab === 'character' ? 'Save Character' : 'Save User Profile'}
           </button>
         </div>
       )}

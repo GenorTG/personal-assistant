@@ -15,48 +15,9 @@ export default function TTSSettings() {
   const [loading, setLoading] = useState(true);
   const [selectedBackend, setSelectedBackend] = useState<string>("");
   const [updating, setUpdating] = useState(false);
-  const [chatterboxServiceStatus, setChatterboxServiceStatus] =
-    useState<any>(null);
-  const [chatterboxInstalling, setChatterboxInstalling] = useState(false);
-  const [chatterboxStarting, setChatterboxStarting] = useState(false);
-  const [logs, setLogs] = useState<string[]>([]);
-
-  // Poll logs when installing or starting
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (chatterboxInstalling || chatterboxStarting) {
-      interval = setInterval(async () => {
-        try {
-          const result = await api.getChatterboxServiceLogs();
-          if (result && result.logs) {
-            setLogs(result.logs);
-          }
-        } catch (error) {
-          console.error("Error fetching logs:", error);
-        }
-      }, 1000);
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [chatterboxInstalling, chatterboxStarting]);
-
-  // Poll status when installing or starting to keep state in sync
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (chatterboxInstalling || chatterboxStarting || chatterboxServiceStatus?.is_installing) {
-      interval = setInterval(async () => {
-        await loadChatterboxServiceStatus();
-      }, 2000); // Poll every 2 seconds
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [chatterboxInstalling, chatterboxStarting, chatterboxServiceStatus?.is_installing]);
 
   useEffect(() => {
     loadTTSInfo();
-    loadChatterboxServiceStatus();
   }, []);
 
   // Get backend health from global context
@@ -64,61 +25,6 @@ export default function TTSSettings() {
     piper: statuses?.tts?.piper || { status: 'offline' },
     chatterbox: statuses?.tts?.chatterbox || { status: 'offline' },
     kokoro: statuses?.tts?.kokoro || { status: 'offline' },
-  };
-
-  const loadChatterboxServiceStatus = async () => {
-    try {
-      const status = await api.getChatterboxServiceStatus() as any;
-      setChatterboxServiceStatus(status);
-      
-      // Sync local state with backend state
-      if (status.is_installing) {
-        setChatterboxInstalling(true);
-      } else if (chatterboxInstalling && !status.is_installing) {
-        setChatterboxInstalling(false);
-      }
-    } catch (error) {
-      console.error("Error loading Chatterbox service status:", error);
-    }
-  };
-
-  const handleInstallChatterbox = async () => {
-    try {
-      setChatterboxInstalling(true);
-      await api.installChatterboxService();
-      // Installation started in background, polling will track progress
-    } catch (error: any) {
-      console.error("Error installing Chatterbox:", error);
-      alert(`Failed to install: ${error.message || "Unknown error"}`);
-      setChatterboxInstalling(false);
-    }
-  };
-
-  const handleStartChatterbox = async () => {
-    try {
-      setChatterboxStarting(true);
-      const result = await api.startChatterboxService() as any;
-      alert(result.message || "Service started");
-      await loadChatterboxServiceStatus();
-      await loadTTSInfo(); // Reload to update backend status
-    } catch (error: any) {
-      console.error("Error starting Chatterbox:", error);
-      alert(`Failed to start: ${error.message || "Unknown error"}`);
-    } finally {
-      setChatterboxStarting(false);
-    }
-  };
-
-  const handleStopChatterbox = async () => {
-    try {
-      const result = await api.stopChatterboxService() as any;
-      alert(result.message || "Service stopped");
-      await loadChatterboxServiceStatus();
-      await loadTTSInfo();
-    } catch (error: any) {
-      console.error("Error stopping Chatterbox:", error);
-      alert(`Failed to stop: ${error.message || "Unknown error"}`);
-    }
   };
 
   const loadTTSInfo = async () => {
@@ -186,7 +92,7 @@ export default function TTSSettings() {
       
       // If it's chatterbox, check status too
       if (backendName === "chatterbox") {
-        loadChatterboxServiceStatus();
+        // loadChatterboxServiceStatus(); // Removed: relying on global status
       }
     } catch (error) {
       console.error("Error switching backend:", error);
@@ -292,108 +198,7 @@ export default function TTSSettings() {
         Text-to-Speech Settings
       </h3>
       <div className="space-y-4">
-        {/* Chatterbox Service Management */}
-        {selectedBackend === "chatterbox" && chatterboxServiceStatus && (
-          <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-medium">
-                  Chatterbox TTS API Service
-                </span>
-                <span
-                  className={`text-xs px-2 py-1 rounded ${
-                    chatterboxServiceStatus.is_running
-                      ? "bg-green-100 text-green-700"
-                      : chatterboxServiceStatus.installed
-                      ? "bg-yellow-100 text-yellow-700"
-                      : "bg-red-100 text-red-700"
-                  }`}
-                >
-                  {chatterboxServiceStatus.is_running
-                    ? "Running"
-                    : chatterboxServiceStatus.installed
-                    ? "Installed"
-                    : "Not Installed"}
-                </span>
-              </div>
-            </div>
 
-            {!chatterboxServiceStatus.installed && (
-              <div className="mb-2">
-                <button
-                  onClick={handleInstallChatterbox}
-                  disabled={chatterboxInstalling}
-                  className="btn-primary w-full text-sm"
-                >
-                  {chatterboxInstalling
-                    ? "Installing..."
-                    : "Install Chatterbox TTS API"}
-                </button>
-                <p className="text-xs text-gray-600 mt-1">
-                  This will clone and set up the Chatterbox TTS API server
-                </p>
-              </div>
-            )}
-
-            {chatterboxServiceStatus.installed &&
-              !chatterboxServiceStatus.is_running && (
-                <div className="mb-2">
-                  <button
-                    onClick={handleStartChatterbox}
-                    disabled={chatterboxStarting}
-                    className="btn-primary w-full text-sm"
-                  >
-                    {chatterboxStarting ? "Starting..." : "Start Service"}
-                  </button>
-                </div>
-              )}
-
-            {chatterboxServiceStatus.is_running && (
-              <div className="space-y-2">
-                <div className="text-xs text-gray-600">
-                  <div>API: {chatterboxServiceStatus.api_url}</div>
-                  {chatterboxServiceStatus.frontend_url && (
-                    <div>Frontend: {chatterboxServiceStatus.frontend_url}</div>
-                  )}
-                </div>
-                <button
-                  onClick={handleStopChatterbox}
-                  className="btn-secondary w-full text-sm"
-                >
-                  Stop Service
-                </button>
-              </div>
-            )}
-
-            {chatterboxServiceStatus.error_message && (
-              <p className="text-xs text-red-600 mt-2">
-                {chatterboxServiceStatus.error_message}
-              </p>
-            )}
-
-            {/* Log Viewer */}
-            {(chatterboxInstalling || chatterboxStarting || logs.length > 0) && (
-              <div className="mt-3 bg-black text-green-400 p-3 rounded text-xs font-mono h-48 overflow-y-auto">
-                <div className="flex justify-between items-center mb-2 border-b border-gray-700 pb-1">
-                  <span>Installation/Startup Logs</span>
-                  <button 
-                    onClick={() => setLogs([])}
-                    className="text-gray-500 hover:text-gray-300"
-                  >
-                    Clear
-                  </button>
-                </div>
-                <div className="flex flex-col-reverse">
-                  {logs.slice().reverse().map((log, i) => (
-                    <div key={i} className="whitespace-pre-wrap break-all">
-                      {log}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
 
         {/* Backend Selection */}
         <div>
@@ -401,9 +206,15 @@ export default function TTSSettings() {
           <div className="space-y-2">
             {backends.map((backend: any) => {
               const health = backendHealth[backend.name];
-              const isAccessible = health?.accessible;
-              const isService = health?.is_service;
+              const isGlobalReady = health?.status === 'ready';
+              const isService = health?.type === 'tts';
               const needsService = ['piper', 'chatterbox', 'kokoro'].includes(backend.name);
+              
+              // Prioritize global status for service-based backends
+              // If the service is running (global status), consider the backend ready
+              // This fixes the issue where the backend might have a stale error state
+              const effectiveStatus = (needsService && isGlobalReady) ? "ready" : backend.status;
+              const effectiveError = (needsService && isGlobalReady) ? null : backend.error_message;
               
               return (
                 <div
@@ -417,7 +228,7 @@ export default function TTSSettings() {
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 flex-wrap">
-                      {getStatusIcon(backend.status, backend.is_generating)}
+                      {getStatusIcon(effectiveStatus, backend.is_generating)}
                       <span className="font-medium capitalize">
                         {backend.name}
                       </span>
@@ -429,27 +240,22 @@ export default function TTSSettings() {
                       
                       {/* Service Health Indicator */}
                       {needsService && (
-                        isAccessible === true ? (
+                        isGlobalReady ? (
                           <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded flex items-center gap-1">
                             <CheckCircle size={12} />
                             Service Running
                           </span>
-                        ) : isAccessible === false ? (
+                        ) : (
                           <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded flex items-center gap-1">
                             <XCircle size={12} />
                             Service Offline
-                          </span>
-                        ) : (
-                          <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded flex items-center gap-1">
-                            <Loader size={12} className="animate-spin" />
-                            Checking...
                           </span>
                         )
                       )}
                       
                       {/* OpenAI external API indicator */}
                       {backend.name === 'openai' && health?.is_external && (
-                        isAccessible === true ? (
+                        isGlobalReady ? (
                           <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded flex items-center gap-1">
                             <CheckCircle size={12} />
                             API Connected {health.authenticated && '🔑'}
@@ -459,7 +265,7 @@ export default function TTSSettings() {
                             <Settings size={12} />
                             Not Configured
                           </span>
-                        ) : isAccessible === false ? (
+                        ) : isGlobalReady === false ? (
                           <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded flex items-center gap-1">
                             <XCircle size={12} />
                             API Offline
@@ -480,31 +286,31 @@ export default function TTSSettings() {
                       )}
                     </div>
                     <div className="text-xs text-gray-500">
-                      {backend.status === "ready" && !backend.is_generating
+                      {effectiveStatus === "ready" && !backend.is_generating
                         ? "Ready"
                         : backend.is_generating
                         ? "Generating..."
-                        : backend.status}
+                        : effectiveStatus}
                     </div>
                   </div>
                   
                   {/* Warning if service is offline but backend is current */}
-                  {needsService && backend.is_current && isAccessible === false && (
+                  {needsService && backend.is_current && !isGlobalReady && (
                     <p className="text-xs text-orange-600 mt-2 flex items-center gap-1">
                       ⚠️ Service is not running. TTS generation will fail. Start the {backend.name} service to use this backend.
                     </p>
                   )}
                   
                   {/* Service error details */}
-                  {health?.error && !backend.error_message && (
+                  {health?.error && !effectiveError && (
                     <p className="text-xs text-gray-500 mt-1">
                       {health.error}
                     </p>
                   )}
                   
-                  {backend.error_message && (
+                  {effectiveError && (
                     <p className="text-xs text-red-500 mt-1">
-                      {backend.error_message}
+                      {effectiveError}
                     </p>
                   )}
                 </div>

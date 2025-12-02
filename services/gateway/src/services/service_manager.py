@@ -200,11 +200,15 @@ class ServiceManager:
     """Manages connections to microservices."""
     
     def __init__(self):
-        self.llm_service_url = "http://localhost:8001"
+        self.llm_service_url = "http://127.0.0.1:8001"
         self.speech_service_url = "http://localhost:8003"
         self.tts_service_url = "http://localhost:8880"
         
-        self.llm_manager = RemoteLLMManager(self.llm_service_url)
+        # Use local LLMManager instead of RemoteLLMManager
+        # The LLM server is managed locally and proxied through gateway
+        from .llm.manager import LLMManager
+        self.llm_manager = LLMManager()
+        self.llm_service_manager = None  # Will be initialized after memory_store
         self.chat_manager = None
         self.memory_store = None
         self.tool_manager = None # Renamed from tool_registry
@@ -219,11 +223,27 @@ class ServiceManager:
         from .tools.manager import ToolManager # Use ToolManager
         from .status_manager import ServiceStatusManager
         
-        # Initialize Core Components
+        # Initialize Memory Store (file-based storage - no separate service needed)
         self.memory_store = MemoryStore()
         await self.memory_store.initialize()
+        logger.info("Memory store initialized (file-based)")
         
-        self.tool_manager = ToolManager()
+        # Load settings from file stores into LLM manager
+        if self.llm_manager:
+            await self.llm_manager.load_settings_from_file_stores(self.memory_store)
+        
+        # Initialize LLM Service Manager
+        from .llm.service_manager import LLMServiceManager
+        self.llm_service_manager = LLMServiceManager()
+        
+        # Initialize Tool Manager with Tool Service client
+        from .tools.client import ToolServiceClient
+        tool_service_client = ToolServiceClient()
+        self.tool_manager = ToolManager(tool_service_client)
+        
+        # Check if Tool service is available
+        if not await tool_service_client.is_available():
+            logger.warning("Tool service not available - tool execution will be limited")
         
         # Initialize Chat Manager
         self.chat_manager = ChatManager(self, self.memory_store, self.tool_manager) # Pass tool_manager
@@ -284,7 +304,8 @@ class ServiceManager:
         async with aiofiles.open(audio_path, 'rb') as f:
             data = await f.read()
         
-        async with httpx.AsyncClient() as client:
+        # Use longer timeout for STT as it can take time on CPU
+        async with httpx.AsyncClient(timeout=60.0) as client:
             files = {'file': ('audio.wav', data, 'audio/wav')}
             resp = await client.post(f"{self.speech_service_url}/v1/audio/transcriptions", files=files)
             if resp.status_code == 200:

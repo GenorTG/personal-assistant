@@ -9,9 +9,9 @@ def generate_conversation_id() -> str:
     return f"conv_{uuid.uuid4().hex[:12]}"
 
 
-def get_timestamp() -> datetime:
-    """Get current timestamp."""
-    return datetime.utcnow()
+def get_timestamp() -> str:
+    """Get current timestamp as ISO string."""
+    return datetime.utcnow().isoformat()
 
 
 def sanitize_filename(filename: str) -> str:

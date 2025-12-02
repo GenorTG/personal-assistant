@@ -1,6 +1,7 @@
 """Model downloader from HuggingFace."""
 from typing import Optional, List, Dict, Any, Callable
 from pathlib import Path
+from datetime import datetime
 import asyncio
 import logging
 from huggingface_hub import hf_hub_download, HfApi
@@ -107,11 +108,19 @@ class ModelDownloader:
             
             results = []
             for model in models:
+                model_id = model.id
+                # Extract author from model ID (format: "author/model-name")
+                author = model_id.split("/")[0] if "/" in model_id else "Unknown"
+                name = model_id.split("/")[-1] if "/" in model_id else model_id
+                
                 results.append({
-                    "model_id": model.id,
-                    "name": model.id.split("/")[-1] if "/" in model.id else model.id,
+                    "model_id": model_id,
+                    "name": name,
+                    "author": author,
                     "downloads": getattr(model, "downloads", 0),
-                    "tags": getattr(model, "tags", [])
+                    "tags": list(getattr(model, "tags", [])),
+                    "likes": getattr(model, "likes", 0),
+                    "last_modified": str(getattr(model, "lastModified", "")) if hasattr(model, "lastModified") else None,
                 })
             
             return results
@@ -245,22 +254,208 @@ class ModelDownloader:
         
         return None
     
+    async def get_model_details(
+        self,
+        repo_id: str
+    ) -> Dict[str, Any]:
+        """Get detailed information about a HuggingFace model repository.
+        
+        Args:
+            repo_id: HuggingFace repository ID
+        
+        Returns:
+            Dictionary with model details including name, author, description, etc.
+        
+        Raises:
+            ValueError: If repo_id is invalid or repository not found
+            RuntimeError: If API call fails
+        """
+        if not repo_id or not repo_id.strip():
+            raise ValueError("Repository ID cannot be empty")
+        
+        repo_id = repo_id.strip()
+        if '/' not in repo_id:
+            raise ValueError(f"Invalid repository ID format: {repo_id}. Expected format: 'username/model-name'")
+        
+        try:
+            logger.info("Fetching model details for: %s", repo_id)
+            loop = asyncio.get_event_loop()
+            
+            def _get_model_info():
+                try:
+                    api = HfApi()
+                    model_info = api.model_info(repo_id)
+                    return model_info
+                except Exception as e:
+                    logger.error("Error fetching model info: %s", str(e))
+                    raise
+            
+            model_info = await loop.run_in_executor(None, _get_model_info)
+            
+            # Extract author (first part before '/')
+            author = repo_id.split('/')[0] if '/' in repo_id else "Unknown"
+            
+            # Detect architecture from tags or model card
+            architecture = self._detect_architecture(model_info)
+            
+            # Get model card/description safely
+            description = ""
+            try:
+                if hasattr(model_info, 'cardData') and model_info.cardData:
+                    description = getattr(model_info.cardData, 'text', '') or ''
+                elif hasattr(model_info, 'card_data') and model_info.card_data:
+                    if isinstance(model_info.card_data, dict):
+                        description = model_info.card_data.get('description', '') or model_info.card_data.get('text', '')
+                    else:
+                        description = getattr(model_info.card_data, 'text', '') or ''
+                
+                if not description and hasattr(model_info, 'description'):
+                    description = model_info.description or ''
+            except Exception as e:
+                logger.warning("Could not extract description for %s: %s", repo_id, str(e))
+                description = ""
+            
+            # Get stats
+            downloads = getattr(model_info, 'downloads', 0) or 0
+            last_modified = None
+            try:
+                if hasattr(model_info, 'lastModified'):
+                    last_modified = str(model_info.lastModified) if model_info.lastModified else None
+                elif hasattr(model_info, 'last_modified'):
+                    last_modified = str(model_info.last_modified) if model_info.last_modified else None
+            except Exception as e:
+                logger.warning("Could not extract last_modified for %s: %s", repo_id, str(e))
+            
+            tags = list(getattr(model_info, 'tags', []))
+            
+            result = {
+                "name": repo_id.split('/')[-1] if '/' in repo_id else repo_id,
+                "full_name": repo_id,
+                "author": author,
+                "description": description,
+                "downloads": downloads,
+                "last_modified": last_modified,
+                "architecture": architecture,
+                "tags": tags
+            }
+            
+            logger.info("Successfully fetched details for %s", repo_id)
+            return result
+        except HfHubHTTPError as e:
+            logger.error("HfHubHTTPError for %s: %s", repo_id, str(e))
+            status_code = getattr(e, 'status_code', None)
+            
+            if status_code == 404:
+                raise ValueError(f"Repository '{repo_id}' not found on HuggingFace.") from e
+            elif status_code == 403:
+                raise ValueError(f"Access denied to repository '{repo_id}'.") from e
+            else:
+                raise ValueError(f"Failed to access repository '{repo_id}': HTTP {status_code}") from e
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error("Unexpected error fetching model details for %s: %s", repo_id, str(e))
+            raise RuntimeError(f"Failed to fetch model details for '{repo_id}': {str(e)}") from e
+    
+    def _detect_architecture(self, model_info) -> str:
+        """Detect model architecture from model info.
+        
+        Args:
+            model_info: HuggingFace model info object
+        
+        Returns:
+            Architecture name (e.g., "Llama 3", "Mistral", "Qwen")
+        """
+        tags = list(getattr(model_info, 'tags', []))
+        model_id = getattr(model_info, 'id', '').lower()
+        
+        # Check tags first
+        for tag in tags:
+            tag_lower = tag.lower()
+            if 'llama-3' in tag_lower or 'llama3' in tag_lower:
+                return "Llama 3"
+            elif 'llama-2' in tag_lower or 'llama2' in tag_lower:
+                return "Llama 2"
+            elif 'llama' in tag_lower:
+                return "Llama"
+            elif 'mistral' in tag_lower:
+                return "Mistral"
+            elif 'mixtral' in tag_lower:
+                return "Mixtral"
+            elif 'qwen2.5' in tag_lower:
+                return "Qwen 2.5"
+            elif 'qwen2' in tag_lower:
+                return "Qwen 2"
+            elif 'qwen' in tag_lower:
+                return "Qwen"
+            elif 'phi-3' in tag_lower or 'phi3' in tag_lower:
+                return "Phi-3"
+            elif 'gemma' in tag_lower:
+                return "Gemma"
+            elif 'yi' in tag_lower:
+                return "Yi"
+        
+        # Check model ID if tags don't match
+        if 'llama-3' in model_id or 'llama3' in model_id:
+            return "Llama 3"
+        elif 'llama-2' in model_id or 'llama2' in model_id:
+            return "Llama 2"
+        elif 'llama' in model_id:
+            return "Llama"
+        elif 'mistral' in model_id:
+            return "Mistral"
+        elif 'mixtral' in model_id:
+            return "Mixtral"
+        elif 'qwen2.5' in model_id or 'qwen-2.5' in model_id:
+            return "Qwen 2.5"
+        elif 'qwen2' in model_id or 'qwen-2' in model_id:
+            return "Qwen 2"
+        elif 'qwen' in model_id:
+            return "Qwen"
+        elif 'phi-3' in model_id or 'phi3' in model_id:
+            return "Phi-3"
+        elif 'gemma' in model_id:
+            return "Gemma"
+        elif 'yi-' in model_id or 'yi_' in model_id:
+            return "Yi"
+        
+        return "Unknown"
+
+    
     def list_downloaded_models(self) -> List[Path]:
         """List all downloaded GGUF models.
+        
+        Scans both:
+        1. New folder structure: models/{author}/{repo}/file.gguf
+        2. Legacy flat structure: models/file.gguf
         
         Returns:
             List of paths to downloaded model files
         """
-        return list(self.models_dir.glob("*.gguf"))
+        gguf_files = []
+        
+        # Scan new folder structure: models/{author}/{repo}/*.gguf
+        for author_dir in self.models_dir.iterdir():
+            if author_dir.is_dir():
+                for repo_dir in author_dir.iterdir():
+                    if repo_dir.is_dir():
+                        gguf_files.extend(repo_dir.glob("*.gguf"))
+        
+        # Also scan flat structure for legacy/manually added models
+        gguf_files.extend(self.models_dir.glob("*.gguf"))
+        
+        return gguf_files
     
     def get_model_info(self, model_path: Path) -> Dict[str, Any]:
         """Get information about a downloaded model.
+        
+        Reads metadata from model_info.json if available.
         
         Args:
             model_path: Path to model file
         
         Returns:
-            Dictionary with model information
+            Dictionary with model information including metadata
         """
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
@@ -269,54 +464,266 @@ class ModelDownloader:
         size_mb = size_bytes / (1024 * 1024)
         size_gb = size_bytes / (1024 * 1024 * 1024)
         
-        return {
+        # Basic info
+        info = {
             "path": str(model_path),
             "name": model_path.name,
             "size_bytes": size_bytes,
             "size_mb": round(size_mb, 2),
             "size_gb": round(size_gb, 2),
-            "exists": True
+            "exists": True,
+            "has_metadata": False,
         }
+        
+        # Try to read metadata from model_info.json in the same directory
+        metadata_file = model_path.parent / "model_info.json"
+        if metadata_file.exists():
+            try:
+                import json
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                
+                info["has_metadata"] = True
+                info["repo_id"] = metadata.get("repo_id")
+                info["author"] = metadata.get("author")
+                info["repo_name"] = metadata.get("name")
+                info["description"] = metadata.get("description", "")[:500]
+                info["downloads"] = metadata.get("downloads", 0)
+                info["likes"] = metadata.get("likes", 0)
+                info["tags"] = metadata.get("tags", [])
+                info["huggingface_url"] = metadata.get("huggingface_url")
+                info["downloaded_at"] = metadata.get("downloaded_at")
+                info["source"] = metadata.get("source", "unknown")
+                
+            except Exception as e:
+                logger.warning(f"Failed to read metadata for {model_path}: {e}")
+        
+        return info
     
-    def delete_model(self, model_id: str) -> bool:
-        """Delete a downloaded model.
+    def get_model_folder(self, model_path: Path) -> Optional[Path]:
+        """Get the model's folder (for models in author/repo structure).
         
         Args:
-            model_id: Model filename or identifier
+            model_path: Path to model file
+            
+        Returns:
+            Path to the model folder, or None if flat structure
+        """
+        # Check if model is in author/repo structure
+        parent = model_path.parent
+        if parent != self.models_dir:
+            # Check if it's author/repo/file.gguf
+            grandparent = parent.parent
+            if grandparent != self.models_dir and grandparent.parent == self.models_dir:
+                # This is in author/repo structure
+                return parent
+        return None
+    
+    def delete_model(self, model_id: str) -> bool:
+        """Delete a downloaded model and its metadata.
+        
+        Args:
+            model_id: Model filename, path, or identifier
         
         Returns:
             True if model was deleted, False if not found
         
         Raises:
-            ValueError: If model is currently loaded
+            RuntimeError: If deletion fails
         """
         # Find model file
         downloaded_models = self.list_downloaded_models()
         model_path = None
         
         for path in downloaded_models:
-            if path.name == model_id or str(path) == model_id:
+            # Match by filename, relative path, or full path
+            relative_path = path.relative_to(self.models_dir) if path.is_relative_to(self.models_dir) else path
+            if (path.name == model_id or 
+                str(path) == model_id or 
+                str(relative_path) == model_id):
                 model_path = path
                 break
         
         if not model_path:
-            # Try as direct path
-            from pathlib import Path
-            potential_path = Path(model_id)
+            # Try as direct path relative to models_dir
+            potential_path = self.models_dir / model_id
             if potential_path.exists() and potential_path.suffix == ".gguf":
                 model_path = potential_path
             else:
                 return False
         
-        # Check if model is currently loaded (would need access to LLMManager)
-        # For now, just delete the file
-        
         try:
             if model_path.exists():
+                model_folder = model_path.parent
+                
+                # Delete the model file
                 model_path.unlink()
-                logger.info("Deleted model: %s", model_path)
+                logger.info("Deleted model file: %s", model_path)
+                
+                # Delete metadata file if exists
+                metadata_file = model_folder / "model_info.json"
+                if metadata_file.exists():
+                    metadata_file.unlink()
+                    logger.info("Deleted metadata file: %s", metadata_file)
+                
+                # Delete folder if empty and not the root models dir
+                if model_folder != self.models_dir:
+                    try:
+                        # Check if folder is empty (no files, only maybe empty subdirs)
+                        remaining_files = list(model_folder.glob("*"))
+                        if not remaining_files:
+                            model_folder.rmdir()
+                            logger.info("Deleted empty folder: %s", model_folder)
+                            
+                            # Also try to delete parent (author folder) if empty
+                            author_folder = model_folder.parent
+                            if author_folder != self.models_dir:
+                                remaining = list(author_folder.glob("*"))
+                                if not remaining:
+                                    author_folder.rmdir()
+                                    logger.info("Deleted empty author folder: %s", author_folder)
+                    except OSError:
+                        pass  # Folder not empty or other issue, ignore
+                
                 return True
             return False
         except Exception as e:
             logger.error("Failed to delete model %s: %s", model_path, e)
             raise RuntimeError(f"Failed to delete model: {str(e)}") from e
+    
+    async def link_and_organize_model(
+        self,
+        model_id: str,
+        repo_id: str,
+        target_filename: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Link a model to a HuggingFace repo and move it to the correct folder.
+        
+        This is used to "fix" manually downloaded models by:
+        1. Finding the model file
+        2. Creating the correct folder structure (author/repo/)
+        3. Moving the model file
+        4. Fetching and saving metadata from HuggingFace
+        
+        Args:
+            model_id: Current model path/identifier
+            repo_id: HuggingFace repository ID (e.g., "TheBloke/Mistral-7B-GGUF")
+            target_filename: Optional new filename (if different from source repo)
+            
+        Returns:
+            Dict with new path and metadata
+        """
+        from huggingface_hub import HfApi
+        import shutil
+        
+        # Find the model file
+        model_path = None
+        for path in self.list_downloaded_models():
+            relative_path = path.relative_to(self.models_dir) if path.is_relative_to(self.models_dir) else path
+            if (path.name == model_id or 
+                str(path) == model_id or 
+                str(relative_path) == model_id):
+                model_path = path
+                break
+        
+        if not model_path:
+            potential_path = self.models_dir / model_id
+            if potential_path.exists():
+                model_path = potential_path
+            else:
+                raise FileNotFoundError(f"Model not found: {model_id}")
+        
+        # Parse repo_id
+        if '/' not in repo_id:
+            raise ValueError(f"Invalid repo_id format: {repo_id}. Expected: author/model-name")
+        
+        author, repo_name = repo_id.split('/', 1)
+        
+        # Create target folder
+        target_folder = self.models_dir / author / repo_name
+        target_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Determine target filename
+        new_filename = target_filename or model_path.name
+        target_path = target_folder / new_filename
+        
+        # Move the file if not already in the right place
+        if model_path != target_path:
+            if target_path.exists():
+                raise FileExistsError(f"Target file already exists: {target_path}")
+            
+            shutil.move(str(model_path), str(target_path))
+            logger.info("Moved model: %s -> %s", model_path, target_path)
+            
+            # Clean up old folder if empty
+            old_folder = model_path.parent
+            if old_folder != self.models_dir:
+                try:
+                    if not list(old_folder.glob("*")):
+                        old_folder.rmdir()
+                        # Try parent too
+                        if old_folder.parent != self.models_dir:
+                            if not list(old_folder.parent.glob("*")):
+                                old_folder.parent.rmdir()
+                except OSError:
+                    pass
+        
+        # Fetch metadata from HuggingFace
+        loop = asyncio.get_event_loop()
+        
+        def fetch_metadata():
+            api = HfApi()
+            try:
+                model_info = api.model_info(repo_id)
+                
+                description = ""
+                try:
+                    if hasattr(model_info, 'cardData') and model_info.cardData:
+                        description = getattr(model_info.cardData, 'text', '') or ''
+                except Exception:
+                    pass
+                
+                return {
+                    "repo_id": repo_id,
+                    "author": author,
+                    "name": repo_name,
+                    "filename": new_filename,
+                    "description": description[:2000] if description else "",
+                    "downloads": getattr(model_info, 'downloads', 0) or 0,
+                    "likes": getattr(model_info, 'likes', 0) or 0,
+                    "tags": list(getattr(model_info, 'tags', [])),
+                    "last_modified": str(getattr(model_info, 'lastModified', '')) if hasattr(model_info, 'lastModified') else None,
+                    "source": "huggingface",
+                    "organized_at": datetime.now().isoformat(),
+                    "huggingface_url": f"https://huggingface.co/{repo_id}",
+                }
+            except Exception as e:
+                logger.warning(f"Could not fetch full metadata for {repo_id}: {e}")
+                return {
+                    "repo_id": repo_id,
+                    "author": author,
+                    "name": repo_name,
+                    "filename": new_filename,
+                    "source": "huggingface",
+                    "organized_at": datetime.now().isoformat(),
+                    "huggingface_url": f"https://huggingface.co/{repo_id}",
+                }
+        
+        metadata = await loop.run_in_executor(None, fetch_metadata)
+        
+        # Save metadata
+        metadata_file = target_folder / "model_info.json"
+        import json
+        with open(metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+        
+        logger.info("Saved metadata for organized model: %s", target_path)
+        
+        # Return info about the new location
+        relative_path = target_path.relative_to(self.models_dir)
+        return {
+            "old_path": str(model_path),
+            "new_path": str(target_path),
+            "model_id": str(relative_path),
+            "metadata": metadata
+        }

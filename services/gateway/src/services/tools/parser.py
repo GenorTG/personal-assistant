@@ -23,26 +23,41 @@ class ToolCallParser:
         """
         tool_calls = []
         
-        # Try JSON format: {"tool": "name", "arguments": {...}}
-        # Match complete JSON objects
-        json_pattern = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}'
-        json_matches = re.finditer(json_pattern, response)
-        for match in json_matches:
-            try:
-                tool_name = match.group(1)
-                arguments_str = match.group(2)
-                # Try to parse arguments as JSON
-                try:
-                    arguments = json.loads(arguments_str)
-                except json.JSONDecodeError:
-                    # If not valid JSON, try to extract key-value pairs
-                    arguments = self._parse_arguments_text(arguments_str)
+        # Try to find complete JSON objects in the response
+        # First, try to find {"name": "...", "parameters": {...}} format
+        json_objects = self._extract_json_objects(response)
+        for obj in json_objects:
+            if "name" in obj and "parameters" in obj:
                 tool_calls.append({
-                    "name": tool_name,
-                    "arguments": arguments
+                    "name": obj["name"],
+                    "arguments": obj["parameters"]
                 })
-            except (json.JSONDecodeError, IndexError):
-                continue
+            elif "tool" in obj and "arguments" in obj:
+                tool_calls.append({
+                    "name": obj["tool"],
+                    "arguments": obj["arguments"]
+                })
+        
+        # Try JSON format: {"tool": "name", "arguments": {...}}
+        if not tool_calls:
+            json_pattern2 = r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}'
+            json_matches2 = re.finditer(json_pattern2, response)
+            for match in json_matches2:
+                try:
+                    tool_name = match.group(1)
+                    arguments_str = match.group(2)
+                    # Try to parse arguments as JSON
+                    try:
+                        arguments = json.loads(arguments_str)
+                    except json.JSONDecodeError:
+                        # If not valid JSON, try to extract key-value pairs
+                        arguments = self._parse_arguments_text(arguments_str)
+                    tool_calls.append({
+                        "name": tool_name,
+                        "arguments": arguments
+                    })
+                except (json.JSONDecodeError, IndexError):
+                    continue
         
         # Try function calling format: <function_calls>...</function_calls>
         if not tool_calls:
@@ -142,3 +157,43 @@ class ToolCallParser:
                 arguments[key] = value
         
         return arguments
+    
+    def _extract_json_objects(self, text: str) -> List[Dict[str, Any]]:
+        """Extract JSON objects from text, handling nested structures.
+        
+        Args:
+            text: Text that may contain JSON objects
+            
+        Returns:
+            List of parsed JSON dictionaries
+        """
+        objects = []
+        i = 0
+        while i < len(text):
+            # Find opening brace
+            if text[i] == '{':
+                brace_count = 0
+                start = i
+                # Find matching closing brace
+                for j in range(i, len(text)):
+                    if text[j] == '{':
+                        brace_count += 1
+                    elif text[j] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            # Found complete JSON object
+                            try:
+                                json_str = text[start:j+1]
+                                obj = json.loads(json_str)
+                                if isinstance(obj, dict) and ("name" in obj or "tool" in obj):
+                                    objects.append(obj)
+                            except json.JSONDecodeError:
+                                pass
+                            i = j + 1
+                            break
+                else:
+                    i += 1
+            else:
+                i += 1
+        
+        return objects

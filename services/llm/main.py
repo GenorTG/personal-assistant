@@ -64,7 +64,7 @@ async def list_loaded_models():
                 "owned_by": "user"
             }]
         }
-    return {"object": "list", "data": []}
+    return {"object": "list", "data": ["no model loaded"]}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):

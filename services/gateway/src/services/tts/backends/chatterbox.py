@@ -92,6 +92,7 @@ class ChatterboxBackend(TTSBackend):
                 # Don't fail - the service is running, just not fully initialized yet
             
             self.status = TTSBackendStatus.READY
+            self.error_message = None  # Clear any previous error
             logger.info("Chatterbox TTS backend initialized successfully")
             return True
         except Exception as e:

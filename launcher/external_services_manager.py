@@ -27,8 +27,25 @@ class ExternalServicesManager:
         """Load metadata about external services."""
         if self.metadata_file.exists():
             try:
-                with open(self.metadata_file, 'r') as f:
-                    return json.load(f)
+                # Check if file is empty
+                if self.metadata_file.stat().st_size == 0:
+                    logger.warning("Metadata file is empty, resetting to empty dict")
+                    return {}
+                    
+                with open(self.metadata_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if not content:
+                        logger.warning("Metadata file has no content, resetting to empty dict")
+                        return {}
+                    return json.loads(content)
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Metadata file corrupted, resetting: {e}")
+                # Try to delete corrupted file
+                try:
+                    self.metadata_file.unlink()
+                except Exception:
+                    pass
+                return {}
             except Exception as e:
                 logger.error(f"Failed to load metadata: {e}")
         return {}
@@ -37,7 +54,7 @@ class ExternalServicesManager:
         """Save metadata about external services."""
         try:
             self.external_services_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.metadata_file, 'w') as f:
+            with open(self.metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(self.metadata, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save metadata: {e}")

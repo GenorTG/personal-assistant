@@ -27,4 +27,5 @@ psutil>=5.9.0
 nvidia-ml-py>=12.535.0
 cryptography>=41.0.0
 pyttsx3>=2.90
+gguf>=0.1.0
 

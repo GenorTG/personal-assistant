@@ -17,11 +17,14 @@ class Settings(BaseSettings):
     port: int = 8000
     
     # Paths
-    base_dir: Path = Path(__file__).parent.parent.parent.parent
+    # settings.py is at: services/gateway/src/config/settings.py
+    # Need to go up 5 levels to reach project root: config -> src -> gateway -> services -> root
+    base_dir: Path = Path(__file__).parent.parent.parent.parent.parent
     data_dir: Path = base_dir / "data"
     models_dir: Path = data_dir / "models"
     memory_dir: Path = data_dir / "memory"
     vector_store_dir: Path = data_dir / "vector_store"
+    db_path: Path = data_dir / "assistant.db"  # Shared database
     
     # LLM Settings
     default_llm_model: Optional[str] = None
@@ -36,10 +39,10 @@ class Settings(BaseSettings):
     repeat_penalty: float = 1.1
     
     # Service URLs
-    llm_service_url: str = "http://localhost:8001"
+    llm_service_url: str = "http://127.0.0.1:8001"  # llama-cpp-python server
     whisper_service_url: str = "http://localhost:8003"
     piper_service_url: str = "http://localhost:8004"
-    chatterbox_service_url: str = "http://localhost:4123" # Chatterbox TTS
+    chatterbox_service_url: str = "http://localhost:4123"  # Chatterbox TTS
     kokoro_service_url: str = "http://localhost:8880"
     audio_client_url: str = "http://localhost:8002"
     

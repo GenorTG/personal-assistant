@@ -70,8 +70,11 @@ class MemoryCalculator:
             quantization: Quantization type
             
         Returns:
-            Model size in GB
+            Model size in GB, or 0 if parameters unknown
         """
+        if num_parameters is None:
+            return 0.0
+        
         bytes_per_param = self._get_bytes_per_param(quantization)
         size_bytes = num_parameters * bytes_per_param
         return size_bytes / (1024 ** 3)  # Convert to GB
@@ -158,9 +161,9 @@ class MemoryCalculator:
         Returns:
             Dict with memory breakdown and total
         """
-        num_parameters = model_params.get("num_parameters", 0)
-        num_layers = model_params.get("num_layers", 32)
-        hidden_size = model_params.get("hidden_size", 4096)
+        num_parameters = model_params.get("num_parameters") or 0
+        num_layers = model_params.get("num_layers") or 32
+        hidden_size = model_params.get("hidden_size") or 4096
         
         # Detect quantization
         quantization = model_params.get("quantization")

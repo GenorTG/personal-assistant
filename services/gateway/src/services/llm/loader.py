@@ -27,9 +27,13 @@ class LLMLoader:
         Returns:
             Tuple of (is_available, message) where is_available indicates if CUDA is usable
         """
+        llama_cpp_cuda_verified = False
+        llama_cpp_installed = False
+        
         # Method 1: Check if llama-cpp-python has CUDA support compiled in
         try:
             from llama_cpp import llama_cpp
+            llama_cpp_installed = True
             # Check for CUDA-related functions/symbols
             has_cuda_support = (
                 hasattr(llama_cpp, 'llama_supports_gpu_offload') or
@@ -38,9 +42,15 @@ class LLMLoader:
                 'cuda' in str(llama_cpp).lower()
             )
             if not has_cuda_support:
+                # llama-cpp-python IS installed but WITHOUT CUDA support - this is a real problem
                 return False, "llama-cpp-python was compiled without CUDA support. Install with: pip install llama-cpp-python[cuda]"
-        except (ImportError, AttributeError) as e:
-            return False, f"Could not verify llama-cpp-python CUDA support: {e}"
+            llama_cpp_cuda_verified = True
+        except ImportError:
+            # llama-cpp-python not installed in gateway - this is OK, continue to other checks
+            # The actual LLM service has its own llama-cpp-python installation
+            logger.debug("llama-cpp-python not installed in gateway, checking other CUDA indicators")
+        except AttributeError as e:
+            logger.debug("Could not verify llama-cpp-python CUDA support: %s", e)
         
         # Method 2: Try PyTorch CUDA (most reliable)
         try:
@@ -70,6 +80,13 @@ class LLMLoader:
                                   capture_output=True, text=True, timeout=3)
             if result.returncode == 0:
                 gpu_info = result.stdout.strip().split('\n')[0] if result.stdout.strip() else "Unknown GPU"
+                # If llama-cpp-python verified CUDA support and nvidia-smi shows GPU, we're good
+                if llama_cpp_cuda_verified:
+                    return True, f"CUDA verified via llama-cpp-python and nvidia-smi: {gpu_info}"
+                # GPU present but we couldn't verify CUDA runtime (no llama-cpp-python, no PyTorch)
+                # Since the LLM service has its own llama-cpp-python, assume GPU is usable
+                if not llama_cpp_installed:
+                    return True, f"NVIDIA GPU detected ({gpu_info}). LLM service will handle CUDA."
                 return False, f"NVIDIA driver detected ({gpu_info}) but CUDA runtime not verified. Install CUDA toolkit and llama-cpp-python[cuda]"
         except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
             logger.debug("nvidia-smi check failed: %s", e)
@@ -79,12 +96,17 @@ class LLMLoader:
             import ctypes
             try:
                 cuda = ctypes.CDLL("libcuda.so.1")
-                # Try to get CUDA version
+                # CUDA library found - if gateway doesn't have llama-cpp-python, trust the LLM service
+                if not llama_cpp_installed:
+                    return True, "CUDA library found. LLM service will handle CUDA support."
                 return False, "CUDA library found but runtime not verified. Install llama-cpp-python[cuda] to use GPU"
             except OSError:
                 try:
                     # Windows
                     cuda = ctypes.windll.LoadLibrary("nvcuda.dll")
+                    # CUDA library found - if gateway doesn't have llama-cpp-python, trust the LLM service
+                    if not llama_cpp_installed:
+                        return True, "CUDA library found (Windows). LLM service will handle CUDA support."
                     return False, "CUDA library found (Windows) but runtime not verified. Install llama-cpp-python[cuda] to use GPU"
                 except OSError:
                     pass
