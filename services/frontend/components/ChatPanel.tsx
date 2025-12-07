@@ -1,11 +1,12 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Mic, Volume2, Zap, Search, Code, FileText, Brain, Calendar, Info, Paperclip, X, Square, RefreshCw, Edit2, Check, X as XIcon } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useSamplerSettings } from '@/contexts/SamplerSettingsContext';
 import { useSettings } from '@/contexts/SettingsContext';
-import { formatError, isNotFoundError, showError } from '@/lib/utils';
+import { formatError, isNotFoundError } from '@/lib/utils';
+import { useToast } from '@/contexts/ToastContext';
 import AudioVisualizer from './AudioVisualizer';
 
 interface ChatPanelProps {
@@ -17,6 +18,7 @@ interface ChatPanelProps {
 export default function ChatPanel({ conversationId, onConversationNotFound, onConversationCreated }: ChatPanelProps) {
   const { settings: samplerSettings } = useSamplerSettings();
   const { userName: contextUserName, botName: contextBotName } = useSettings();
+  const { showError } = useToast();
   
   const [messages, setMessages] = useState<any[]>([]);
   const [input, setInput] = useState('');
@@ -39,26 +41,11 @@ export default function ChatPanel({ conversationId, onConversationNotFound, onCo
     if (contextBotName) setBotName(contextBotName);
   }, [contextUserName, contextBotName]);
 
-  useEffect(() => {
-    if (conversationId) {
-      loadConversation();
-    } else {
-      setMessages([]);
-    }
-  }, [conversationId]);
-
-  // User names are now managed by SettingsContext
-  // No need for separate loadUserNames function
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
-
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  const loadConversation = async () => {
+  const loadConversation = useCallback(async () => {
     if (!conversationId) {
       setMessages([]);
       return;
@@ -81,7 +68,22 @@ export default function ChatPanel({ conversationId, onConversationNotFound, onCo
       // Clear messages for any error
       setMessages([]);
     }
-  };
+  }, [conversationId, onConversationNotFound]);
+
+  useEffect(() => {
+    if (conversationId) {
+      loadConversation();
+    } else {
+      setMessages([]);
+    }
+  }, [conversationId, loadConversation]);
+
+  // User names are now managed by SettingsContext
+  // No need for separate loadUserNames function
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
 
   const handleFileUpload = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -95,7 +97,7 @@ export default function ChatPanel({ conversationId, onConversationNotFound, onCo
         setUploadedFiles((prev) => [...prev, file]);
       } catch (error) {
         console.error(`Error uploading ${file.name}:`, error);
-        showError(formatError(error), `Error uploading ${file.name}`);
+        showError(`Error uploading ${file.name}: ${formatError(error)}`);
       }
     }
     
@@ -151,7 +153,7 @@ export default function ChatPanel({ conversationId, onConversationNotFound, onCo
       setMessages((prev) => [...prev, assistantMessage]);
     } catch (error) {
       console.error('Error regenerating:', error);
-      showError(formatError(error), 'Error regenerating response');
+      showError(`Error regenerating response: ${formatError(error)}`);
     } finally {
       setLoading(false);
     }
@@ -193,7 +195,7 @@ export default function ChatPanel({ conversationId, onConversationNotFound, onCo
       // But for now, just save the edit
     } catch (error) {
       console.error('Error updating message:', error);
-      showError(formatError(error), 'Error updating message');
+      showError(`Error updating message: ${formatError(error)}`);
     }
   };
 
@@ -257,7 +259,7 @@ export default function ChatPanel({ conversationId, onConversationNotFound, onCo
       // Don't show error if it was a cancellation
       if (error.name !== 'AbortError') {
         console.error('Error sending message:', error);
-        showError(formatError(error), 'Error sending message');
+        showError(`Error sending message: ${formatError(error)}`);
         // Remove the user message if request failed (unless it was cancelled)
         setMessages((prev) => prev.slice(0, -1));
       }
@@ -276,7 +278,7 @@ export default function ChatPanel({ conversationId, onConversationNotFound, onCo
       audio.onended = () => URL.revokeObjectURL(audioUrl);
     } catch (error) {
       console.error('Error with TTS:', error);
-      alert('Failed to play text-to-speech');
+      showError('Failed to play text-to-speech');
     }
   };
 
@@ -309,7 +311,7 @@ export default function ChatPanel({ conversationId, onConversationNotFound, onCo
             setInput(result.text);
           } catch (error) {
             console.error('Error with STT:', error);
-            alert('Error transcribing audio');
+            showError('Error transcribing audio');
           }
           stream.getTracks().forEach(track => track.stop());
         };
@@ -319,7 +321,7 @@ export default function ChatPanel({ conversationId, onConversationNotFound, onCo
         setRecording(true);
       } catch (error) {
         console.error('Error starting recording:', error);
-        alert('Error accessing microphone');
+        showError('Error accessing microphone');
       }
     }
   };

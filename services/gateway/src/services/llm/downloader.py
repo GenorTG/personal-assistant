@@ -113,6 +113,24 @@ class ModelDownloader:
                 author = model_id.split("/")[0] if "/" in model_id else "Unknown"
                 name = model_id.split("/")[-1] if "/" in model_id else model_id
                 
+                # Format last_modified date properly
+                last_modified = None
+                if hasattr(model, "lastModified") and model.lastModified:
+                    try:
+                        from datetime import datetime
+                        # If it's a datetime object, convert to ISO string
+                        if isinstance(model.lastModified, datetime):
+                            last_modified = model.lastModified.isoformat()
+                        # If it's already a string, use it
+                        elif isinstance(model.lastModified, str):
+                            last_modified = model.lastModified
+                        # Otherwise try to convert to string
+                        else:
+                            last_modified = str(model.lastModified)
+                    except Exception as e:
+                        logger.debug(f"Could not format lastModified for {model_id}: {e}")
+                        last_modified = None
+                
                 results.append({
                     "model_id": model_id,
                     "name": name,
@@ -120,7 +138,7 @@ class ModelDownloader:
                     "downloads": getattr(model, "downloads", 0),
                     "tags": list(getattr(model, "tags", [])),
                     "likes": getattr(model, "likes", 0),
-                    "last_modified": str(getattr(model, "lastModified", "")) if hasattr(model, "lastModified") else None,
+                    "last_modified": last_modified,
                 })
             
             return results
@@ -161,11 +179,74 @@ class ModelDownloader:
             
             def _list_files():
                 try:
-                    logger.debug("Calling HfApi.list_repo_files for: %s", repo_id)
+                    logger.debug("Calling HfApi methods for: %s", repo_id)
                     api = HfApi()  # Create fresh instance to avoid any state issues
-                    result = api.list_repo_files(repo_id, repo_type="model")
-                    logger.info("Successfully retrieved %d files from %s", len(result) if result else 0, repo_id)
-                    return result
+                    # First, get list of files
+                    file_list = api.list_repo_files(repo_id, repo_type="model")
+                    logger.info("Successfully retrieved %d files from %s", len(file_list) if file_list else 0, repo_id)
+                    
+                    # Filter to GGUF files
+                    gguf_file_list = [f for f in file_list if f.endswith(".gguf")]
+                    
+                    # Filter out ARM-specific quantizations on non-ARM systems
+                    # Q4_0_4_4, Q4_0_4_8, Q4_0_8_8 are ARM NEON/i8mm/SVE optimizations
+                    import platform
+                    machine = platform.machine().lower()
+                    is_arm = machine in ('arm64', 'aarch64', 'armv8', 'armv7l')
+                    
+                    if not is_arm:
+                        # ARM-specific quantization patterns to filter out
+                        arm_quant_patterns = ['q4_0_4_4', 'q4_0_4_8', 'q4_0_8_8']
+                        original_count = len(gguf_file_list)
+                        gguf_file_list = [
+                            f for f in gguf_file_list 
+                            if not any(pattern in f.lower() for pattern in arm_quant_patterns)
+                        ]
+                        filtered_count = original_count - len(gguf_file_list)
+                        if filtered_count > 0:
+                            logger.info("Filtered out %d ARM-specific quantizations (Q4_0_4_4/Q4_0_4_8/Q4_0_8_8) from %s", 
+                                       filtered_count, repo_id)
+                    
+                    # Get file sizes using get_paths_info
+                    file_sizes = {}
+                    if gguf_file_list:
+                        try:
+                            # Get file info including sizes
+                            paths_info = api.get_paths_info(repo_id, paths=gguf_file_list, repo_type="model")
+                            if paths_info:
+                                logger.debug("Got paths_info for %d files", len(paths_info))
+                                for path_info in paths_info:
+                                    try:
+                                        # Handle both dict and object responses
+                                        if isinstance(path_info, dict):
+                                            file_path = path_info.get("path", "") or path_info.get("name", "") or path_info.get("rfilename", "")
+                                            size_bytes = path_info.get("size") or path_info.get("size_bytes") or 0
+                                        else:
+                                            # Try object attributes
+                                            file_path = getattr(path_info, "path", None) or getattr(path_info, "name", None) or getattr(path_info, "rfilename", None) or ""
+                                            size_bytes = getattr(path_info, "size", None) or getattr(path_info, "size_bytes", None) or 0
+                                        
+                                        if file_path:
+                                            # Convert size_bytes to int if it's not already
+                                            if isinstance(size_bytes, (int, float)) and size_bytes > 0:
+                                                file_sizes[file_path] = int(size_bytes)
+                                                logger.debug("Found size for %s: %d bytes", file_path, int(size_bytes))
+                                            else:
+                                                logger.debug("No size found for %s (size_bytes=%s)", file_path, size_bytes)
+                                    except Exception as parse_err:
+                                        logger.debug("Error parsing path_info: %s", str(parse_err))
+                                        continue
+                        except Exception as size_err:
+                            logger.warning("Could not fetch file sizes via get_paths_info for %s: %s", repo_id, str(size_err))
+                            import traceback
+                            logger.debug("Size fetch traceback: %s", traceback.format_exc())
+                            
+                            # Note: File sizes may not be available for all repositories
+                            # This is a limitation of the HuggingFace API in some cases
+                            logger.debug("File sizes will not be available for this repository")
+                            # Continue without sizes for remaining files
+                    
+                    return gguf_file_list, file_sizes
                 except HfHubHTTPError as http_err:
                     logger.error("HfHubHTTPError in executor: %s", str(http_err))
                     # Re-raise with full context
@@ -176,21 +257,36 @@ class ModelDownloader:
                     logger.error("Inner traceback: %s", traceback.format_exc())
                     raise
             
-            files = await loop.run_in_executor(None, _list_files)
+            file_list, file_sizes = await loop.run_in_executor(None, _list_files)
             
-            if not files:
-                raise ValueError(f"Repository '{repo_id}' not found or is empty. Please check the repository ID.")
+            if not file_list:
+                raise ValueError(f"Repository '{repo_id}' not found or contains no GGUF files. Please check the repository ID.")
             
             gguf_files = []
-            for file in files:
-                if file.endswith(".gguf"):
-                    # Extract quantization info from filename if possible
-                    size_info = self._extract_size_info(file)
-                    gguf_files.append({
-                        "filename": file,
-                        "size_info": size_info,
-                        "is_gguf": True
-                    })
+            for filename in file_list:
+                size_bytes = file_sizes.get(filename, 0)
+                
+                # Extract quantization info from filename if possible
+                size_info = self._extract_size_info(filename)
+                
+                # Format file size
+                size_str = None
+                if size_bytes and size_bytes > 0:
+                    if size_bytes >= 1024 * 1024 * 1024:  # GB
+                        size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+                    elif size_bytes >= 1024 * 1024:  # MB
+                        size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
+                    else:  # KB
+                        size_str = f"{size_bytes / 1024:.2f} KB"
+                
+                gguf_files.append({
+                    "filename": filename,
+                    "rfilename": filename,  # For compatibility with frontend
+                    "size": size_bytes,
+                    "size_info": size_info,
+                    "size_str": size_str,  # Formatted size string
+                    "is_gguf": True
+                })
             
             if not gguf_files:
                 raise ValueError(f"No GGUF files found in repository '{repo_id}'. This repository may not contain GGUF models.")
@@ -319,10 +415,27 @@ class ModelDownloader:
             downloads = getattr(model_info, 'downloads', 0) or 0
             last_modified = None
             try:
-                if hasattr(model_info, 'lastModified'):
-                    last_modified = str(model_info.lastModified) if model_info.lastModified else None
-                elif hasattr(model_info, 'last_modified'):
-                    last_modified = str(model_info.last_modified) if model_info.last_modified else None
+                from datetime import datetime
+                if hasattr(model_info, 'lastModified') and model_info.lastModified:
+                    # If it's a datetime object, convert to ISO string
+                    if isinstance(model_info.lastModified, datetime):
+                        last_modified = model_info.lastModified.isoformat()
+                    # If it's already a string, use it
+                    elif isinstance(model_info.lastModified, str):
+                        last_modified = model_info.lastModified
+                    # Otherwise try to convert to string
+                    else:
+                        last_modified = str(model_info.lastModified)
+                elif hasattr(model_info, 'last_modified') and model_info.last_modified:
+                    # If it's a datetime object, convert to ISO string
+                    if isinstance(model_info.last_modified, datetime):
+                        last_modified = model_info.last_modified.isoformat()
+                    # If it's already a string, use it
+                    elif isinstance(model_info.last_modified, str):
+                        last_modified = model_info.last_modified
+                    # Otherwise try to convert to string
+                    else:
+                        last_modified = str(model_info.last_modified)
             except Exception as e:
                 logger.warning("Could not extract last_modified for %s: %s", repo_id, str(e))
             
@@ -444,6 +557,24 @@ class ModelDownloader:
         # Also scan flat structure for legacy/manually added models
         gguf_files.extend(self.models_dir.glob("*.gguf"))
         
+        # Filter out ARM-specific quantizations on non-ARM systems
+        # Q4_0_4_4, Q4_0_4_8, Q4_0_8_8 are ARM NEON/i8mm/SVE optimizations
+        import platform
+        machine = platform.machine().lower()
+        is_arm = machine in ('arm64', 'aarch64', 'armv8', 'armv7l')
+        
+        if not is_arm:
+            arm_quant_patterns = ['q4_0_4_4', 'q4_0_4_8', 'q4_0_8_8']
+            original_count = len(gguf_files)
+            gguf_files = [
+                f for f in gguf_files 
+                if not any(pattern in f.name.lower() for pattern in arm_quant_patterns)
+            ]
+            filtered_count = original_count - len(gguf_files)
+            if filtered_count > 0:
+                logger.debug("Filtered out %d ARM-specific quantizations from downloaded models list", 
+                           filtered_count)
+        
         return gguf_files
     
     def get_model_info(self, model_path: Path) -> Dict[str, Any]:
@@ -494,6 +625,9 @@ class ModelDownloader:
                 info["huggingface_url"] = metadata.get("huggingface_url")
                 info["downloaded_at"] = metadata.get("downloaded_at")
                 info["source"] = metadata.get("source", "unknown")
+                # Include MoE info from metadata if available
+                if "moe" in metadata:
+                    info["moe"] = metadata["moe"]
                 
             except Exception as e:
                 logger.warning(f"Failed to read metadata for {model_path}: {e}")
@@ -683,7 +817,39 @@ class ModelDownloader:
                 except Exception:
                     pass
                 
-                return {
+                # Try to fetch config.json from HuggingFace to get MoE info
+                moe_info = None
+                try:
+                    from huggingface_hub import hf_hub_download
+                    import tempfile
+                    import json as json_module
+                    
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        config_path = hf_hub_download(
+                            repo_id=repo_id,
+                            filename="config.json",
+                            local_dir=tmpdir,
+                            local_dir_use_symlinks=False
+                        )
+                        
+                        with open(config_path, 'r', encoding='utf-8') as f:
+                            config = json_module.load(f)
+                            
+                            # Extract MoE info from config.json
+                            num_experts = config.get("num_local_experts") or config.get("num_experts")
+                            experts_per_token = config.get("num_experts_per_tok")
+                            
+                            if num_experts and num_experts > 1:
+                                moe_info = {
+                                    "is_moe": True,
+                                    "num_experts": num_experts,
+                                    "experts_per_token": experts_per_token or 2
+                                }
+                                logger.info(f"Extracted MoE info from HuggingFace config.json: {num_experts} experts")
+                except Exception as e:
+                    logger.debug(f"Could not fetch config.json from HuggingFace for {repo_id}: {e}")
+                
+                metadata = {
                     "repo_id": repo_id,
                     "author": author,
                     "name": repo_name,
@@ -697,6 +863,12 @@ class ModelDownloader:
                     "organized_at": datetime.now().isoformat(),
                     "huggingface_url": f"https://huggingface.co/{repo_id}",
                 }
+                
+                # Add MoE info if found
+                if moe_info:
+                    metadata["moe"] = moe_info
+                
+                return metadata
             except Exception as e:
                 logger.warning(f"Could not fetch full metadata for {repo_id}: {e}")
                 return {

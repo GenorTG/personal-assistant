@@ -1,26 +1,29 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Loader, CheckCircle, XCircle, Volume2 } from 'lucide-react';
 import { X } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useSettings } from '@/contexts/SettingsContext';
+import { saveSettingsLocally, loadSettingsLocally, clearPendingSync } from '@/lib/localSettings';
+import { useToast } from '@/contexts/ToastContext';
 import TTSSettings from './TTSSettings';
 import STTSettings from './STTSettings';
-import { ServiceStatusPanel } from './ServiceStatusPanel';
 import SystemPromptEditor from './SystemPromptEditor';
 import ToolSettings from './ToolSettings';
 import MemorySettings from './MemorySettings';
 import SamplerSettings from './SamplerSettings';
+import ResizableSidebar from './ResizableSidebar';
 
 interface SettingsPanelProps {
   onClose: () => void;
+  onWidthChange?: (width: number) => void;
 }
 
 type SettingsTab = 'ai' | 'tts' | 'stt' | 'character' | 'profile' | 'system-prompt' | 'tools' | 'memory';
 
 // TTS Settings Component (deprecated - using separate component)
-function TTSSettingsSection() {
+function _TTSSettingsSection() {
   const [backends, setBackends] = useState<any[]>([]);
   const [currentBackend, setCurrentBackend] = useState<any>(null);
   const [voices, setVoices] = useState<any[]>([]);
@@ -71,7 +74,8 @@ function TTSSettingsSection() {
       await loadTTSInfo();
     } catch (error) {
       console.error('Error switching backend:', error);
-      alert('Failed to switch TTS backend');
+      // Note: This is in a nested component, so we can't use useToast here
+      // The TTSSettings component should handle its own toasts
     }
   };
 
@@ -79,11 +83,13 @@ function TTSSettingsSection() {
     if (!selectedBackend) return;
     try {
       await api.setTTSBackendOptions(selectedBackend, options);
-      alert('TTS options updated!');
+      // Note: This is in a nested component, so we can't use useToast here
+      // The TTSSettings component should handle its own toasts
       await loadBackendDetails(selectedBackend);
     } catch (error) {
       console.error('Error updating options:', error);
-      alert('Failed to update TTS options');
+      // Note: This is in a nested component, so we can't use useToast here
+      // The TTSSettings component should handle its own toasts
     }
   };
 
@@ -300,17 +306,23 @@ function TTSSettingsSection() {
   );
 }
 
-export default function SettingsPanel({ onClose }: SettingsPanelProps) {
-  const { settings: contextSettings, isLoading: settingsLoading, refresh: refreshSettings } = useSettings();
-  const [settings, setSettings] = useState<any>(contextSettings?.settings || null);
+export default function SettingsPanel({ onClose, onWidthChange }: SettingsPanelProps) {
+  const { settings: contextSettings, isLoading: settingsLoading } = useSettings();
+  const { showWarning } = useToast();
+  // Load from localStorage first for instant UI, then merge with backend settings
+  const [settings, setSettings] = useState<any>(() => {
+    const local = loadSettingsLocally();
+    return contextSettings?.settings ? { ...contextSettings.settings, ...local } : local;
+  });
   const [activeTab, setActiveTab] = useState<SettingsTab>('ai');
   const [llmServiceStatus, setLlmServiceStatus] = useState<any>(null);
-  const [llmServiceLoading, setLlmServiceLoading] = useState(false);
+  const syncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Update local settings when context changes
+  // Update local settings when context changes (but preserve local overrides)
   useEffect(() => {
     if (contextSettings?.settings) {
-      setSettings(contextSettings.settings);
+      const local = loadSettingsLocally();
+      setSettings({ ...contextSettings.settings, ...local });
     }
   }, [contextSettings]);
 
@@ -320,25 +332,68 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   const loadLLMServiceStatus = async () => {
     try {
-      setLlmServiceLoading(true);
       const serviceStatus = await api.getLLMServiceStatus() as any;
       setLlmServiceStatus(serviceStatus);
     } catch (error) {
       console.error('Error loading LLM service status:', error);
-    } finally {
-      setLlmServiceLoading(false);
     }
   };
 
-  const handleSave = async () => {
+  // Save settings with local storage first, then sync to backend
+  const saveSettings = useCallback(async (settingsToSave: any) => {
     try {
-      await api.updateSettings(settings);
-      alert('Settings saved!');
+      // Save to localStorage immediately for instant UI
+      saveSettingsLocally({
+        character_card: settingsToSave?.character_card,
+        user_profile: settingsToSave?.user_profile,
+        llm_endpoint_mode: settingsToSave?.llm_endpoint_mode,
+        llm_remote_url: settingsToSave?.llm_remote_url,
+        llm_remote_api_key: settingsToSave?.llm_remote_api_key,
+        llm_remote_model: settingsToSave?.llm_remote_model,
+      });
+      
+      // Sync to backend
+      await api.updateSettings(settingsToSave);
+      clearPendingSync();
+      // Don't show alert - settings are already saved locally
     } catch (error) {
       console.error('Error saving settings:', error);
-      alert('Error saving settings');
+      showWarning('Error syncing settings to backend. Changes are saved locally.');
     }
-  };
+  }, []);
+
+  const handleSave = useCallback(async () => {
+    await saveSettings(settings);
+  }, [settings, saveSettings]);
+
+  // Auto-save on change (debounced backend sync)
+  const handleSettingsChange = useCallback((newSettings: any) => {
+    setSettings(newSettings);
+    
+    // Save to localStorage immediately
+    saveSettingsLocally({
+      character_card: newSettings?.character_card,
+      user_profile: newSettings?.user_profile,
+      llm_endpoint_mode: newSettings?.llm_endpoint_mode,
+      llm_remote_url: newSettings?.llm_remote_url,
+      llm_remote_api_key: newSettings?.llm_remote_api_key,
+      llm_remote_model: newSettings?.llm_remote_model,
+    });
+    
+    // Schedule backend sync (debounced)
+    if (syncTimeoutRef.current) {
+      clearTimeout(syncTimeoutRef.current);
+    }
+    syncTimeoutRef.current = setTimeout(async () => {
+      try {
+        await api.updateSettings(newSettings);
+        clearPendingSync();
+      } catch (error) {
+        console.error('Error auto-syncing settings:', error);
+        // Don't alert - silent failure, settings are in localStorage
+      }
+    }, 1000);
+  }, []);
 
   const tabs: { id: SettingsTab; label: string }[] = [
     { id: 'ai', label: 'AI' },
@@ -352,7 +407,21 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
   ];
 
   return (
-    <div className="w-96 bg-white border-l border-gray-200 flex flex-col fixed right-0 z-40 shadow-2xl" style={{ height: 'calc(100vh - 73px)', top: '73px' }}>
+    <ResizableSidebar
+      initialWidth={384}
+      minWidth={200}
+      maxWidth={800}
+      side="right"
+      className="bg-white border-l border-gray-200 flex flex-col fixed right-0 z-40 shadow-sm outline-none focus:outline-none animate-slide-in-right"
+      style={{
+        height: 'calc(100vh - 73px)',
+        top: '73px',
+        maxHeight: 'calc(100vh - 73px)',
+        overflow: 'hidden',
+        position: 'fixed'
+      }}
+      onWidthChange={onWidthChange}
+    >
       {/* Header */}
       <div className="p-4 border-b border-gray-200 flex-shrink-0">
         <div className="flex justify-between items-center">
@@ -384,8 +453,8 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         ))}
       </div>
       
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4">
+      {/* Content - Scrollable */}
+      <div className="flex-1 overflow-y-auto p-4 relative min-h-0">
         {settingsLoading ? (
           <div className="flex items-center justify-center py-8">
             <p className="text-gray-500">Loading settings...</p>
@@ -400,22 +469,129 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
               <div className="space-y-4">
                 <h3 className="font-semibold mb-4">AI Sampler Settings</h3>
                 
-                {/* LLM Service Status */}
+                {/* LLM Endpoint Mode Selection */}
                 <div className="border-b border-gray-200 pb-4 mb-4">
-                  <label className="block text-sm font-medium mb-2">LLM Service Status</label>
-                  <div className="p-3 border rounded-lg bg-gray-50">
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium">llama-cpp-python Server</span>
-                      <div className="text-sm">
-                        {llmServiceStatus?.running ? (
-                          <span className="text-green-600 font-medium">● Running</span>
-                        ) : (
-                          <span className="text-gray-400">○ Stopped</span>
-                        )}
+                  <label className="block text-sm font-medium mb-2">LLM Endpoint</label>
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="radio"
+                        id="endpoint-local"
+                        name="llm-endpoint"
+                        value="local"
+                        checked={settings?.llm_endpoint_mode !== 'remote'}
+                        onChange={() => {
+                          const newSettings = { ...settings, llm_endpoint_mode: 'local' };
+                          setSettings(newSettings);
+                          saveSettings(newSettings);
+                        }}
+                        className="w-4 h-4 text-primary-600 border-gray-300 focus:ring-primary-500"
+                      />
+                      <label htmlFor="endpoint-local" className="text-sm text-gray-700 cursor-pointer">
+                        Local (llama-cpp-python server)
+                      </label>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="radio"
+                        id="endpoint-remote"
+                        name="llm-endpoint"
+                        value="remote"
+                        checked={settings?.llm_endpoint_mode === 'remote'}
+                        onChange={() => {
+                          const newSettings = { ...settings, llm_endpoint_mode: 'remote' };
+                          setSettings(newSettings);
+                          saveSettings(newSettings);
+                        }}
+                        className="w-4 h-4 text-primary-600 border-gray-300 focus:ring-primary-500"
+                      />
+                      <label htmlFor="endpoint-remote" className="text-sm text-gray-700 cursor-pointer">
+                        Remote (OpenAI-compatible API)
+                      </label>
+                    </div>
+                  </div>
+                  
+                  {/* Remote Endpoint Configuration */}
+                  {settings?.llm_endpoint_mode === 'remote' && (
+                    <div className="mt-4 p-4 bg-blue-50 rounded-lg border border-blue-200 space-y-3">
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1.5">
+                          API Endpoint URL
+                        </label>
+                        <input
+                          type="text"
+                          value={settings?.llm_remote_url || ''}
+                          onChange={(e) => {
+                            const newSettings = { ...settings, llm_remote_url: e.target.value };
+                            setSettings(newSettings);
+                            saveSettings(newSettings);
+                          }}
+                          placeholder="https://api.openai.com/v1"
+                          className="input w-full text-sm"
+                        />
+                        <p className="text-xs text-gray-500 mt-1">
+                          Full URL to OpenAI-compatible endpoint (e.g., https://api.openai.com/v1 or http://localhost:1234/v1)
+                        </p>
+                      </div>
+                      
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1.5">
+                          API Key (optional)
+                        </label>
+                        <input
+                          type="password"
+                          value={settings?.llm_remote_api_key || ''}
+                          onChange={(e) => {
+                            const newSettings = { ...settings, llm_remote_api_key: e.target.value };
+                            setSettings(newSettings);
+                            saveSettings(newSettings);
+                          }}
+                          placeholder="sk-..."
+                          className="input w-full text-sm"
+                        />
+                        <p className="text-xs text-gray-500 mt-1">
+                          API key for authentication (required for OpenAI, optional for self-hosted)
+                        </p>
+                      </div>
+                      
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1.5">
+                          Model Name/ID
+                        </label>
+                        <input
+                          type="text"
+                          value={settings?.llm_remote_model || ''}
+                          onChange={(e) => {
+                            const newSettings = { ...settings, llm_remote_model: e.target.value };
+                            setSettings(newSettings);
+                            saveSettings(newSettings);
+                          }}
+                          placeholder="gpt-4, gpt-3.5-turbo, or model name"
+                          className="input w-full text-sm"
+                        />
+                        <p className="text-xs text-gray-500 mt-1">
+                          Model identifier to use with the remote endpoint (leave empty to use model from request)
+                        </p>
                       </div>
                     </div>
-                    <p className="text-xs text-gray-500 mt-1">Port 8001 - Load a model to start</p>
-                  </div>
+                  )}
+                  
+                  {/* Local LLM Service Status */}
+                  {settings?.llm_endpoint_mode !== 'remote' && (
+                    <div className="mt-4 p-3 border rounded-lg bg-gray-50">
+                      <div className="flex items-center justify-between">
+                        <span className="font-medium">llama-cpp-python Server</span>
+                        <div className="text-sm">
+                          {llmServiceStatus?.running ? (
+                            <span className="text-green-600 font-medium">● Running</span>
+                          ) : (
+                            <span className="text-gray-400">○ Stopped</span>
+                          )}
+                        </div>
+                      </div>
+                      <p className="text-xs text-gray-500 mt-1">Port 8001 - Load a model to start</p>
+                    </div>
+                  )}
                 </div>
 
                 {/* Full Sampler Settings Component */}
@@ -442,7 +618,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                 type="text"
                 value={settings?.character_card?.name || ''}
                 onChange={(e) =>
-                  setSettings({
+                  handleSettingsChange({
                     ...settings,
                     character_card: {
                       ...settings?.character_card,
@@ -458,7 +634,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
               <textarea
                 value={settings?.character_card?.personality || ''}
                 onChange={(e) =>
-                  setSettings({
+                  handleSettingsChange({
                     ...settings,
                     character_card: {
                       ...settings?.character_card,
@@ -482,7 +658,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
                 type="text"
                 value={settings?.user_profile?.name || ''}
                 onChange={(e) =>
-                  setSettings({
+                  handleSettingsChange({
                     ...settings,
                     user_profile: {
                       ...settings?.user_profile,
@@ -498,7 +674,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
               <textarea
                 value={settings?.user_profile?.about || ''}
                 onChange={(e) =>
-                  setSettings({
+                  handleSettingsChange({
                     ...settings,
                     user_profile: {
                       ...settings?.user_profile,
@@ -516,6 +692,11 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         )}
       </div>
       
+      {/* Fixed bottom padding */}
+      <div className="h-16 flex-shrink-0 -mx-4 px-4" style={{
+        background: 'linear-gradient(to bottom, rgba(59, 130, 246, 0.08), rgba(99, 102, 241, 0.12), rgba(139, 92, 246, 0.16), rgba(168, 85, 247, 0.2))'
+      }}></div>
+      
       {/* Footer - only for tabs without their own save button */}
       {!settingsLoading && settings && (activeTab === 'character' || activeTab === 'profile') && (
         <div className="p-4 border-t border-gray-200 flex-shrink-0 bg-gray-50">
@@ -528,7 +709,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           </button>
         </div>
       )}
-    </div>
+    </ResizableSidebar>
   );
 }
 

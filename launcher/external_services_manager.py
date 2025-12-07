@@ -7,11 +7,21 @@ Handles automatic cloning, setup, and management of external Git repositories
 import subprocess
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 import json
 import logging
 
 logger = logging.getLogger(__name__)
+# Configure logger to not fail if no handlers are set up or handlers have None streams
+# This prevents errors in threaded contexts where stdout/stderr might not be available
+# Remove all existing handlers and use NullHandler to prevent stream errors
+for handler in list(logger.handlers):
+    logger.removeHandler(handler)
+handler = logging.NullHandler()
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+# Disable propagation to prevent errors from parent loggers
+logger.propagate = False
 
 
 class ExternalServicesManager:

@@ -1,0 +1,21 @@
+Python 3.12.10
+Name: torch
+Version: 2.9.1
+Summary: Tensors and Dynamic neural networks in Python with strong GPU acceleration
+Home-page: https://pytorch.org
+Author: 
+Author-email: PyTorch Team <packages@pytorch.org>
+License: BSD-3-Clause
+Location: D:\Github Personal\personal-assistant\services\.core_venv\Lib\site-packages
+Requires: filelock, fsspec, jinja2, networkx, setuptools, sympy, typing-extensions
+Required-by: sentence-transformers
+Checking core venv at: D:\Github Personal\personal-assistant\services\.core_venv\Scripts\python.exe
+
+--- Python Version ---
+
+--- Checking llama-cpp-python ---
+Version: 0.3.16
+CUDA Support: True
+
+
+--- Checking torch ---

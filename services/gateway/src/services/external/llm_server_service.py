@@ -1,6 +1,7 @@
 """Service for managing the llama-cpp-python server process."""
 import asyncio
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -30,12 +31,12 @@ class LLMServerService:
         self.venv_python = self._get_llm_python()
     
     def _get_llm_python(self) -> str:
-        """Get the Python interpreter from the LLM service's venv."""
+        """Get the Python interpreter from the shared core services venv."""
         import sys
         from pathlib import Path
         
-        # Get project root from settings
-        llm_venv_dir = settings.base_dir / "services" / "llm" / ".venv"
+        # Get project root from settings - LLM now uses shared core venv
+        llm_venv_dir = settings.base_dir / "services" / ".core_venv"
         
         # Determine Python executable path based on platform
         if sys.platform == "win32":
@@ -45,12 +46,12 @@ class LLMServerService:
         
         # Check if it exists, fallback to sys.executable if not
         if python_exe.exists():
-            logger.info("Using LLM service Python: %s", python_exe)
+            logger.info("Using LLM service Python from shared core venv: %s", python_exe)
             return str(python_exe)
         else:
             logger.warning(
-                "LLM service venv not found at %s, falling back to gateway Python: %s. "
-                "Please ensure the LLM service is installed.",
+                "Shared core venv not found at %s, falling back to gateway Python: %s. "
+                "Please ensure the core services are installed.",
                 llm_venv_dir, sys.executable
             )
             return sys.executable
@@ -90,6 +91,7 @@ class LLMServerService:
         cache_type_v: Optional[str] = None,
         # MoE settings
         n_cpu_moe: Optional[int] = None,
+        n_experts_to_use: Optional[int] = None,
     ) -> bool:
         """Start the LLM server with a specific model.
         
@@ -187,10 +189,6 @@ class LLMServerService:
         if cache_type_v and cache_type_v != "f16":
             model_config["cache_type_v"] = cache_type_v
             
-        # MoE settings
-        if n_cpu_moe is not None:
-            model_config["n_cpu_moe"] = n_cpu_moe
-            
         # Build server config
         config = {
             "host": self.host,
@@ -216,6 +214,10 @@ class LLMServerService:
             self.venv_python, "-m", "llama_cpp.server",
             "--config_file", str(config_path)
         ]
+        
+        # Note: n_cpu_moe is not a valid command-line argument for llama-cpp-python server
+        # It may need to be passed differently or may not be supported
+        # Removed to avoid "unrecognized arguments" error
 
         logger.info("Starting LLM server: %s", " ".join(cmd))
         
@@ -227,11 +229,18 @@ class LLMServerService:
             else:
                 creationflags = 0
             
+            # Set environment variables for proper encoding on Windows
+            env = os.environ.copy()
+            if sys.platform == "win32":
+                # Use UTF-8 encoding to avoid UnicodeEncodeError
+                env["PYTHONIOENCODING"] = "utf-8"
+            
             self.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                creationflags=creationflags
+                creationflags=creationflags,
+                env=env
             )
             
             # Start log monitoring immediately to prevent buffer filling

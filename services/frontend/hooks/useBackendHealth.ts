@@ -14,7 +14,6 @@ interface UseBackendHealthOptions {
 
 export function useBackendHealth(options: UseBackendHealthOptions = {}) {
   const {
-    interval = 30000,
     initialDelay = 0,
     enabled = true,
   } = options;
@@ -27,9 +26,9 @@ export function useBackendHealth(options: UseBackendHealthOptions = {}) {
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Smart polling: 30s when stable, 5s when unstable
+  // Smart polling: 30s when stable, 2s when unstable for faster updates
   const STABLE_INTERVAL = 30000; // 30 seconds when backend is ready and stable
-  const UNSTABLE_INTERVAL = 5000; // 5 seconds when backend is failing or was ready but now failing
+  const UNSTABLE_INTERVAL = 2000; // 2 seconds when backend is failing or was ready but now failing (reduced from 5s)
   const STABLE_THRESHOLD = 3; // Number of consecutive successful checks to consider stable
 
   const checkHealth = useCallback(async () => {

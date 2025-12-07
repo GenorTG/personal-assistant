@@ -3,12 +3,14 @@
 import { useState, useEffect } from 'react';
 import { X, Save, RefreshCw } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useToast } from '@/contexts/ToastContext';
 
 interface ServerSettingsPanelProps {
   onClose: () => void;
 }
 
 export default function ServerSettingsPanel({ onClose }: ServerSettingsPanelProps) {
+  const { showSuccess, showError } = useToast();
   const [loading, setLoading] = useState(false);
   const [systemInfo, setSystemInfo] = useState<any>(null);
   
@@ -41,11 +43,11 @@ export default function ServerSettingsPanel({ onClose }: ServerSettingsPanelProp
     try {
       // Note: This would require a new API endpoint to update server settings
       // For now, these settings are applied when loading a model
-      alert('Settings saved! They will be applied when loading the next model.');
+      showSuccess('Settings saved! They will be applied when loading the next model.');
       onClose();
     } catch (error) {
       console.error('Error saving settings:', error);
-      alert('Error saving settings');
+      showError('Error saving settings');
     } finally {
       setLoading(false);
     }

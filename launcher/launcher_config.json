@@ -1,0 +1,6 @@
+{
+  "chatterbox": {
+    "enable_prewarm": true,
+    "torch_compile": false
+  }
+}

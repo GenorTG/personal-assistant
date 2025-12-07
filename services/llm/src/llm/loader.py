@@ -35,7 +35,7 @@ class LLMLoader:
                 'cuda' in str(llama_cpp).lower()
             )
             if not has_cuda_support:
-                return False, "llama-cpp-python was compiled without CUDA support. Install with: pip install llama-cpp-python[cuda]"
+                return False, "llama-cpp-python installed but seems to lack CUDA support. Please reinstall with CUDA support."
         except (ImportError, AttributeError) as e:
             return False, f"Could not verify llama-cpp-python CUDA support: {e}"
         
@@ -54,7 +54,8 @@ class LLMLoader:
                 except Exception as e:
                     return False, f"CUDA hardware detected but runtime not usable: {e}"
             else:
-                return False, "PyTorch CUDA not available (torch.cuda.is_available() = False)"
+                # Fallback check for nvidia-smi if torch says no
+                pass
         except ImportError:
             pass  # PyTorch not installed, try other methods
         except Exception as e:
@@ -67,7 +68,10 @@ class LLMLoader:
                                   capture_output=True, text=True, timeout=3)
             if result.returncode == 0:
                 gpu_info = result.stdout.strip().split('\n')[0] if result.stdout.strip() else "Unknown GPU"
-                return False, f"NVIDIA driver detected ({gpu_info}) but CUDA runtime not verified. Install CUDA toolkit and llama-cpp-python[cuda]"
+                # If we got here, it means llama-cpp-python has CUDA symbols (Method 1 passed)
+                # but PyTorch didn't detect it or wasn't installed.
+                # We'll assume it might work if drivers are present.
+                return True, f"NVIDIA driver detected ({gpu_info}). Assuming CUDA is available for llama-cpp-python."
         except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
             logger.debug("nvidia-smi check failed: %s", e)
         
@@ -75,20 +79,20 @@ class LLMLoader:
         try:
             import ctypes
             try:
-                cuda = ctypes.CDLL("libcuda.so.1")
-                # Try to get CUDA version
-                return False, "CUDA library found but runtime not verified. Install llama-cpp-python[cuda] to use GPU"
+                # Windows
+                cuda = ctypes.windll.LoadLibrary("nvcuda.dll")
+                return True, "CUDA library found (nvcuda.dll). Assuming CUDA is available."
             except OSError:
                 try:
-                    # Windows
-                    cuda = ctypes.windll.LoadLibrary("nvcuda.dll")
-                    return False, "CUDA library found (Windows) but runtime not verified. Install llama-cpp-python[cuda] to use GPU"
+                    # Linux
+                    cuda = ctypes.CDLL("libcuda.so.1")
+                    return True, "CUDA library found (libcuda.so.1). Assuming CUDA is available."
                 except OSError:
                     pass
         except Exception as e:
             logger.debug("CUDA library check failed: %s", e)
         
-        return False, "No CUDA runtime detected. Install CUDA toolkit and llama-cpp-python[cuda] to use GPU"
+        return False, "No CUDA runtime detected. Please ensure CUDA drivers are installed."
     
     def _detect_gpu_layers(self) -> int:
         """Auto-detect GPU and return appropriate n_gpu_layers value.

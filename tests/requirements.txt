@@ -1,3 +1,0 @@
-# Test Suite Dependencies
-aiohttp>=3.9.0
-

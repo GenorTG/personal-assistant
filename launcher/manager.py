@@ -64,57 +64,64 @@ class ServiceManager:
         self.service_status: Dict[str, ServiceStatus] = {}
         self.service_info: Dict[str, Dict[str, Any]] = {}
         
-        # Initialize external services manager
-        from external_services_manager import ExternalServicesManager
-        self.external_services_mgr = ExternalServicesManager(self.root_dir)
+        # Initialize external services manager lazily (only when needed)
+        # This defers the metadata file loading until actually needed
+        self.external_services_mgr = None
         
+        # Core services share a single venv
+        self.core_services = ["memory", "tools", "gateway", "llm"]
+        self.core_venv = self.root_dir / "services" / ".core_venv"
         
         # Service configurations
-        # Note: Order matters for "Start All" - Memory/Tools start before Gateway
+        # Note: Core services (memory, tools, gateway, llm) share a venv and start simultaneously
         self.services = {
             "memory": {
-                "name": "Memory Service",
+                "name": "Core: Memory Service",
                 "port": 8005,
                 "url": "http://localhost:8005",
                 "health_endpoint": "/health",
                 "start_cmd": lambda: self._get_python_service_start_cmd("memory", "main:app", 8005),
                 "install_cmd": lambda: self._install_python_service("memory"),
                 "dir": self.root_dir / "services" / "memory",
-                "venv": self.root_dir / "services" / "memory" / ".venv",
-                "optional": False
+                "venv": self.core_venv,  # Shared venv for core services
+                "optional": False,
+                "is_core": True
             },
             "tools": {
-                "name": "Tool Service",
+                "name": "Core: Tool Service",
                 "port": 8006,
                 "url": "http://localhost:8006",
                 "health_endpoint": "/health",
                 "start_cmd": lambda: self._get_python_service_start_cmd("tools", "main:app", 8006),
                 "install_cmd": lambda: self._install_python_service("tools"),
                 "dir": self.root_dir / "services" / "tools",
-                "venv": self.root_dir / "services" / "tools" / ".venv",
-                "optional": True
+                "venv": self.core_venv,  # Shared venv for core services
+                "optional": True,
+                "is_core": True
             },
             "gateway": {
-                "name": "API Gateway",
+                "name": "Core: API Gateway",
                 "port": 8000,
                 "url": "http://localhost:8000",
                 "health_endpoint": "/health",
                 "start_cmd": lambda: self._get_python_service_start_cmd("gateway", "main:app", 8000),
                 "install_cmd": lambda: self._install_python_service("gateway"),
                 "dir": self.root_dir / "services" / "gateway",
-                "venv": self.root_dir / "services" / "gateway" / ".venv",
-                "optional": False
+                "venv": self.core_venv,  # Shared venv for core services
+                "optional": False,
+                "is_core": True
             },
             "llm": {
-                "name": "LLM Service",
+                "name": "Core: LLM Service",
                 "port": 8001,
                 "url": "http://localhost:8001",
                 "health_endpoint": "/health",
                 "start_cmd": lambda: [],  # LLM is managed by Gateway, not directly started
                 "install_cmd": lambda: self._install_python_service("llm"),
                 "dir": self.root_dir / "services" / "llm",
-                "venv": self.root_dir / "services" / "llm" / ".venv",
-                "optional": False
+                "venv": self.core_venv,  # Shared venv for core services
+                "optional": False,
+                "is_core": True
             },
             "whisper": {
                 "name": "Whisper Service (STT)",
@@ -125,7 +132,8 @@ class ServiceManager:
                 "install_cmd": self._get_whisper_install_cmd,
                 "dir": self.root_dir / "services" / "stt-whisper",
                 "venv": self.root_dir / "services" / "stt-whisper" / ".venv",
-                "optional": True
+                "optional": True,
+                "is_core": False
             },
             "piper": {
                 "name": "Piper Service (TTS)",
@@ -136,7 +144,8 @@ class ServiceManager:
                 "install_cmd": self._get_piper_install_cmd,
                 "dir": self.root_dir / "services" / "tts-piper",
                 "venv": self.root_dir / "services" / "tts-piper" / ".venv",
-                "optional": True
+                "optional": True,
+                "is_core": False
             },
             "chatterbox": {
                 "name": "Chatterbox Service (TTS)",
@@ -149,7 +158,9 @@ class ServiceManager:
                 "venv": self.root_dir / "external_services" / "chatterbox-tts-api" / ".venv",
                 "repo_url": "https://github.com/travisvn/chatterbox-tts-api",
                 "is_external": True,
-                "optional": True
+                "optional": True,
+                "is_core": False,
+                "python_version": "3.11"
             },
             "kokoro": {
                 "name": "Kokoro Service (TTS)",
@@ -160,18 +171,20 @@ class ServiceManager:
                 "install_cmd": self._get_kokoro_install_cmd,
                 "dir": self.root_dir / "services" / "tts-kokoro",
                 "venv": self.root_dir / "services" / "tts-kokoro" / ".venv",
-                "optional": True
+                "optional": True,
+                "is_core": False
             },
             "frontend": {
                 "name": "Frontend (Next.js)",
-                "port": 3000,
-                "url": "http://localhost:3000",
+                "port": 8002,
+                "url": "http://localhost:8002",
                 "health_endpoint": None,
                 "start_cmd": self._get_frontend_start_cmd,
                 "install_cmd": self._get_frontend_install_cmd,
                 "dir": self.root_dir / "services" / "frontend",
                 "venv": None,
-                "optional": False
+                "optional": False,
+                "is_core": False
             }
         }
         
@@ -205,7 +218,6 @@ class ServiceManager:
         Returns a Python script that executes npm install and npm run build.
         """
         import tempfile
-        import os
         
         # Create a temporary Python script that runs npm commands
         frontend_dir = str(self.services['frontend']['dir'])
@@ -269,41 +281,129 @@ npm_cmd = "npm" if use_shell else ("npm.cmd" if platform.system() == "Windows" e
 
 # Run npm install
 print("[INFO] Running npm install...")
+print(f"[INFO] Command: {{' '.join([npm_cmd, 'install'])}}")
+sys.stdout.flush()
 try:
-    result = subprocess.run(
+    # Use Popen to stream output in real-time
+    process = subprocess.Popen(
         [npm_cmd, "install"],
         shell=use_shell,
-        check=False,
         cwd=frontend_dir,
-        stdout=sys.stdout,
-        stderr=subprocess.STDOUT
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
     )
-    if result.returncode != 0:
+    # Stream output line by line
+    for line in iter(process.stdout.readline, ''):
+        if line:
+            print(line.rstrip())
+            sys.stdout.flush()
+    process.wait()
+    if process.returncode != 0:
         print("[FAIL] npm install failed")
         sys.exit(1)
     print("[OK] npm install completed")
+    sys.stdout.flush()
 except Exception as e:
     print(f"[FAIL] Error running npm install: {{e}}")
     import traceback
     traceback.print_exc()
     sys.exit(1)
 
+# Update Next.js and other packages to latest versions
+print("[INFO] Updating packages to latest versions...")
+print(f"[INFO] Command: {{' '.join([npm_cmd, 'update'])}}")
+sys.stdout.flush()
+try:
+    # Run npm update to update packages within their version ranges
+    process = subprocess.Popen(
+        [npm_cmd, "update"],
+        shell=use_shell,
+        cwd=frontend_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
+    )
+    # Stream output line by line
+    for line in iter(process.stdout.readline, ''):
+        if line:
+            print(line.rstrip())
+            sys.stdout.flush()
+    process.wait()
+    # npm update returns 0 even if nothing was updated, so we don't fail on non-zero
+    print("[OK] npm update completed")
+    sys.stdout.flush()
+except Exception as e:
+    print(f"[WARNING] Error running npm update: {{e}}")
+    # Don't fail installation if update fails
+    import traceback
+    traceback.print_exc()
+
+# Update Next.js to latest version explicitly
+print("[INFO] Updating Next.js to latest version...")
+print(f"[INFO] Command: {{' '.join([npm_cmd, 'install', 'next@latest'])}}")
+sys.stdout.flush()
+try:
+    # Install latest Next.js version
+    process = subprocess.Popen(
+        [npm_cmd, "install", "next@latest"],
+        shell=use_shell,
+        cwd=frontend_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
+    )
+    # Stream output line by line
+    for line in iter(process.stdout.readline, ''):
+        if line:
+            print(line.rstrip())
+            sys.stdout.flush()
+    process.wait()
+    if process.returncode != 0:
+        print("[WARNING] Next.js update failed, but continuing...")
+    else:
+        print("[OK] Next.js updated to latest version")
+    sys.stdout.flush()
+except Exception as e:
+    print(f"[WARNING] Error updating Next.js: {{e}}")
+    # Don't fail installation if Next.js update fails
+    import traceback
+    traceback.print_exc()
+
 # Run npm run build
 print("[INFO] Running npm run build...")
+print(f"[INFO] Command: {{' '.join([npm_cmd, 'run', 'build'])}}")
+sys.stdout.flush()
 try:
-    result = subprocess.run(
+    # Use Popen to stream output in real-time
+    process = subprocess.Popen(
         [npm_cmd, "run", "build"],
         shell=use_shell,
-        check=False,
         cwd=frontend_dir,
-        stdout=sys.stdout,
-        stderr=subprocess.STDOUT
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
     )
-    if result.returncode != 0:
+    # Stream output line by line
+    for line in iter(process.stdout.readline, ''):
+        if line:
+            print(line.rstrip())
+            sys.stdout.flush()
+    process.wait()
+    if process.returncode != 0:
         print("[FAIL] npm run build failed")
         sys.exit(1)
     print("[OK] npm run build completed")
     print("[OK] Frontend installation completed successfully!")
+    sys.stdout.flush()
 except Exception as e:
     print(f"[FAIL] Error running npm run build: {{e}}")
     import traceback
@@ -357,17 +457,10 @@ except Exception as e:
         # Ensure repo is cloned and .env is prepared
         if not self._ensure_external_service("chatterbox"):
             return []
-        # Prefer uv if it exists; otherwise fall back to standard venv + pip install
-        import shutil
-        if shutil.which("uv"):
-            # Use uv for fast dependency installation (creates venv automatically)
-            if platform.system() == "Windows":
-                return ["cmd", "/c", "uv sync"]
-            else:
-                return ["bash", "-c", "uv sync"]
-        else:
-            # uv not available – use the existing python‑service installer which creates a venv and runs pip
-            return self._install_python_service("chatterbox")
+        # Use standard python service installer - it will handle CUDA detection
+        # The _install_python_service method has special handling for Chatterbox
+        # Always run full install
+        return self._install_python_service("chatterbox")
 
 
     def _get_chatterbox_start_cmd(self) -> List[str]:
@@ -423,101 +516,207 @@ except Exception as e:
         
         return True
 
-    def _install_python_service(self, service_key: str, force_reinstall: bool = False) -> List[str]:
+    def _install_python_service(self, service_key: str) -> List[str]:
         """Install a Python service using a virtual environment and pip.
         Executes commands directly to avoid shell quoting issues.
         Special handling for LLM service to build llama-cpp-python with CUDA.
+        Core services (memory, tools, gateway, llm) share a single venv.
+        Always runs pip install -r requirements.txt (pip will skip already installed packages).
         
         Args:
             service_key: Key of the service to install
-            force_reinstall: If True, reinstall even if already installed. If False, skip if installed.
         """
         service = self.services[service_key]
         venv_dir = service["venv"]
         req_file = service["dir"] / "requirements.txt"
         service_dir = service["dir"]
+        is_core = service.get("is_core", False)
         
-        # Check if already installed (unless force_reinstall is True)
-        if not force_reinstall:
-            if venv_dir.exists():
-                # Check if venv is valid
+        # For core services, if shared venv already exists, check if it's valid
+        # If venv exists but pip is missing, we need to set it up properly
+        if is_core and venv_dir.exists():
+            # Check if venv is valid
+            if platform.system() == "Windows":
+                python_exe = venv_dir / "Scripts" / "python.exe"
+            else:
+                python_exe = venv_dir / "bin" / "python"
+            
+            if python_exe.exists():
+                # Check if pip is available
+                creation_flags = 0
                 if platform.system() == "Windows":
-                    python_exe = venv_dir / "Scripts" / "python.exe"
-                else:
-                    python_exe = venv_dir / "bin" / "python"
+                    creation_flags = subprocess.CREATE_NO_WINDOW
                 
-                if python_exe.exists():
-                    # Service is already installed, skip
-                    print(f"[SKIP] {service['name']} is already installed. Use force_reinstall=True to reinstall.")
-                    return [sys.executable, "-c", "print('[SKIP] Service already installed')"]
+                # Test if pip is available
+                try:
+                    result = subprocess.run(
+                        [str(python_exe), "-m", "pip", "--version"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        creationflags=creation_flags
+                    )
+                    pip_available = result.returncode == 0
+                except Exception:
+                    pip_available = False
+                
+                if pip_available:
+                    # Shared venv exists and pip works - install this service's requirements
+                    # pip will handle skipping if already satisfied, or install missing packages
+                    print(f"[CORE] Shared venv exists. Installing {service['name']} dependencies...")
+                    
+                    # Build pip install command (always run, pip will skip already installed packages)
+                    pip_cmd = [str(python_exe), "-m", "pip", "install", "-r", str(req_file)]
+                    
+                    try:
+                        # Stream output directly to stdout (not captured) so launcher can capture it
+                        result = subprocess.run(
+                            pip_cmd,
+                            check=True,
+                            text=True,
+                            timeout=600,
+                            creationflags=creation_flags
+                        )
+                        print(f"[SUCCESS] {service['name']} dependencies installed in shared venv")
+                        return [sys.executable, "-c", "print('[SUCCESS] Dependencies installed')"]
+                    except subprocess.CalledProcessError as e:
+                        error_msg = str(e)
+                        print(f"[ERROR] Failed to install dependencies: {error_msg[:500]}")
+                        return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                else:
+                    # Venv exists but pip is missing - need to install pip first
+                    print(f"[CORE] Shared venv exists but pip is missing. Installing pip...")
+                    try:
+                        # Use ensurepip to bootstrap pip - stream output to stdout
+                        result = subprocess.run(
+                            [str(python_exe), "-m", "ensurepip", "--upgrade"],
+                            check=True,
+                            text=True,
+                            timeout=60,
+                            creationflags=creation_flags
+                        )
+                        print("[CORE] Pip installed successfully")
+                        # Now try installing requirements (always run, pip will skip already installed packages)
+                        pip_cmd = [str(python_exe), "-m", "pip", "install", "-r", str(req_file)]
+                        result = subprocess.run(
+                            pip_cmd,
+                            check=True,
+                            text=True,
+                            timeout=600,
+                            creationflags=creation_flags
+                        )
+                        print(f"[SUCCESS] {service['name']} dependencies installed in shared venv")
+                        return [sys.executable, "-c", "print('[SUCCESS] Dependencies installed')"]
+                    except subprocess.CalledProcessError as e:
+                        error_msg = str(e)
+                        print(f"[ERROR] Failed to install pip or dependencies: {error_msg[:500]}")
+                        return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                    except Exception as e:
+                        print(f"[ERROR] Unexpected error: {e}")
+                        return [sys.executable, "-c", "import sys; sys.exit(1)"]
         
-        print(f"Setting up {service['name']} environment...")
+        if is_core:
+            print(f"Setting up Core Services shared environment...")
+        else:
+            print(f"Setting up {service['name']} environment...")
 
         # 0. Check for locked files
         if not self._check_venv_locks(venv_dir):
             print("[ERROR] Cannot proceed - venv is locked by running processes")
             return [sys.executable, "-c", "import sys; print('[ERROR] Venv locked'); sys.exit(1)"]
 
-        # 1. Remove existing venv if it exists (with retries for Windows file locks)
-        if venv_dir.exists():
-            print("Removing existing virtual environment...")
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    # On Windows, files might be locked - try to remove with retries
-                    if platform.system() == "Windows":
-                        # Try to remove read-only files
-                        for root, dirs, files in os.walk(venv_dir):
-                            for d in dirs:
-                                os.chmod(os.path.join(root, d), 0o777)
-                            for f in files:
-                                try:
-                                    os.chmod(os.path.join(root, f), 0o777)
-                                except (OSError, PermissionError):
-                                    pass
-                    
-                    shutil.rmtree(str(venv_dir), ignore_errors=True)
-                    # Wait a bit for Windows to release file handles
-                    if platform.system() == "Windows":
-                        time.sleep(1)
-                    
-                    if not venv_dir.exists():
-                        break
-                except (PermissionError, OSError) as e:
-                    if attempt < max_retries - 1:
-                        print(f"Retrying venv removal (attempt {attempt + 1}/{max_retries})...")
-                        time.sleep(2)
-                    else:
-                        print(f"Warning: Could not fully remove existing venv: {e}")
-                        print("Trying to continue anyway...")
-                        break
+        # NEVER remove existing venvs - that's too destructive!
+        # Always run pip install -r requirements.txt (pip will skip already installed packages)
+        # We only create venvs if they don't exist
 
-        # 1. Create virtual environment
-        print("Creating virtual environment...")
-        try:
-            # Use CREATE_NO_WINDOW on Windows
-            creation_flags = 0
-            if platform.system() == "Windows":
-                creation_flags = subprocess.CREATE_NO_WINDOW
+        # 1. Create virtual environment (if it doesn't exist)
+        # Determine Python version
+        # Default to 3.12 as requested
+        target_minor = 12
+        
+        # Check for service-specific override
+        if "python_version" in service:
+            try:
+                # format "3.10"
+                ver_str = str(service["python_version"])
+                if "." in ver_str:
+                    target_minor = int(ver_str.split(".")[1])
+                    print(f"Service {service['name']} requests Python 3.{target_minor}")
+            except (ValueError, IndexError):
+                print(f"[WARNING] Invalid python_version '{service.get('python_version')}' for {service['name']}, defaulting to 3.12")
+
+        # Check existing venv version if it exists
+        if venv_dir.exists():
+            try:
+                if platform.system() == "Windows":
+                    check_python = venv_dir / "Scripts" / "python.exe"
+                else:
+                    check_python = venv_dir / "bin" / "python"
+                
+                if check_python.exists():
+                    # Check version
+                    creation_flags = 0
+                    if platform.system() == "Windows":
+                        creation_flags = subprocess.CREATE_NO_WINDOW
+                        
+                    res = subprocess.run(
+                        [str(check_python), "--version"], 
+                        capture_output=True, 
+                        text=True, 
+                        creationflags=creation_flags
+                    )
+                    if res.returncode == 0:
+                        # Output format: "Python 3.11.9"
+                        out = res.stdout.strip() or res.stderr.strip()
+                        if out.startswith("Python 3."):
+                            current_minor = int(out.split(".")[1])
+                            if current_minor != target_minor:
+                                print(f"[WARNING] Venv at {venv_dir} has Python 3.{current_minor}, but service requires 3.{target_minor}")
+                                print(f"[INFO] Deleting venv to reinstall with correct version...")
+                                import shutil
+                                try:
+                                    shutil.rmtree(venv_dir, ignore_errors=True)
+                                    if venv_dir.exists():
+                                        # Try shell delete if shutil fails
+                                        if platform.system() == "Windows":
+                                            os.system(f'rmdir /S /Q "{venv_dir}"')
+                                except Exception as e:
+                                    print(f"[ERROR] Failed to delete venv: {e}")
+            except Exception as e:
+                print(f"[WARNING] Failed to check venv version: {e}")
+
+        if not venv_dir.exists():
+            if is_core:
+                print(f"Creating shared virtual environment for core services (Python 3.{target_minor})...")
+            else:
+                print(f"Creating virtual environment for {service['name']} (Python 3.{target_minor})...")
             
-            result = subprocess.run(
-                [sys.executable, "-m", "venv", str(venv_dir)], 
-                check=True, 
-                timeout=60,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=creation_flags
-            )
-            if result.stdout:
-                print(result.stdout)
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stdout or str(e) if hasattr(e, 'stdout') else str(e)
-            print(f"[ERROR] Failed to create venv: {error_msg}")
-            return [sys.executable, "-c", "import sys; print('[ERROR] Failed to create venv'); sys.exit(1)"]
-        except subprocess.TimeoutExpired:
-            print("[ERROR] Timeout creating venv")
-            return [sys.executable, "-c", "import sys; print('[ERROR] Timeout creating venv'); sys.exit(1)"]
+            python_exe = self.find_latest_python(max_major=3, max_minor=target_minor)
+            
+            try:
+                # Use CREATE_NO_WINDOW on Windows
+                creation_flags = 0
+                if platform.system() == "Windows":
+                    creation_flags = subprocess.CREATE_NO_WINDOW
+                
+                result = subprocess.run(
+                    [python_exe, "-m", "venv", str(venv_dir)], 
+                    check=True, 
+                    timeout=60,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    creationflags=creation_flags
+                )
+                if result.stdout:
+                    print(result.stdout)
+            except subprocess.CalledProcessError as e:
+                error_msg = e.stdout or str(e) if hasattr(e, 'stdout') else str(e)
+                print(f"[ERROR] Failed to create venv: {error_msg}")
+                return [sys.executable, "-c", "import sys; print('[ERROR] Failed to create venv'); sys.exit(1)"]
+            except subprocess.TimeoutExpired:
+                print("[ERROR] Timeout creating venv")
+                return [sys.executable, "-c", "import sys; print('[ERROR] Timeout creating venv'); sys.exit(1)"]
 
         # 2. Install dependencies
         python_exe = venv_dir / ("Scripts" if platform.system() == "Windows" else "bin") / "python"
@@ -535,101 +734,349 @@ except Exception as e:
             creation_flags = subprocess.CREATE_NO_WINDOW
         
         try:
-            # Upgrade pip and install build tools
+            # Upgrade pip and install build tools - stream output to stdout
             print("Upgrading pip and installing build tools...")
             result = subprocess.run(
                 [str(python_exe), "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools", "cmake"],
                 check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
                 text=True,
                 timeout=300,
                 creationflags=creation_flags
             )
-            if result.stdout:
-                print(result.stdout)
             if result.returncode != 0:
-                print(f"[WARNING] pip upgrade had issues: {result.stdout[:200] if result.stdout else 'Unknown error'}")
+                print(f"[WARNING] pip upgrade had issues (exit code: {result.returncode})")
             
-            # Special handling for LLM service - build llama-cpp-python with CUDA
-            if service_key == "llm":
-                self._print("Installing LLM service with CUDA support...", "cyan")
-                self._print("This will take 10-20 minutes to compile...", "yellow")
+            # Special handling for Chatterbox service - install PyTorch with CUDA by default
+            if service_key == "chatterbox":
+                import shutil
+                import re
                 
-                # Detect GPU and set build flags
-                cores = os.cpu_count() or 4
+                # Detect CUDA availability
+                nvidia_smi = shutil.which("nvidia-smi")
+                has_cuda = False
+                cuda_index = "https://download.pytorch.org/whl/cu121"  # Default to CUDA 12.1
+                
+                if nvidia_smi:
+                    cuda_check_result = subprocess.run(
+                        [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        creationflags=creation_flags
+                    )
+                    if cuda_check_result.returncode == 0 and cuda_check_result.stdout.strip():
+                        has_cuda = True
+                        print("[CHATTERBOX] CUDA GPU detected - will install PyTorch with CUDA support by default")
+                        
+                        # Try to detect CUDA version
+                        nvcc = shutil.which("nvcc")
+                        if nvcc:
+                            nvcc_result = subprocess.run(
+                                [nvcc, "--version"],
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                                creationflags=creation_flags
+                            )
+                            if nvcc_result.returncode == 0:
+                                for line in nvcc_result.stdout.split('\n'):
+                                    if 'release' in line.lower():
+                                        match = re.search(r'release\s+(\d+)\.(\d+)', line, re.IGNORECASE)
+                                        if match:
+                                            major, minor = match.groups()
+                                            # Use cu124 for CUDA 12.4+ (recommended), cu121 for CUDA 12.1-12.3
+                                            if major == "12" and int(minor) >= 4:
+                                                cuda_index = "https://download.pytorch.org/whl/cu124"
+                                                print(f"[CHATTERBOX] Detected CUDA version: {major}.{minor} (using cu124 PyTorch build)")
+                                            elif major == "12":
+                                                cuda_index = "https://download.pytorch.org/whl/cu121"
+                                                print(f"[CHATTERBOX] Detected CUDA version: {major}.{minor} (using cu121 PyTorch build)")
+                                            elif major == "11" and minor == "8":
+                                                cuda_index = "https://download.pytorch.org/whl/cu118"
+                                                print(f"[CHATTERBOX] Detected CUDA version: {major}.{minor} (using cu118 PyTorch build)")
+                                            break
+                
+                # Check if PyTorch with CUDA is already installed (preserve it!)
+                pytorch_has_cuda = False
+                if has_cuda:
+                    check_cuda_cmd = [str(python_exe), "-c", "import torch; print('CUDA:', torch.cuda.is_available())"]
+                    try:
+                        cuda_check = subprocess.run(
+                            check_cuda_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                            creationflags=creation_flags
+                        )
+                        if cuda_check.returncode == 0 and "CUDA: True" in cuda_check.stdout:
+                            pytorch_has_cuda = True
+                            print("[CHATTERBOX] PyTorch with CUDA support already installed - preserving it")
+                    except Exception:
+                        pass
+                
+                # Install PyTorch with CUDA if CUDA is available and PyTorch doesn't have CUDA
+                pytorch_cmd = None  # Define outside if block for use in verification later
+                if has_cuda and not pytorch_has_cuda:
+                    print("[CHATTERBOX] Installing PyTorch with CUDA support (default for Chatterbox)...")
+                    # First, uninstall any existing CPU-only PyTorch
+                    try:
+                        print("[CHATTERBOX] Uninstalling existing PyTorch (if any)...")
+                        uninstall_cmd = [str(python_exe), "-m", "pip", "uninstall", "torch", "torchaudio", "-y"]
+                        # Stream uninstall output to stdout
+                        uninstall_result = subprocess.run(
+                            uninstall_cmd,
+                            text=True,
+                            timeout=300,
+                            creationflags=creation_flags
+                        )
+                    except Exception as e:
+                        print(f"[CHATTERBOX] Note: Uninstall step had issues (may be normal): {e}")
+                    
+                    # Chatterbox requires torch==2.6.0 and torchaudio==2.6.0 (exact versions)
+                    # CUDA index was already determined above based on CUDA version
+                    pytorch_cmd = [
+                        str(python_exe), "-m", "pip", "install",
+                        "torch==2.6.0",
+                        "torchaudio==2.6.0",
+                        "--index-url", cuda_index,
+                        "--no-cache-dir"  # Ensure fresh download
+                    ]
+                    try:
+                        # Stream PyTorch installation output to stdout
+                        pytorch_result = subprocess.run(
+                            pytorch_cmd,
+                            check=True,
+                            text=True,
+                            timeout=1800,  # 30 minutes
+                            creationflags=creation_flags
+                        )
+                        
+                        # VERIFY CUDA installation actually worked
+                        verify_cmd = [str(python_exe), "-c", "import torch; print('CUDA_BUILT:', torch.version.cuda if hasattr(torch.version, 'cuda') and torch.version.cuda else 'None'); print('CUDA_AVAILABLE:', torch.cuda.is_available())"]
+                        verify_result = subprocess.run(
+                            verify_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                            creationflags=creation_flags
+                        )
+                        if verify_result.returncode == 0:
+                            if "CUDA_BUILT: None" in verify_result.stdout or "CUDA_AVAILABLE: False" in verify_result.stdout:
+                                print("[CHATTERBOX] WARNING: PyTorch installation completed but CUDA is not available!")
+                                print("[CHATTERBOX] This may indicate:")
+                                print("[CHATTERBOX]   - CUDA runtime/drivers not installed")
+                                print("[CHATTERBOX]   - PyTorch CUDA build doesn't match CUDA runtime")
+                                print("[CHATTERBOX]   - GPU not accessible")
+                                print("[CHATTERBOX] Will continue with CPU-only installation")
+                                pytorch_has_cuda = False
+                            else:
+                                print("[CHATTERBOX] PyTorch with CUDA support installed and verified successfully")
+                                pytorch_has_cuda = True
+                        else:
+                            print("[CHATTERBOX] WARNING: Could not verify CUDA installation")
+                            pytorch_has_cuda = False
+                    except subprocess.CalledProcessError as e:
+                        print(f"[CHATTERBOX] Warning: Failed to install PyTorch with CUDA: {e.stdout[:200] if e.stdout else str(e)}")
+                        print("[CHATTERBOX] Will continue with CPU-only installation")
+                        pytorch_has_cuda = False
+                
+                # Install requirements, filtering out torch/torchaudio if CUDA PyTorch is installed
+                if req_file.exists():
+                    if pytorch_has_cuda:
+                        # Read requirements and filter out torch/torchaudio
+                        print("[CHATTERBOX] Installing dependencies (excluding torch/torchaudio - CUDA version already installed)...")
+                        with open(req_file, 'r', encoding='utf-8') as f:
+                            req_lines = f.readlines()
+                        
+                        filtered_reqs = []
+                        for line in req_lines:
+                            line_lower = line.lower().strip()
+                            # Skip torch and torchaudio lines (case-insensitive, handle comments)
+                            if line.strip().startswith('#'):
+                                continue  # Skip comments
+                            if not any(pkg in line_lower for pkg in ['torch', 'torchaudio']):
+                                filtered_reqs.append(line.strip())
+                        
+                        # Install filtered requirements
+                        if filtered_reqs:
+                            # Write filtered requirements to temp file
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp_req:
+                                tmp_req.write('\n'.join(filtered_reqs))
+                                tmp_req_path = tmp_req.name
+                            
+                            try:
+                                # Stream requirements installation output to stdout
+                                req_result = subprocess.run(
+                                    [str(python_exe), "-m", "pip", "install", "-r", tmp_req_path],
+                                    check=True,
+                                    text=True,
+                                    timeout=600,
+                                    creationflags=creation_flags
+                                )
+                                
+                                # VERIFY CUDA PyTorch is still installed after requirements install
+                                verify_cmd = [str(python_exe), "-c", "import torch; print('CUDA_BUILT:', torch.version.cuda if hasattr(torch.version, 'cuda') and torch.version.cuda else 'None'); print('CUDA_AVAILABLE:', torch.cuda.is_available())"]
+                                verify_result = subprocess.run(
+                                    verify_cmd,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=10,
+                                    creationflags=creation_flags
+                                )
+                                if verify_result.returncode == 0:
+                                    if "CUDA_BUILT: None" in verify_result.stdout or "CUDA_AVAILABLE: False" in verify_result.stdout:
+                                        print("[CHATTERBOX] ERROR: CUDA PyTorch was overwritten by requirements.txt!")
+                                        if pytorch_cmd:
+                                            print("[CHATTERBOX] Reinstalling CUDA PyTorch...")
+                                            # Reinstall CUDA PyTorch - stream output
+                                            subprocess.run(
+                                                pytorch_cmd,
+                                                check=True,
+                                                text=True,
+                                                timeout=1800,
+                                                creationflags=creation_flags
+                                            )
+                                            print("[CHATTERBOX] CUDA PyTorch reinstalled")
+                                        else:
+                                            print("[CHATTERBOX] WARNING: Cannot reinstall CUDA PyTorch (command not available)")
+                                    else:
+                                        print("[CHATTERBOX] Dependencies installed successfully (CUDA PyTorch preserved)")
+                            finally:
+                                # Clean up temp file
+                                try:
+                                    os.unlink(tmp_req_path)
+                                except Exception:
+                                    pass
+                    else:
+                        # Install all requirements normally (includes CPU torch) - stream output
+                        print("[CHATTERBOX] Installing all dependencies from requirements.txt...")
+                        req_result = subprocess.run(
+                            [str(python_exe), "-m", "pip", "install", "-r", str(req_file)],
+                            check=True,
+                            text=True,
+                            timeout=600,
+                            creationflags=creation_flags
+                        )
+                        print("[CHATTERBOX] Dependencies installed successfully")
+                else:
+                    print(f"[WARNING] requirements.txt not found at {req_file}")
+                
+                return [sys.executable, "-c", "print('[SUCCESS] Chatterbox installed with CUDA support')"]
+            
+            # Special handling for LLM service - install prebuilt llama-cpp-python with CUDA
+            if service_key == "llm":
+                self._print("Installing LLM service with CUDA support (prebuilt wheels)...", "cyan")
+                
+                # Detect GPU and CUDA version
+                cuda_version = "cpu" # Default to CPU
+                cuda_index_url = ""
                 
                 # Check for CUDA
                 try:
                     nvcc_result = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5)
-                    has_cuda = nvcc_result.returncode == 0
-                except (FileNotFoundError, subprocess.TimeoutError):
-                    has_cuda = False
+                    if nvcc_result.returncode == 0:
+                        import re
+                        # Parse version
+                        # Example: Cuda compilation tools, release 12.4, V12.4.131
+                        match = re.search(r"release (\d+)\.(\d+)", nvcc_result.stdout)
+                        if match:
+                            major, minor = match.groups()
+                            major = int(major)
+                            minor = int(minor)
+                            
+                            if major == 12:
+                                if minor >= 4:
+                                    cuda_version = "cu124"
+                                    cuda_index_url = "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+                                else:
+                                    cuda_version = "cu121"
+                                    cuda_index_url = "https://abetlen.github.io/llama-cpp-python/whl/cu121"
+                                self._print(f"Detected CUDA {major}.{minor} - using {cuda_version} wheels", "green")
+                            elif major == 11:
+                                cuda_version = "cu118" # Most common for 11.x
+                                cuda_index_url = "https://abetlen.github.io/llama-cpp-python/whl/cu118"
+                                self._print(f"Detected CUDA {major}.{minor} - using {cuda_version} wheels", "green")
+                            else:
+                                self._print(f"Detected CUDA {major}.{minor} - no prebuilt wheels found, falling back to CPU", "yellow")
+                        else:
+                            self._print("Could not parse CUDA version, falling back to CPU", "yellow")
+                    else:
+                        self._print("No CUDA compiler found (nvcc), checking nvidia-smi...", "dim")
+                        # Fallback to nvidia-smi check
+                        nvidia_smi = shutil.which("nvidia-smi")
+                        if nvidia_smi:
+                            smi_result = subprocess.run([nvidia_smi], capture_output=True, text=True)
+                            if smi_result.returncode == 0 and "CUDA Version: 12" in smi_result.stdout:
+                                # Assume 12.1 safe fallback for 12.x drivers if nvcc missing
+                                cuda_version = "cu121"
+                                cuda_index_url = "https://abetlen.github.io/llama-cpp-python/whl/cu121"
+                                self._print("Detected CUDA 12 via nvidia-smi - using cu121 wheels", "green")
+                except Exception as e:
+                    self._print(f"Error detecting CUDA: {e}", "yellow")
                 
-                if has_cuda:
-                    self._print("CUDA detected - building with GPU support", "green")
-                    # RTX 3080 = compute capability 8.6 (sm_86)
-                    # Build optimized for this GPU only + use all cores
-                    os.environ["CMAKE_ARGS"] = "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_NATIVE=on"
-                    os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = str(cores)
-                    os.environ["FORCE_CMAKE"] = "1"
-                else:
-                    self._print("No CUDA detected - building CPU-only version", "yellow")
-                    os.environ["CMAKE_ARGS"] = "-DLLAMA_NATIVE=on"
-                    os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = str(cores)
-                    os.environ["FORCE_CMAKE"] = "1"
-                
-                # Install llama-cpp-python with CUDA first
-                self._print(f"Building llama-cpp-python (using {cores} CPU cores)...", "dim")
-                self._print("This will take 10-20 minutes. Please be patient...", "yellow")
-                try:
-                    result = subprocess.run(
-                        [str(python_exe), "-m", "pip", "install", "llama-cpp-python[server]", "--no-cache-dir", "--force-reinstall"],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                        timeout=3600  # 1 hour timeout
-                    )
-                    
-                    if result.returncode != 0:
-                        error_msg = result.stderr or result.stdout or "Unknown error"
-                        if "Permission denied" in error_msg or "Access is denied" in error_msg:
-                            self._print("Permission denied error. Make sure:", "red")
-                            self._print("  1. No other programs are using files in the venv", "red")
-                            self._print("  2. You have write permissions to the service directory", "red")
-                            self._print("  3. Antivirus is not blocking file access", "red")
-                            return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                # Install llama-cpp-python
+                if cuda_index_url:
+                    self._print(f"Installing llama-cpp-python from {cuda_index_url}...", "cyan")
+                    try:
+                        # Uninstall first to be safe
+                        subprocess.run(
+                            [str(python_exe), "-m", "pip", "uninstall", "llama-cpp-python", "-y"],
+                            capture_output=True,
+                            creationflags=creation_flags
+                        )
                         
-                        self._print("Failed to build llama-cpp-python with CUDA. Trying CPU-only fallback...", "yellow")
-                        # Fallback to CPU
-                        os.environ["CMAKE_ARGS"] = "-DLLAMA_NATIVE=on"
-                        os.environ.pop("CMAKE_BUILD_PARALLEL_LEVEL", None)
+                        install_cmd = [
+                            str(python_exe), "-m", "pip", "install", 
+                            "llama-cpp-python>=0.3.0", 
+                            "--extra-index-url", cuda_index_url,
+                            "--no-cache-dir",
+                            "--force-reinstall"
+                        ]
+                        
                         result = subprocess.run(
-                            [str(python_exe), "-m", "pip", "install", "llama-cpp-python[server]", "--no-cache-dir", "--force-reinstall"],
+                            install_cmd,
                             check=False,
                             capture_output=True,
                             text=True,
-                            timeout=3600
+                            timeout=600,
+                            creationflags=creation_flags
                         )
+                        
                         if result.returncode != 0:
-                            error_msg = result.stderr or result.stdout or "Unknown error"
-                            self._print(f"Failed to install llama-cpp-python: {error_msg[:500]}", "red")
-                            return [sys.executable, "-c", "import sys; sys.exit(1)"]
-                except subprocess.TimeoutExpired:
-                    self._print("Build timed out after 1 hour. This is unusual.", "red")
-                    return [sys.executable, "-c", "import sys; sys.exit(1)"]
-                except Exception as e:
-                    self._print(f"Unexpected error during build: {e}", "red")
-                    return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                            self._print(f"Failed to install prebuilt wheel: {result.stderr[:500]}", "red")
+                            self._print("Falling back to CPU version...", "yellow")
+                            cuda_index_url = "" # Trigger CPU fallback
+                        else:
+                            self._print("Successfully installed llama-cpp-python with CUDA support", "green")
+                    except Exception as e:
+                        self._print(f"Error installing prebuilt wheel: {e}", "red")
+                        cuda_index_url = "" # Trigger CPU fallback
                 
-                # Install other requirements (skip llama-cpp-python)
+                if not cuda_index_url:
+                    self._print("Installing CPU-only llama-cpp-python...", "yellow")
+                    try:
+                        subprocess.run(
+                            [str(python_exe), "-m", "pip", "install", "llama-cpp-python>=0.3.0"],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=600,
+                            creationflags=creation_flags
+                        )
+                    except Exception as e:
+                        self._print(f"Failed to install llama-cpp-python: {e}", "red")
+                        return [sys.executable, "-c", "import sys; sys.exit(1)"]
+
+                # Install other requirements (skip llama-cpp-python as we just installed it)
                 self._print("Installing other dependencies...", "dim")
                 other_deps = []
-                with open(req_file, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#') and 'llama-cpp-python' not in line:
-                            other_deps.append(line)
+                if req_file.exists():
+                    with open(req_file, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith('#') and 'llama-cpp-python' not in line:
+                                other_deps.append(line)
                 
                 if other_deps:
                     # Create temp requirements file without llama-cpp-python
@@ -644,7 +1091,66 @@ except Exception as e:
                             check=True,
                             capture_output=True,
                             text=True,
-                            timeout=600
+                            timeout=600,
+                            creationflags=creation_flags
+                        )
+                    except subprocess.CalledProcessError as e:
+                        self._print(f"Failed to install dependencies: {e.stderr[:500] if e.stderr else str(e)}", "red")
+                        return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                    finally:
+                        if os.path.exists(tmp_req):
+                            try:
+                                os.remove(tmp_req)
+                            except (PermissionError, OSError):
+                                pass
+            else:
+                # For core services, install all core services' requirements
+                if is_core:
+                    self._print("Installing all core services dependencies (this may take a while)...", "dim")
+                    core_req_files = []
+                    for core_svc_key in self.core_services:
+                        core_svc = self.services[core_svc_key]
+                        core_req = core_svc["dir"] / "requirements.txt"
+                        if core_req.exists():
+                            core_req_files.append(str(core_req))
+                    
+                    if core_req_files:
+                        try:
+                            # Install all core services' requirements (always run, pip will skip already installed packages)
+                            for req_file_path in core_req_files:
+                                self._print(f"Installing dependencies from {Path(req_file_path).name}...", "dim")
+                                pip_cmd = [str(python_exe), "-m", "pip", "install", "-r", req_file_path]
+                                # Stream output to stdout
+                                result = subprocess.run(
+                                    pip_cmd,
+                                    check=True,
+                                    text=True,
+                                    timeout=600,
+                                    creationflags=creation_flags
+                                )
+                        except subprocess.CalledProcessError as e:
+                            error_msg = e.stderr or e.stdout or str(e)
+                            if "Permission denied" in error_msg or "Access is denied" in error_msg:
+                                self._print("Permission denied installing dependencies", "red")
+                                self._print("Make sure you have write access to the venv directory", "red")
+                            else:
+                                self._print(f"Failed to install dependencies: {error_msg[:500]}", "red")
+                            return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                        except subprocess.TimeoutExpired:
+                            self._print("Installation timed out", "red")
+                            return [sys.executable, "-c", "import sys; sys.exit(1)"]
+                else:
+                    # Normal installation for other services (always run, pip will skip already installed packages)
+                    self._print("Installing dependencies (this may take a while)...", "dim")
+                    try:
+                        pip_cmd = [str(python_exe), "-m", "pip", "install", "-r", str(req_file)]
+                        # Stream output to stdout
+                        result = subprocess.run(
+                            pip_cmd,
+                            check=True,
+                            text=True,
+                            timeout=600,
+                            creationflags=creation_flags
                         )
                     except subprocess.CalledProcessError as e:
                         error_msg = e.stderr or e.stdout or str(e)
@@ -657,34 +1163,6 @@ except Exception as e:
                     except subprocess.TimeoutExpired:
                         self._print("Installation timed out", "red")
                         return [sys.executable, "-c", "import sys; sys.exit(1)"]
-                    finally:
-                        if os.path.exists(tmp_req):
-                            try:
-                                os.remove(tmp_req)
-                            except (PermissionError, OSError):
-                                pass
-            else:
-                # Normal installation for other services
-                self._print("Installing dependencies (this may take a while)...", "dim")
-                try:
-                    result = subprocess.run(
-                        [str(python_exe), "-m", "pip", "install", "-r", str(req_file)],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=600
-                    )
-                except subprocess.CalledProcessError as e:
-                    error_msg = e.stderr or e.stdout or str(e)
-                    if "Permission denied" in error_msg or "Access is denied" in error_msg:
-                        self._print("Permission denied installing dependencies", "red")
-                        self._print("Make sure you have write access to the venv directory", "red")
-                    else:
-                        self._print(f"Failed to install dependencies: {error_msg[:500]}", "red")
-                    return [sys.executable, "-c", "import sys; sys.exit(1)"]
-                except subprocess.TimeoutExpired:
-                    self._print("Installation timed out", "red")
-                    return [sys.executable, "-c", "import sys; sys.exit(1)"]
                 
         except Exception as e:
             self._print(f"Unexpected error during installation: {e}", "red")
@@ -700,10 +1178,26 @@ except Exception as e:
             except Exception as e:
                 print(f"[WARNING] Failed to copy .env: {e}")
         
-        print(f"[SUCCESS] {service['name']} installation completed successfully")
+        if is_core:
+            print(f"[SUCCESS] Core services shared environment installation completed successfully")
+        else:
+            print(f"[SUCCESS] {service['name']} installation completed successfully")
         # Return a dummy success command since we already did the work
         return [sys.executable, "-c", "print('[SUCCESS] Installation completed')"]
 
+    def _get_external_services_manager(self):
+        """Lazy-load external services manager."""
+        if self.external_services_mgr is None:
+            # Use absolute import to avoid relative import errors
+            import sys
+            from pathlib import Path
+            launcher_dir = Path(__file__).parent
+            if str(launcher_dir) not in sys.path:
+                sys.path.insert(0, str(launcher_dir))
+            from external_services_manager import ExternalServicesManager
+            self.external_services_mgr = ExternalServicesManager(self.root_dir)
+        return self.external_services_mgr
+    
     def _ensure_external_service(self, service_name: str) -> bool:
         """Ensure external service is cloned and configured."""
         service = self.services.get(service_name)
@@ -723,12 +1217,13 @@ except Exception as e:
         
         # Clone the repository if needed
         self._print(f"Ensuring {service_name} is cloned...", "cyan")
-        if not self.external_services_mgr.ensure_service_cloned(repo_url, service_name, target_dir):
+        external_mgr = self._get_external_services_manager()
+        if not external_mgr.ensure_service_cloned(repo_url, service_name, target_dir):
             self._print(f"Failed to clone {service_name}", "red")
             return False
         
         # Setup the service (create .env, etc.)
-        if not self.external_services_mgr.setup_service(service_name, target_dir):
+        if not external_mgr.setup_service(service_name, target_dir):
             self._print(f"Failed to setup {service_name}", "red")
             return False
         
@@ -796,7 +1291,77 @@ except Exception as e:
             return True, version_str
         except Exception as e:
             return False, f"Error checking Python: {e}"
-    
+
+    def find_latest_python(self, max_major=3, max_minor=12):
+        candidates = []
+
+        # Windows: Try 'py' launcher first
+        if platform.system() == "Windows":
+            try:
+                # Check available versions via py --list
+                result = subprocess.run(["py", "--list"], capture_output=True, text=True)
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        # Output format: " -V:3.12          Python 3.12 (64-bit)"
+                        if "-V:" in line:
+                            try:
+                                ver_part = line.split()[0].split(":")[1] # "3.12"
+                                major, minor = map(int, ver_part.split("."))
+                                if major == 3 and minor <= max_minor:
+                                    # Found a valid version, verify we can use it
+                                    py_cmd = f"py -{major}.{minor}"
+                                    # Get the actual executable path
+                                    path_res = subprocess.run(
+                                        ["py", f"-{major}.{minor}", "-c", "import sys; print(sys.executable)"],
+                                        capture_output=True,
+                                        text=True
+                                    )
+                                    if path_res.returncode == 0:
+                                        exe_path = path_res.stdout.strip()
+                                        candidates.append((major, minor, exe_path))
+                            except (ValueError, IndexError):
+                                continue
+            except FileNotFoundError:
+                pass
+
+        # Try common executable names (Linux/Mac or Windows fallback)
+        for major in range(3, max_major + 1):
+            for minor in range(0, max_minor + 1):
+                name = f"python{major}.{minor}"
+                try:
+                    result = subprocess.run(
+                        [name, "--version"],
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        version_str = result.stdout.strip() or result.stderr.strip()
+                        # Confirm version is within limits
+                        if version_str.startswith(f"Python {major}.{minor}"):
+                            candidates.append((major, minor, name))
+                except FileNotFoundError:
+                    continue
+
+        # Sort descending and pick highest
+        if candidates:
+            # Remove duplicates based on path/name
+            unique_candidates = {}
+            for maj, min_v, path in candidates:
+                key = (maj, min_v)
+                if key not in unique_candidates:
+                    unique_candidates[key] = path
+            
+            sorted_keys = sorted(unique_candidates.keys(), reverse=True)
+            best_ver = sorted_keys[0]
+            best_path = unique_candidates[best_ver]
+            
+            print(f"Using Python {best_ver[0]}.{best_ver[1]} executable: {best_path}")
+            return best_path
+
+        # Fallback to current Python
+        print(f"No newer Python found, using current: {sys.executable}")
+        return sys.executable
+
     def check_node(self) -> Tuple[bool, str]:
         """Check if Node.js is available."""
         try:
@@ -1068,7 +1633,7 @@ except Exception as e:
         
         # Create fresh venv
         self._print("Creating fresh virtual environment...", style="yellow")
-        python_exe = sys.executable
+        python_exe = self.find_latest_python(max_major=3, max_minor=12)
         
         # Use --clear flag if venv still exists (will clear it)
         venv_args = [python_exe, "-m", "venv", str(venv_path)]

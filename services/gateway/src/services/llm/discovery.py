@@ -13,6 +13,7 @@ import json
 from datetime import datetime
 from huggingface_hub import HfApi
 from .model_info import ModelInfoExtractor
+from .file_stores import ModelMetadataStore
 
 logger = logging.getLogger(__name__)
 
@@ -504,7 +505,7 @@ class ModelDiscovery:
             "last_verified": datetime.now().isoformat(),
             "source": "manual_linked"
         })
-        
+            
         await self.metadata_store.save_metadata(model_path, existing)
         return existing
     

@@ -12,9 +12,11 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ServiceStatusProvider } from "@/contexts/ServiceStatusContext";
 import { useSettings } from "@/contexts/SettingsContext";
 import { useBackendHealth } from "@/hooks/useBackendHealth";
+import { useToast } from "@/contexts/ToastContext";
 
 export default function Home() {
   const { modelLoaded, currentModel, refresh: refreshSettings } = useSettings();
+  const { showError, showConfirm } = useToast();
   const { isReady: backendReady, error: backendError, checkHealth: checkBackend } = useBackendHealth({
     interval: 5000, // Check every 5 seconds for faster updates
     enabled: true,
@@ -22,6 +24,7 @@ export default function Home() {
   const [showSettings, setShowSettings] = useState(false);
   const [showModelBrowser, setShowModelBrowser] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(384); // Default 384px (w-96)
   const [conversations, setConversations] = useState<any[]>([]);
   const [currentConversationId, setCurrentConversationId] = useState<
     string | null
@@ -33,7 +36,8 @@ export default function Home() {
     try {
       setError(null);
       
-      // Check cache first (unless force refresh)
+      // Check cache first (unless force refresh) - OPTIMISTIC LOADING
+      let cachedConvs: any[] | null = null;
       if (!forceRefresh) {
         const cached = localStorage.getItem('conversations_cache');
         const cacheTime = localStorage.getItem('conversations_cache_time');
@@ -42,10 +46,13 @@ export default function Home() {
           // Use cache if less than 30 seconds old
           if (age < 30000) {
             try {
-              const convs = JSON.parse(cached);
-              console.log(`[Conversations] Loaded ${convs.length} conversations from cache`);
-              setConversations(convs);
-              return convs;
+              cachedConvs = JSON.parse(cached);
+              if (cachedConvs && Array.isArray(cachedConvs)) {
+                console.log(`[Conversations] Loaded ${cachedConvs.length} conversations from cache`);
+                // Show cached data immediately
+                setConversations(cachedConvs);
+                setLoading(false);
+              }
             } catch {
               // Cache corrupted, continue to fetch
             }
@@ -53,21 +60,36 @@ export default function Home() {
         }
       }
       
-      const convs = (await api.getConversations()) as any[];
-      console.log(`[Conversations] Loaded ${convs.length} conversations`);
-      setConversations(convs);
-      
-      // Cache the result
-      localStorage.setItem('conversations_cache', JSON.stringify(convs));
-      localStorage.setItem('conversations_cache_time', Date.now().toString());
-      
-      return convs;
+      // Try to fetch fresh data in background (non-blocking)
+      try {
+        const convs = (await api.getConversations()) as any[];
+        console.log(`[Conversations] Loaded ${convs.length} conversations from backend`);
+        setConversations(convs);
+        
+        // Cache the result
+        localStorage.setItem('conversations_cache', JSON.stringify(convs));
+        localStorage.setItem('conversations_cache_time', Date.now().toString());
+        
+        return convs;
+      } catch (fetchError) {
+        // If we have cached data, use it and don't show error
+        if (cachedConvs && cachedConvs.length > 0) {
+          console.warn("[Conversations] Backend fetch failed, using cached data:", fetchError);
+          return cachedConvs;
+        }
+        // No cached data, show error
+        throw fetchError;
+      }
     } catch (error) {
       console.error("Error loading conversations:", error);
-      setError(
-        error instanceof Error ? error.message : "Failed to load conversations"
-      );
-      setConversations([]);
+      // Only set error if we don't have cached data
+      const cached = localStorage.getItem('conversations_cache');
+      if (!cached) {
+        setError(
+          error instanceof Error ? error.message : "Failed to load conversations"
+        );
+        setConversations([]);
+      }
       return [];
     } finally {
       setLoading(false);
@@ -93,45 +115,46 @@ export default function Home() {
     } catch (error) {
       console.error("Error creating conversation:", error);
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      alert(`Error creating conversation: ${errorMessage}`);
+      showError(`Error creating conversation: ${errorMessage}`);
       
       // Try to reload conversations anyway in case it was partially created
       await loadConversations(true);
     }
-  }, [loadConversations]);
+  }, [loadConversations, showError]);
 
   const initializeApp = useCallback(async () => {
     setLoading(true);
     setError(null);
     
     try {
-      // Wait for backend to be ready first
-      const ready = await api.waitForBackend(60000); // Wait up to 60 seconds
-      if (!ready) {
-        setError(
-          "Backend is not responding. Please ensure the backend server is running on http://localhost:8000"
-        );
-        setLoading(false);
-        return;
-      }
+      // NO BLOCKING WAIT - Load cached data immediately, fetch fresh data in background
+      console.log("[App] Initializing app with optimistic loading...");
 
-      console.log("[App] Backend is ready, initializing app...");
-
-      // Sync the health hook state with API client state
+      // Sync the health hook state with API client state (non-blocking)
       checkBackend();
 
-      // Parallelize settings refresh and conversation loading for faster initialization
-      const [convs] = await Promise.all([
-        loadConversations(),
-        refreshSettings(), // Settings refresh can happen in parallel
-      ]);
+      // Load conversations immediately (will use cache if available)
+      const convs = await loadConversations();
+
+      // Try to refresh settings in background (non-blocking, won't block UI)
+      refreshSettings().catch(err => {
+        console.warn("[App] Settings refresh failed (non-critical):", err);
+      });
 
       console.log(`[App] Loaded ${convs.length} conversations`);
 
-      // If no conversations exist, create a default one
+      // If no conversations exist, try to create a default one (only if backend is ready)
       if (convs.length === 0) {
-        console.log("[App] No conversations found, creating new one...");
-        await handleNewConversation();
+        // Check if backend is ready before creating conversation
+        const isReady = await api.checkBackendHealth();
+        if (isReady) {
+          console.log("[App] No conversations found, creating new one...");
+          handleNewConversation().catch(err => {
+            console.warn("[App] Failed to create default conversation:", err);
+          });
+        } else {
+          console.log("[App] Backend not ready, will create conversation when ready");
+        }
       } else {
         // Try to load last opened conversation from localStorage
         const lastConversationId = localStorage.getItem("lastConversationId");
@@ -157,23 +180,31 @@ export default function Home() {
       }
     } catch (error) {
       console.error("[App] Error initializing app:", error);
-      setError(
-        error instanceof Error ? error.message : "Failed to initialize app"
-      );
+      // Don't show error if we have cached conversations
+      const cached = localStorage.getItem('conversations_cache');
+      if (!cached) {
+        setError(
+          error instanceof Error ? error.message : "Failed to initialize app"
+        );
+      }
       setLoading(false);
     }
   }, [refreshSettings, loadConversations, handleNewConversation, checkBackend]);
 
+  // Only run initializeApp once on mount
   useEffect(() => {
     initializeApp();
     // Settings are now managed by SettingsContext and auto-refresh every 30s
     // No need for separate model status polling
-  }, [initializeApp]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Empty deps - only run on mount
 
   // Check backend health immediately on mount for faster status update
+  // Note: useBackendHealth hook already handles initial check, this is just for immediate sync
   useEffect(() => {
     checkBackend();
-  }, [checkBackend]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only run once on mount
 
   // Backend health is now managed by useBackendHealth hook
   useEffect(() => {
@@ -188,43 +219,44 @@ export default function Home() {
   // No need for separate loadModelStatus function
 
   const handleDeleteConversation = async (id: string) => {
-    if (!confirm("Are you sure you want to delete this conversation?")) {
-      return;
-    }
+    showConfirm(
+      "Are you sure you want to delete this conversation?",
+      async () => {
+        try {
+          await api.deleteConversation(id);
 
-    try {
-      await api.deleteConversation(id);
+          // Clear localStorage if deleting the last opened conversation
+          if (localStorage.getItem("lastConversationId") === id) {
+            localStorage.removeItem("lastConversationId");
+          }
 
-      // Clear localStorage if deleting the last opened conversation
-      if (localStorage.getItem("lastConversationId") === id) {
-        localStorage.removeItem("lastConversationId");
-      }
-
-      // Update current conversation before reloading
-      if (currentConversationId === id) {
-        const remaining = conversations.filter((c) => c.conversation_id !== id);
-        const nextId =
-          remaining.length > 0 ? remaining[0].conversation_id : null;
-        setCurrentConversationId(nextId);
-        if (nextId) {
-          localStorage.setItem("lastConversationId", nextId);
-        } else {
-          // No conversations left, create a new one
-          await handleNewConversation();
-          return; // handleNewConversation already calls loadConversations
+          // Update current conversation before reloading
+          if (currentConversationId === id) {
+            const remaining = conversations.filter((c) => c.conversation_id !== id);
+            const nextId =
+              remaining.length > 0 ? remaining[0].conversation_id : null;
+            setCurrentConversationId(nextId);
+            if (nextId) {
+              localStorage.setItem("lastConversationId", nextId);
+            } else {
+              // No conversations left, create a new one
+              await handleNewConversation();
+              return; // handleNewConversation already calls loadConversations
+            }
+          }
+          
+          // Reload conversations list to reflect deletion
+          await loadConversations();
+        } catch (error) {
+          console.error("Error deleting conversation:", error);
+          const errorMessage = error instanceof Error ? error.message : "Unknown error";
+          showError(`Error deleting conversation: ${errorMessage}`);
+          
+          // Still reload conversations in case the deletion partially succeeded
+          await loadConversations();
         }
       }
-      
-      // Reload conversations list to reflect deletion
-      await loadConversations();
-    } catch (error) {
-      console.error("Error deleting conversation:", error);
-      const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      alert(`Error deleting conversation: ${errorMessage}`);
-      
-      // Still reload conversations in case the deletion partially succeeded
-      await loadConversations();
-    }
+    );
   };
 
   const handleSwitchConversation = (id: string) => {
@@ -234,7 +266,7 @@ export default function Home() {
 
   const handleRenameConversation = async (id: string, newName: string) => {
     if (!newName || !newName.trim()) {
-      alert("Conversation name cannot be empty");
+      showError("Conversation name cannot be empty");
       return;
     }
 
@@ -247,7 +279,7 @@ export default function Home() {
     } catch (error) {
       console.error('Error renaming conversation:', error);
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      alert(`Error renaming conversation: ${errorMessage}`);
+      showError(`Error renaming conversation: ${errorMessage}`);
       
       // Reload conversations to get current state (rename may have partially succeeded)
       await loadConversations();
@@ -264,7 +296,7 @@ export default function Home() {
     } catch (error) {
       console.error('Error pinning conversation:', error);
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      alert(`Error ${pinned ? 'pinning' : 'unpinning'} conversation: ${errorMessage}`);
+      showError(`Error ${pinned ? 'pinning' : 'unpinning'} conversation: ${errorMessage}`);
       
       // Reload conversations to get current state
       await loadConversations();
@@ -281,30 +313,38 @@ export default function Home() {
     }
     confirmMessage += '\n\nThis action cannot be undone.';
     
-    if (!confirm(confirmMessage)) {
-      return;
-    }
-
-    try {
-      await api.deleteAllConversations();
-      
-      // Clear localStorage
-      localStorage.removeItem("lastConversationId");
-      
-      // Clear state
-      setConversations([]);
-      setCurrentConversationId(null);
-      
-      // Create a new default conversation
-      await handleNewConversation();
-    } catch (error) {
-      console.error("Error deleting all conversations:", error);
-      const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      alert(`Error deleting all conversations: ${errorMessage}`);
-      
-      // Reload conversations to get current state
-      await loadConversations();
-    }
+    showConfirm(confirmMessage, async () => {
+      try {
+        await api.deleteAllConversations();
+        
+        // Clear localStorage cache
+        localStorage.removeItem("lastConversationId");
+        localStorage.removeItem("conversations_cache");
+        localStorage.removeItem("conversations_cache_time");
+        
+        // Force reload conversations to get updated list from backend (bypass cache)
+        const updatedConversations = await loadConversations(true);
+        
+        // Clear current conversation ID
+        setCurrentConversationId(null);
+        
+        // Check if any conversations remain after deletion
+        if (!updatedConversations || updatedConversations.length === 0) {
+          // All conversations deleted - create a new default one
+          await handleNewConversation();
+        } else {
+          // Select the first remaining conversation (should be pinned ones)
+          setCurrentConversationId(updatedConversations[0].id);
+        }
+      } catch (error) {
+        console.error("Error deleting all conversations:", error);
+        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        showError(`Error deleting all conversations: ${errorMessage}`);
+        
+        // Reload conversations to get current state
+        await loadConversations(true);
+      }
+    });
   };
 
   const handleConversationNotFound = (conversationId: string) => {
@@ -459,9 +499,10 @@ export default function Home() {
           <div className="flex-1 flex overflow-hidden relative">
             {/* Chat Panel */}
             <div
-              className={`flex-1 flex flex-col transition-all duration-300 ${
-                showSettings || showModelBrowser || showDebug ? "mr-96" : ""
-              }`}
+              className="flex-1 flex flex-col transition-all duration-300"
+              style={{
+                marginRight: showSettings || showModelBrowser || showDebug ? `${sidebarWidth}px` : '0',
+              }}
             >
               <ChatPanel 
                 conversationId={currentConversationId} 
@@ -476,13 +517,19 @@ export default function Home() {
 
             {/* Side Panels - Only show one at a time */}
             {showSettings && !showModelBrowser && !showDebug && (
-              <SettingsPanel onClose={() => setShowSettings(false)} />
+              <SettingsPanel 
+                onClose={() => setShowSettings(false)}
+                onWidthChange={setSidebarWidth}
+              />
             )}
             {showModelBrowser && !showSettings && !showDebug && (
               <ModelBrowser onClose={() => setShowModelBrowser(false)} />
             )}
             {showDebug && !showSettings && !showModelBrowser && (
-              <DebugPanel onClose={() => setShowDebug(false)} />
+              <DebugPanel 
+                onClose={() => setShowDebug(false)}
+                onWidthChange={setSidebarWidth}
+              />
             )}
           </div>
         </div>

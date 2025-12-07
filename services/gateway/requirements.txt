@@ -16,6 +16,7 @@ aiosqlite>=0.20.0
 # Memory/Embeddings (for chat context)
 sentence-transformers>=2.2.0
 chromadb>=0.4.0
+sympy>=1.0.0
 
 # LLM Client
 openai>=1.0.0

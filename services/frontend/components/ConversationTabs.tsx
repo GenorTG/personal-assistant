@@ -2,6 +2,7 @@
 
 import { Plus, X, Edit2, Check, Pin } from 'lucide-react';
 import { useState } from 'react';
+import { useToast } from '@/contexts/ToastContext';
 
 interface ConversationTabsProps {
   conversations: any[];
@@ -24,6 +25,7 @@ export default function ConversationTabs({
   onRename,
   onPin,
 }: ConversationTabsProps) {
+  const { showConfirm } = useToast();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const getTitle = (conv: any) => {
@@ -64,9 +66,9 @@ export default function ConversationTabs({
     if (conversations.length === 0) return;
     
     const confirmMessage = `Are you sure you want to delete all ${conversations.length} conversations? This action cannot be undone.`;
-    if (confirm(confirmMessage)) {
+    showConfirm(confirmMessage, () => {
       onDeleteAll();
-    }
+    });
   };
 
   return (

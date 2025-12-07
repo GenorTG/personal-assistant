@@ -797,6 +797,16 @@ class ChatterboxServiceManager:
                 if not await self._install_dependencies():
                     raise RuntimeError("Failed to install Chatterbox TTS API dependencies. Check logs for details.")
             
+            # Verify CUDA availability and PyTorch CUDA support before starting
+            device_info = self._check_device_info()
+            if device_info.get("cuda_available", False):
+                logger.info("CUDA detected: %s (PyTorch %s)", 
+                          device_info.get("gpu_name", "Unknown GPU"),
+                          device_info.get("pytorch_version", "Unknown"))
+            else:
+                logger.warning("CUDA not available - Chatterbox will run in CPU mode. "
+                             "For GPU support, ensure PyTorch with CUDA is installed in the Chatterbox venv.")
+            
             logger.info("Starting Chatterbox TTS API server at %s...", self.api_url)
             
             # Start the server process
@@ -829,6 +839,19 @@ class ChatterboxServiceManager:
                     env['PYTHONPATH'] = f"{base_dir_str}{os.pathsep}{env['PYTHONPATH']}"
                 else:
                     env['PYTHONPATH'] = base_dir_str
+                
+                # OPTIMIZATION: Detect CUDA and set DEVICE environment variable for GPU support
+                # Check if CUDA is available in the venv
+                device_info = self._check_device_info()
+                if device_info.get("cuda_available", False):
+                    env['DEVICE'] = 'cuda'
+                    logger.info("CUDA detected - setting DEVICE=cuda for GPU inference")
+                    self._logs.append("CUDA detected - setting DEVICE=cuda for GPU inference")
+                else:
+                    # Explicitly set to auto (will detect best available device)
+                    env['DEVICE'] = 'auto'
+                    logger.info("No CUDA detected - using DEVICE=auto (will use CPU or MPS if available)")
+                    self._logs.append("No CUDA detected - using DEVICE=auto")
                 
                 # On Windows, create a new console window so logs are visible
                 # On Unix, use default behavior (inherit terminal)
@@ -996,7 +1019,11 @@ class ChatterboxServiceManager:
             }
     
     async def restart(self) -> Dict[str, Any]:
-        """Restart the Chatterbox TTS API server."""
+        """Restart the Chatterbox TTS API server.
+        
+        This will restart with GPU support if CUDA is available.
+        The DEVICE environment variable will be set to 'cuda' if CUDA is detected.
+        """
         await self.stop()
         await asyncio.sleep(1)
         return await self.start()

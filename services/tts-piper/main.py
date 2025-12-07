@@ -21,7 +21,18 @@ class TTSRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize TTS
+    # Initialize TTS and ensure model is available
+    try:
+        # Try to find or download model on startup
+        if not tts_service.model_path or not tts_service.model_path.exists():
+            logger.info("No Piper model found on startup, attempting to download...")
+            tts_service.model_path = tts_service._download_default_model()
+            if tts_service.model_path and tts_service.model_path.exists():
+                logger.info(f"Piper model ready: {tts_service.model_path}")
+            else:
+                logger.warning("Piper model not available - will attempt download on first use")
+    except Exception as e:
+        logger.warning(f"Failed to initialize Piper model on startup: {e}")
     yield
 
 app = FastAPI(title="Piper Service", lifespan=lifespan)
@@ -43,7 +54,15 @@ async def health_check():
 async def text_to_speech(request: TTSRequest):
     """Convert text to speech."""
     try:
-        audio_path = await tts_service.synthesize(request.input, request.voice)
+        # synthesize is synchronous, run in executor
+        import asyncio
+        loop = asyncio.get_event_loop()
+        audio_path = await loop.run_in_executor(
+            None,
+            tts_service.synthesize,
+            request.input,
+            request.voice
+        )
         # Read the generated wav file into memory
         with open(audio_path, "rb") as f:
             audio_data = f.read()

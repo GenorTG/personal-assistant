@@ -196,55 +196,101 @@ class DownloadManager:
             loop = asyncio.get_event_loop()
             
             def do_download():
-                # Use a custom progress handler
+                # Use file monitoring approach for more reliable progress tracking
                 from huggingface_hub import hf_hub_download, HfApi
-                from huggingface_hub.utils import tqdm as hf_tqdm
                 import time
+                import os
+                import threading
                 
-                last_update = [time.time()]
-                last_bytes = [0]
+                # Get expected file size first
+                api = HfApi()
+                expected_size = 0
+                try:
+                    # Try to get file size from HuggingFace
+                    paths_info = api.get_paths_info(download.repo_id, paths=[download.filename], repo_type="model")
+                    if paths_info and isinstance(paths_info, list) and len(paths_info) > 0:
+                        file_info = paths_info[0]
+                        if isinstance(file_info, dict):
+                            expected_size = file_info.get("size", 0)
+                        elif hasattr(file_info, 'size'):
+                            expected_size = file_info.size or 0
+                except Exception as e:
+                    logger.debug(f"Could not get file size: {e}")
                 
-                class ProgressTracker:
-                    def __init__(self, download_obj, callback):
-                        self.download = download_obj
-                        self.callback = callback
+                download.total_bytes = expected_size
+                if expected_size > 0:
+                    download.bytes_downloaded = 0
+                    download.progress = 0.0
+                
+                # Start download in a separate thread with file monitoring
+                download_path = None
+                download_error = None
+                
+                def monitor_progress():
+                    """Monitor file size during download."""
+                    target_file = None
+                    last_size = 0
+                    last_time = time.time()
+                    check_count = 0
                     
-                    def update_progress(self, current, total):
-                        now = time.time()
-                        elapsed = now - last_update[0]
-                        
-                        self.download.bytes_downloaded = current
-                        self.download.total_bytes = total
-                        
-                        if total > 0:
-                            self.download.progress = (current / total) * 100
-                        
-                        if elapsed > 0.3:
-                            bytes_diff = current - last_bytes[0]
-                            self.download.speed_bps = bytes_diff / elapsed if elapsed > 0 else 0
-                            last_update[0] = now
-                            last_bytes[0] = current
+                    while download.status == DownloadStatus.DOWNLOADING:
+                        try:
+                            check_count += 1
                             
-                            # Notify in main thread
-                            self.callback(self.download)
+                            # Find the file being downloaded
+                            if target_file is None or not target_file.exists():
+                                # Check direct path first (hf_hub_download might save directly to local_dir)
+                                direct_path = model_folder / download.filename
+                                if direct_path.exists():
+                                    target_file = direct_path
+                                else:
+                                    # Look for the file recursively in the model folder
+                                    for file in model_folder.rglob(download.filename):
+                                        if file.is_file():
+                                            target_file = file
+                                            break
+                                    
+                                    # Also check for temporary files (hf_hub_download might use .tmp extension)
+                                    if target_file is None:
+                                        for file in model_folder.rglob(f"{download.filename}*"):
+                                            if file.is_file() and (file.suffix == '.tmp' or '.tmp' in file.name):
+                                                target_file = file
+                                                break
+                            
+                            if target_file and target_file.exists():
+                                current_size = target_file.stat().st_size
+                                
+                                # Always update if size changed, or every 10 checks (5 seconds) even if same
+                                if current_size != last_size or check_count % 10 == 0:
+                                    now = time.time()
+                                    elapsed = now - last_time if last_time > 0 else 0.5
+                                    
+                                    download.bytes_downloaded = current_size
+                                    if expected_size > 0:
+                                        download.progress = min((current_size / expected_size) * 100, 99.9)  # Cap at 99.9% until complete
+                                    
+                                    # Calculate speed
+                                    if elapsed > 0.1 and current_size > last_size:
+                                        bytes_diff = current_size - last_size
+                                        download.speed_bps = bytes_diff / elapsed
+                                        last_time = now
+                                        last_size = current_size
+                                        
+                                        # Notify progress
+                                        on_progress(download)
+                                    elif current_size != last_size:
+                                        # Size changed but not enough time elapsed - still update
+                                        last_size = current_size
+                                        on_progress(download)
+                            
+                            time.sleep(0.5)  # Check every 0.5 seconds
+                        except Exception as e:
+                            logger.debug(f"Progress monitoring error: {e}")
+                            time.sleep(1)
                 
-                tracker = ProgressTracker(download, on_progress)
-                
-                # Monkey-patch tqdm to capture progress
-                original_tqdm = hf_tqdm.tqdm
-                
-                class CapturingTqdm(original_tqdm):
-                    def __init__(self, *args, **kwargs):
-                        super().__init__(*args, **kwargs)
-                        self._tracker = tracker
-                    
-                    def update(self, n=1):
-                        result = super().update(n)
-                        if hasattr(self, 'total') and self.total:
-                            self._tracker.update_progress(self.n, self.total)
-                        return result
-                
-                hf_tqdm.tqdm = CapturingTqdm
+                # Start progress monitoring thread
+                monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
+                monitor_thread.start()
                 
                 try:
                     # Download to the model subfolder
@@ -255,9 +301,22 @@ class DownloadManager:
                         local_dir_use_symlinks=False,
                         resume_download=True
                     )
+                    
+                    # Final update - ensure we have the correct size
+                    if path and os.path.exists(path):
+                        final_size = os.path.getsize(path)
+                        download.bytes_downloaded = final_size
+                        download.total_bytes = final_size
+                        download.progress = 100.0
+                        on_progress(download)
+                    
                     return path
+                except Exception as e:
+                    download_error = e
+                    raise
                 finally:
-                    hf_tqdm.tqdm = original_tqdm
+                    # Wait a bit for final progress update
+                    time.sleep(0.5)
             
             model_path = await loop.run_in_executor(None, do_download)
             
@@ -313,6 +372,38 @@ class DownloadManager:
                 except Exception:
                     pass
                 
+                # Try to fetch config.json from HuggingFace to get MoE info
+                moe_info = None
+                try:
+                    from huggingface_hub import hf_hub_download
+                    import tempfile
+                    import json as json_module
+                    
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        config_path = hf_hub_download(
+                            repo_id=repo_id,
+                            filename="config.json",
+                            local_dir=tmpdir,
+                            local_dir_use_symlinks=False
+                        )
+                        
+                        with open(config_path, 'r', encoding='utf-8') as f:
+                            config = json_module.load(f)
+                            
+                            # Extract MoE info from config.json
+                            num_experts = config.get("num_local_experts") or config.get("num_experts")
+                            experts_per_token = config.get("num_experts_per_tok")
+                            
+                            if num_experts and num_experts > 1:
+                                moe_info = {
+                                    "is_moe": True,
+                                    "num_experts": num_experts,
+                                    "experts_per_token": experts_per_token or 2
+                                }
+                                logger.info(f"Extracted MoE info from HuggingFace config.json: {num_experts} experts")
+                except Exception as e:
+                    logger.debug(f"Could not fetch config.json from HuggingFace for {repo_id}: {e}")
+                
                 # Build metadata
                 metadata = {
                     "repo_id": repo_id,
@@ -328,6 +419,10 @@ class DownloadManager:
                     "downloaded_at": datetime.now().isoformat(),
                     "huggingface_url": f"https://huggingface.co/{repo_id}",
                 }
+                
+                # Add MoE info if found
+                if moe_info:
+                    metadata["moe"] = moe_info
                 
                 return metadata
             

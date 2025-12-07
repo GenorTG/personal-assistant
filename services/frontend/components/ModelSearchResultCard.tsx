@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { formatNumber, formatDateShort } from '@/lib/utils';
 import { CheckCircle, Eye, Heart, Calendar, User, Cpu, Hash, Package, Edit3, Trash2, Loader2 } from 'lucide-react';
 
 interface ModelSearchResultCardProps {
@@ -89,18 +90,6 @@ export default function ModelSearchResultCard({
 
   const buttonDisabled = isCurrent && !onDownload && !onViewDetails;
   
-  // Format numbers
-  const formatNumber = (num: number) => {
-    if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
-    if (num >= 1000) return `${(num / 1000).toFixed(1)}k`;
-    return num;
-  };
-
-  // Format date
-  const formatDate = (dateString: string) => {
-    if (!dateString) return '';
-    return new Date(dateString).toLocaleDateString();
-  };
 
   return (
     <div className={`group relative bg-white rounded-xl border transition-all duration-200 hover:shadow-lg hover:border-primary-300 ${isCurrent ? 'border-green-500 ring-1 ring-green-500 bg-green-50/30' : 'border-gray-200'}`}>
@@ -192,7 +181,7 @@ export default function ModelSearchResultCard({
           {model.last_modified && (
             <div className="flex items-center gap-1" title="Last Updated">
               <Calendar size={14} />
-              <span>{formatDate(model.last_modified)}</span>
+              <span>{formatDateShort(model.last_modified)}</span>
             </div>
           )}
         </div>

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { RefreshCw, Play, Square, AlertCircle, CheckCircle } from 'lucide-react';
+import { RefreshCw, Play, AlertCircle } from 'lucide-react';
 import { api } from '../lib/api';
 
 interface ServiceStatus {

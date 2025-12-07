@@ -45,7 +45,7 @@ class MemoryStore:
         """Initialize memory store resources."""
         # Clean up old SQLite data (we use file store now)
         await self._cleanup_old_data()
-    
+        
     async def _cleanup_old_data(self):
         """Remove old SQLite database files - we use file store only now."""
         logger = logging.getLogger(__name__)
@@ -207,7 +207,7 @@ class MemoryStore:
         """
         # File store now handles cleanup automatically
         return await self.file_store.list_conversations(limit=limit, offset=offset)
-    
+        
     async def reset_all_data(self, keep_models: bool = True) -> Dict[str, Any]:
         """Reset all app data (conversations, settings, vector store).
         
@@ -539,7 +539,7 @@ class MemoryStore:
         conv_file = self.file_store.conversations_dir / f"{conversation_id}.json"
         
         if not conv_file.exists():
-            return {
+                    return {
                 "custom": False,
                 "save_enabled": None,
                 "read_enabled": None

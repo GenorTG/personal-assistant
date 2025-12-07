@@ -164,7 +164,10 @@ class ModelLoadOptions(BaseModel):
     cache_type_v: Optional[str] = Field(None, pattern="^(f16|f32|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1)$", description="KV cache type for V")
     
     # MoE (Mixture of Experts) settings
-    n_cpu_moe: Optional[int] = Field(None, ge=1, le=128, description="Number of CPU threads for MoE experts")
+    # Note: n_cpu_moe is not a valid parameter for llama-cpp-python server
+    # It was incorrectly documented as "CPU threads for MoE experts"
+    # The correct parameter is n_experts_to_use (number of experts to activate per token)
+    n_experts_to_use: Optional[int] = Field(None, ge=1, le=64, description="Number of experts to use per token (for MoE models). This specifies how many experts are activated for each token during processing.")
     
     # Deprecated/removed - kept for backwards compatibility, will be ignored
     use_flash_attention: Optional[bool] = Field(None, description="DEPRECATED: Use flash_attn instead")
@@ -270,6 +273,12 @@ class AISettings(BaseModel):
     character_card: Optional[CharacterCard] = Field(None, description="Character card for personality")
     user_profile: Optional[UserProfile] = Field(None, description="User profile information")
     default_load_options: Optional[ModelLoadOptions] = Field(None, description="Default model loading options")
+    
+    # Remote LLM Endpoint Settings
+    llm_endpoint_mode: Optional[str] = Field("local", description="LLM endpoint mode: 'local' or 'remote'")
+    llm_remote_url: Optional[str] = Field(None, description="Remote OpenAI-compatible endpoint URL (e.g., https://api.openai.com/v1)")
+    llm_remote_api_key: Optional[str] = Field(None, description="API key for remote endpoint (optional)")
+    llm_remote_model: Optional[str] = Field(None, description="Model name/ID to use with remote endpoint")
 
 
 class AISettingsResponse(BaseModel):
@@ -298,6 +307,7 @@ class ModelInfo(BaseModel):
     huggingface_url: Optional[str] = None
     downloaded_at: Optional[str] = None
     has_metadata: bool = False
+    moe: Optional[Dict[str, Any]] = None  # MoE configuration from model_info.json
 
 
 class ModelMetadata(BaseModel):

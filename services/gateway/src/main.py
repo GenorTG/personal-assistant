@@ -1,11 +1,47 @@
 """FastAPI application entry point."""
 import os
 import logging
+import platform
+import asyncio
 
 # Configure logger early
 import time
 logger = logging.getLogger(__name__)
 startup_start = time.time()
+
+# Fix Windows asyncio connection errors
+if platform.system() == "Windows":
+    def _suppress_connection_errors(loop, context):
+        """Suppress non-critical connection errors on Windows."""
+        exception = context.get('exception')
+        if isinstance(exception, ConnectionResetError):
+            # This is a non-critical error that happens during connection cleanup
+            # It's safe to ignore on Windows - it's a known asyncio/Windows issue
+            return
+        # For other exceptions, use default handler
+        if hasattr(loop, 'default_exception_handler') and loop.default_exception_handler:
+            loop.default_exception_handler(context)
+        else:
+            # Fallback: just log to debug
+            logger.debug(f"Unhandled asyncio exception: {context}")
+    
+    # Store handler for later use
+    _connection_error_handler = _suppress_connection_errors
+    
+    # Also suppress asyncio logger errors for ConnectionResetError
+    asyncio_logger = logging.getLogger('asyncio')
+    original_error = asyncio_logger.error
+    
+    def filtered_error(msg, *args, **kwargs):
+        # Filter out ConnectionResetError messages
+        if 'ConnectionResetError' in str(msg) or 'connection_lost' in str(msg) or 'ProactorBasePipeTransport' in str(msg):
+            asyncio_logger.debug(msg, *args, **kwargs)
+        else:
+            original_error(msg, *args, **kwargs)
+    
+    asyncio_logger.error = filtered_error
+else:
+    _connection_error_handler = None
 
 # Check NumPy version compatibility BEFORE importing ChromaDB
 try:
@@ -127,7 +163,7 @@ class CORSMiddlewareCustom(BaseHTTPMiddleware):
 app.add_middleware(CORSMiddlewareCustom)
 
 # Also keep the standard CORS middleware as a fallback
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
+cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:8002,http://localhost:8000").split(",")
 if settings.debug:
     # In debug mode, allow all origins for development
     cors_origins = ["*"]
@@ -242,6 +278,15 @@ if False and frontend_path.exists() and not frontend_next_path.exists():
 async def startup_event():
     """Initialize services on startup."""
     startup_start_time = time.time()
+    
+    # Set asyncio exception handler on Windows to suppress connection errors
+    if platform.system() == "Windows" and _connection_error_handler:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(_connection_error_handler)
+            logger.debug("Configured asyncio exception handler for Windows")
+        except Exception as e:
+            logger.debug(f"Could not set asyncio exception handler: {e}")
     
     # Log all registered routes again at startup
     logger.info("=" * 60)

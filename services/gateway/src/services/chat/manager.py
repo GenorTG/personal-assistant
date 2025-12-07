@@ -402,19 +402,24 @@ class ChatManager:
             return False
     
     async def get_conversation_name(self, conversation_id: str) -> Optional[str]:
-        """Get the name of a conversation."""
+        """Get the name of a conversation.
+        
+        OPTIMIZED: Loads single conversation instead of all conversations.
+        """
         await self._initialize()
         if conversation_id in self._conversation_names:
             return self._conversation_names[conversation_id]
         
-        # Try to load from database
-        conversations = await self.memory_store.list_conversations()
-        for conv in conversations:
-            if conv["conversation_id"] == conversation_id:
+        # OPTIMIZATION: Load single conversation directly instead of loading all
+        try:
+            conv = await self.memory_store.get_conversation(conversation_id)
+            if conv:
                 name = conv.get("name")
                 if name:
                     self._conversation_names[conversation_id] = name
                     return name
+        except Exception as e:
+            logger.warning(f"Error loading conversation {conversation_id} for name: {e}")
         
         return None
 

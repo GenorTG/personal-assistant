@@ -51,13 +51,27 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       const data = await api.getSettings() as AppSettings;
       setSettings(data);
     } catch (err) {
+      // Handle backend not ready gracefully - don't block UI
       const errorMessage = err instanceof Error ? err.message : 'Failed to load settings';
       setError(errorMessage);
-      console.error('Error loading settings:', err);
+      console.warn('Error loading settings (non-critical):', err);
+      // Don't clear existing settings if backend fails - keep last known state
+      // Use functional update to check current state without dependency
+      setSettings((currentSettings) => {
+        if (!currentSettings) {
+          // Set default empty settings so UI doesn't break
+          return {
+            model_loaded: false,
+            current_model: null,
+            supports_tool_calling: false,
+          };
+        }
+        return currentSettings; // Keep existing settings
+      });
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, []); // Remove settings dependency to prevent infinite loops
 
   useEffect(() => {
     // Initial load

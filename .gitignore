@@ -42,6 +42,7 @@ venv.bak/
 .virtualenv/
 virtualenv/
 .launcher_venv/
+.*_venv/
 
 # Node.js
 node_modules/

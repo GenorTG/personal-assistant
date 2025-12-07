@@ -1,8 +1,9 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import { Thermometer, Layers, Repeat, Sparkles, Dice1, Settings2, RotateCcw, Save, ChevronDown, ChevronUp } from 'lucide-react';
+import { Thermometer, Repeat, Sparkles, Dice1, Settings2, RotateCcw, Save, ChevronDown, ChevronUp } from 'lucide-react';
 import { useSamplerSettings, SamplerSettingsData, DEFAULT_SETTINGS } from '@/contexts/SamplerSettingsContext';
+import { useToast } from '@/contexts/ToastContext';
 
 const PRESETS = {
   default: { ...DEFAULT_SETTINGS },
@@ -62,13 +63,15 @@ export default function SamplerSettings({ onSettingsChange }: Props) {
     onSettingsChange?.(DEFAULT_SETTINGS);
   };
 
+  const { showError } = useToast();
+  
   const handleSave = async () => {
     setSaving(true);
     try {
       await saveToBackend();
     } catch (error) {
       console.error('Error saving settings:', error);
-      alert('Failed to save settings');
+      showError('Failed to save settings');
     } finally {
       setSaving(false);
     }

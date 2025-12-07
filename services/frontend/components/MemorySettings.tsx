@@ -1,10 +1,12 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { Database, Brain, Sliders, Save, Eye, EyeOff } from 'lucide-react';
+import { Database, Brain, Sliders, Save, Eye } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useToast } from '@/contexts/ToastContext';
 
 export default function MemorySettings() {
+  const { showSuccess, showError } = useToast();
   const [similarityThreshold, setSimilarityThreshold] = useState(0.7);
   const [topK, setTopK] = useState(5);
   const [loading, setLoading] = useState(true);
@@ -60,10 +62,10 @@ export default function MemorySettings() {
         vector_memory_apply_to_all: vectorMemoryApplyToAll
       });
       
-      alert('Memory settings saved successfully!');
+      showSuccess('Memory settings saved successfully!');
     } catch (error) {
       console.error('Error saving memory settings:', error);
-      alert('Failed to save memory settings');
+      showError('Failed to save memory settings');
     }
   };
 

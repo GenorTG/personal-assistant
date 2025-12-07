@@ -248,20 +248,34 @@ class FileConversationStore:
         conv_file = self.conversations_dir / f"{conversation_id}.json"
         
         try:
+            file_deleted = False
             # Delete file
             if conv_file.exists():
                 conv_file.unlink()
+                file_deleted = True
+                logger.debug(f"Deleted conversation file: {conv_file}")
+            else:
+                logger.debug(f"Conversation file does not exist: {conv_file}")
             
             # Remove from index
             index = await self._load_index()
+            index_updated = False
             if conversation_id in index.get("conversations", {}):
                 del index["conversations"][conversation_id]
+                index_updated = True
+                logger.debug(f"Removed conversation {conversation_id} from index")
+            
+            # Always save index if it was updated, even if file didn't exist
+            if index_updated:
                 self._index_cache = index
                 await self._save_index()
+                logger.debug(f"Saved updated index after deleting conversation {conversation_id}")
             
-            return True
+            # Return True if either file was deleted or index was updated (or both)
+            # This handles cases where file might be missing but index entry exists
+            return file_deleted or index_updated
         except Exception as e:
-            logger.error(f"Error deleting conversation {conversation_id}: {e}")
+            logger.error(f"Error deleting conversation {conversation_id}: {e}", exc_info=True)
             return False
     
     async def update_conversation_metadata(

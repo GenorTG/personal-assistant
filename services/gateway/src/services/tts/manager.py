@@ -7,7 +7,8 @@ from .backends import (
     ChatterboxBackend,
     KokoroBackend,
     CoquiBackend,
-    Pyttsx3Backend
+    Pyttsx3Backend,
+    PiperBackend
 )
 from .backends.openai_api import OpenAITTSBackend
 from ...config.settings import settings
@@ -29,6 +30,7 @@ class TTSManager:
         self.backends = {
             "chatterbox": ChatterboxBackend(),
             "kokoro": KokoroBackend(),
+            "piper": PiperBackend(),
             "coqui": CoquiBackend(),
             "pyttsx3": Pyttsx3Backend(),
             "openai": OpenAITTSBackend()

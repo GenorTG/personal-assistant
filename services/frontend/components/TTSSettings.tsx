@@ -1,12 +1,14 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Volume2, CheckCircle, XCircle, Loader, Settings } from "lucide-react";
 import { api } from "@/lib/api";
 import { useServiceStatus } from "@/contexts/ServiceStatusContext";
+import { useToast } from "@/contexts/ToastContext";
 
 export default function TTSSettings() {
   const { statuses } = useServiceStatus();
+  const { showError, showSuccess } = useToast();
   const [backends, setBackends] = useState<any[]>([]);
   const [currentBackend, setCurrentBackend] = useState<any>(null);
   const [voices, setVoices] = useState<any[]>([]);
@@ -15,6 +17,8 @@ export default function TTSSettings() {
   const [loading, setLoading] = useState(true);
   const [selectedBackend, setSelectedBackend] = useState<string>("");
   const [updating, setUpdating] = useState(false);
+  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const lastSavedOptionsRef = useRef<string>("");
 
   useEffect(() => {
     loadTTSInfo();
@@ -98,7 +102,7 @@ export default function TTSSettings() {
       console.error("Error switching backend:", error);
       // Revert on failure
       setSelectedBackend(previousBackend);
-      alert("Failed to switch TTS backend. Check console for details.");
+      showError("Failed to switch TTS backend. Check console for details.");
       // Reload to ensure consistent state
       loadTTSInfo();
     } finally {
@@ -106,44 +110,49 @@ export default function TTSSettings() {
     }
   };
 
-  const handleUpdateOptions = async () => {
+  const saveOptions = useCallback(async (optionsToSave: any) => {
     if (!selectedBackend) return;
+    
+    // Convert structured options to flat format for API
+    const flatOptions: any = {};
+    if (optionsToSave.voice) flatOptions.voice = optionsToSave.voice;
+
+    // Handle structured options (with value key)
+    Object.keys(optionsToSave).forEach((key) => {
+      if (key === "voice") return;
+      const value = optionsToSave[key];
+      if (typeof value === "object" && value !== null && "value" in value) {
+        flatOptions[key] = value.value;
+      } else {
+        flatOptions[key] = value;
+      }
+    });
+
+    // Check if options actually changed
+    const optionsStr = JSON.stringify(flatOptions);
+    if (optionsStr === lastSavedOptionsRef.current) {
+      return; // No change, skip save
+    }
+
     try {
       setUpdating(true);
-      // Convert structured options to flat format for API
-      const flatOptions: any = {};
-      if (options.voice) flatOptions.voice = options.voice;
-
-      // Handle structured options (with value key)
-      Object.keys(options).forEach((key) => {
-        if (key === "voice") return;
-        const value = options[key];
-        if (typeof value === "object" && value !== null && "value" in value) {
-          flatOptions[key] = value.value;
-        } else {
-          flatOptions[key] = value;
-        }
-      });
-
-      // Save options without blocking UI - fire and forget for instant feedback
-      api.setTTSBackendOptions(selectedBackend, flatOptions).catch((error) => {
-        console.error("Error updating options:", error);
-        // Only show error if it's critical
-        if (
-          error.message?.includes("not found") ||
-          error.message?.includes("failed")
-        ) {
-          alert("Failed to update TTS options");
-        }
-      });
-
-      // Update local state immediately for instant feedback
-      setUpdating(false);
+      await api.setTTSBackendOptions(selectedBackend, flatOptions);
+      lastSavedOptionsRef.current = optionsStr;
     } catch (error) {
       console.error("Error updating options:", error);
+      // Only show error if it's critical
+      if (
+        error instanceof Error && (
+          error.message?.includes("not found") ||
+          error.message?.includes("failed")
+        )
+      ) {
+        console.error("Failed to update TTS options:", error);
+      }
+    } finally {
       setUpdating(false);
     }
-  };
+  }, [selectedBackend]);
 
   const updateOptionValue = (key: string, value: any) => {
     setOptions((prev: any) => {
@@ -157,9 +166,42 @@ export default function TTSSettings() {
       } else {
         newOptions[key] = value;
       }
+      
+      // Auto-save with debouncing (500ms delay)
+      if (saveTimeoutRef.current) {
+        clearTimeout(saveTimeoutRef.current);
+      }
+      saveTimeoutRef.current = setTimeout(() => {
+        saveOptions(newOptions);
+      }, 500);
+      
       return newOptions;
     });
   };
+  
+  // Save options when backend changes
+  useEffect(() => {
+    if (selectedBackend && Object.keys(options).length > 0) {
+      // Reset last saved when backend changes
+      lastSavedOptionsRef.current = "";
+      // Auto-save current options for new backend
+      if (saveTimeoutRef.current) {
+        clearTimeout(saveTimeoutRef.current);
+      }
+      saveTimeoutRef.current = setTimeout(() => {
+        saveOptions(options);
+      }, 500);
+    }
+  }, [selectedBackend, saveOptions]);
+  
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (saveTimeoutRef.current) {
+        clearTimeout(saveTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const getOptionValue = (key: string): any => {
     const opt = options[key];
@@ -323,9 +365,31 @@ export default function TTSSettings() {
         {currentBackend && currentBackend.status === "ready" && (
           <>
             {/* Voice Selection */}
-            {voices.length > 0 && (
-              <div>
-                <label className="block text-sm font-medium mb-1">Voice</label>
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-sm font-medium">Voice</label>
+                <button
+                  onClick={async () => {
+                    try {
+                      setUpdating(true);
+                      await api.refreshTTSVoices(selectedBackend);
+                      await loadBackendDetails(selectedBackend);
+                      showSuccess("Voices refreshed successfully!");
+                    } catch (error: any) {
+                      console.error("Error refreshing voices:", error);
+                      showError(`Failed to refresh voices: ${error.message}`);
+                    } finally {
+                      setUpdating(false);
+                    }
+                  }}
+                  disabled={updating}
+                  className="text-xs px-2 py-1 bg-blue-500 hover:bg-blue-600 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Refresh voices list (hot-reload)"
+                >
+                  {updating ? "Refreshing..." : "🔄 Refresh"}
+                </button>
+              </div>
+              {voices.length > 0 ? (
                 <select
                   value={getOptionValue("voice") || ""}
                   onChange={(e) => updateOptionValue("voice", e.target.value)}
@@ -338,8 +402,12 @@ export default function TTSSettings() {
                     </option>
                   ))}
                 </select>
-              </div>
-            )}
+              ) : (
+                <div className="text-sm text-gray-500 py-2">
+                  No voices available. Click "Refresh" to reload voices.
+                </div>
+              )}
+            </div>
 
             {/* Backend-specific Options */}
             {currentBackend.name === "chatterbox" && (
@@ -366,12 +434,12 @@ export default function TTSSettings() {
                           setUpdating(true);
                           const name = file.name.replace(/\.[^/.]+$/, "");
                           await api.uploadVoice(file, name);
-                          alert(`Voice '${name}' uploaded successfully!`);
+                          showSuccess(`Voice '${name}' uploaded successfully!`);
                           // Reload voices
                           await loadBackendDetails("chatterbox");
                         } catch (error: any) {
                           console.error("Error uploading voice:", error);
-                          alert(`Upload failed: ${error.message}`);
+                          showError(`Upload failed: ${error.message}`);
                         } finally {
                           setUpdating(false);
                           // Reset input
@@ -503,6 +571,33 @@ export default function TTSSettings() {
                       Random seed for reproducible generation (leave empty for
                       random)
                     </p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {currentBackend.name === "piper" && (
+              <div className="space-y-3 p-3 bg-gray-50 rounded-lg">
+                <div className="flex items-center gap-2 mb-2">
+                  <Settings size={16} />
+                  <span className="text-sm font-medium">Piper Options</span>
+                </div>
+                {options.speed && (
+                  <div>
+                    <label className="block text-sm font-medium mb-1">
+                      Speed: {getOptionValue("speed")?.toFixed(1) || "1.0"}
+                    </label>
+                    <input
+                      type="range"
+                      min={options.speed?.min || 0.5}
+                      max={options.speed?.max || 2.0}
+                      step={options.speed?.step || 0.1}
+                      value={getOptionValue("speed") || 1.0}
+                      onChange={(e) =>
+                        updateOptionValue("speed", parseFloat(e.target.value))
+                      }
+                      className="w-full"
+                    />
                   </div>
                 )}
               </div>
@@ -693,13 +788,11 @@ export default function TTSSettings() {
               </div>
             )}
 
-            <button
-              onClick={handleUpdateOptions}
-              disabled={updating}
-              className="btn-primary w-full mt-4"
-            >
-              {updating ? "Updating..." : "Update TTS Options"}
-            </button>
+            {updating && (
+              <div className="text-sm text-gray-500 mt-4 text-center">
+                Saving...
+              </div>
+            )}
           </>
         )}
       </div>

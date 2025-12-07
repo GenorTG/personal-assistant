@@ -230,7 +230,10 @@ class LLMManager:
         cache_type_k: Optional[str] = None,
         cache_type_v: Optional[str] = None,
         # MoE settings
-        n_cpu_moe: Optional[int] = None,
+        # Note: n_cpu_moe is not a valid parameter for llama-cpp-python server
+        # It was incorrectly documented as "CPU threads for MoE experts"
+        # The correct parameter is n_experts_to_use (number of experts to activate per token)
+        n_experts_to_use: Optional[int] = None,
         # Deprecated parameters (ignored)
         use_flash_attention: Optional[bool] = None,
         offload_kqv: Optional[bool] = None,
@@ -254,7 +257,7 @@ class LLMManager:
             rope_scaling_type: RoPE scaling type
             yarn_*: YaRN context extension parameters
             cache_type_k/v: KV cache data types
-            n_cpu_moe: Number of CPU threads for MoE experts (for Mixture of Experts models)
+            # n_cpu_moe removed - not a valid parameter for llama-cpp-python server
             
         Returns:
             True if model loaded successfully
@@ -267,9 +270,10 @@ class LLMManager:
         if offload_kqv is not None:
             logger.warning("offload_kqv is not supported by llama-cpp-python, ignoring")
         
-        # Extract n_cpu_moe from kwargs if provided (for API compatibility)
+        # n_cpu_moe is not a valid parameter - ignore if provided for backwards compatibility
         if 'n_cpu_moe' in kwargs:
-            n_cpu_moe = kwargs.pop('n_cpu_moe')
+            logger.warning("n_cpu_moe is not a valid parameter for llama-cpp-python server, ignoring")
+            kwargs.pop('n_cpu_moe')
             
         if kwargs:
             logger.warning("Unknown parameters ignored: %s", list(kwargs.keys()))
@@ -283,25 +287,12 @@ class LLMManager:
             info_extractor = ModelInfoExtractor(model_file.parent)
             model_info = info_extractor.extract_info(model_file.name, use_cache=True)
             
-            # Auto-detect MoE and suggest optimal n_cpu_moe if not provided
+            # Auto-detect MoE model info
+            # Note: n_cpu_moe is not a valid parameter for llama-cpp-python server
+            # The correct parameter is n_experts_to_use (number of experts per token)
             moe_info = model_info.get("moe", {})
             is_moe = moe_info.get("is_moe", False)
             num_experts = moe_info.get("num_experts")
-            
-            # Auto-configure MoE settings if model is MoE and n_cpu_moe not provided
-            if is_moe and n_cpu_moe is None:
-                # Default to 4 threads per expert, or use available CPU threads
-                import os
-                available_threads = os.cpu_count() or 4
-                if num_experts:
-                    # Use min of (experts * 2) or available threads
-                    suggested_moe_threads = min(num_experts * 2, available_threads)
-                    n_cpu_moe = max(2, suggested_moe_threads)  # At least 2 threads
-                    logger.info(f"Auto-detected MoE model ({num_experts} experts), setting n_cpu_moe={n_cpu_moe}")
-                else:
-                    # Fallback: use half of available threads
-                    n_cpu_moe = max(2, available_threads // 2)
-                    logger.info(f"Auto-detected MoE model, setting n_cpu_moe={n_cpu_moe}")
             
             # Use provided options or defaults
             effective_n_ctx = n_ctx or settings.llm_context_size
@@ -321,8 +312,8 @@ class LLMManager:
             if is_moe:
                 logger.info("MoE Model: %d experts, %d experts per token", 
                            num_experts or 0, moe_info.get("experts_per_token", 2))
-                if n_cpu_moe:
-                    logger.info("MoE CPU Threads: %d", n_cpu_moe)
+                if n_experts_to_use:
+                    logger.info("MoE: Using %d experts per token", n_experts_to_use)
             logger.info("Context: %d | Batch: %d | Threads: %d", 
                        effective_n_ctx, effective_n_batch, effective_n_threads)
             logger.info("GPU Layers: %d | Flash Attention: %s", 
@@ -355,7 +346,8 @@ class LLMManager:
                 yarn_orig_ctx=yarn_orig_ctx,
                 cache_type_k=cache_type_k,
                 cache_type_v=cache_type_v,
-                n_cpu_moe=n_cpu_moe,
+                # n_cpu_moe removed - not a valid parameter
+                n_experts_to_use=n_experts_to_use,
             )
             
             if success:

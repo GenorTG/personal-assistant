@@ -155,6 +155,52 @@ class MirostatBlock:
 
 
 @dataclass
+class DRYRepetitionPenaltyBlock:
+    """DRY (Dynamic Repetition Penalty) sampler block.
+    
+    DRY repetition penalty provides sequence-based repetition control
+    that dynamically adjusts penalties based on sequence patterns.
+    """
+    dry_multiplier: float = 0.0
+    """DRY multiplier for repetition penalty (0.0 = disabled)."""
+    
+    dry_base: float = 1.0
+    """DRY base value for repetition penalty calculation."""
+    
+    dry_allowed_length: int = 0
+    """Allowed sequence length before applying DRY penalty (0 = disabled)."""
+    
+    def to_params(self, include_defaults: bool = False) -> Dict[str, Any]:
+        """Convert to API parameters.
+        
+        Args:
+            include_defaults: If True, include all parameters even if default
+            
+        Returns:
+            Dictionary of parameters for API
+        """
+        params = {}
+        
+        if include_defaults or self.dry_multiplier != 0.0:
+            params["dry_multiplier"] = self.dry_multiplier
+        if include_defaults or self.dry_base != 1.0:
+            params["dry_base"] = self.dry_base
+        if include_defaults or self.dry_allowed_length != 0:
+            params["dry_allowed_length"] = self.dry_allowed_length
+            
+        return params
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DRYRepetitionPenaltyBlock":
+        """Create from dictionary."""
+        return cls(
+            dry_multiplier=data.get("dry_multiplier", 0.0),
+            dry_base=data.get("dry_base", 1.0),
+            dry_allowed_length=data.get("dry_allowed_length", 0)
+        )
+
+
+@dataclass
 class BasicSamplingBlock:
     """Basic sampling parameters block.
     

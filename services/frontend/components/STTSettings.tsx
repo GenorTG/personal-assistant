@@ -1,30 +1,18 @@
 'use client';
 
 import { useState } from 'react';
-import { Mic, CheckCircle, XCircle, Loader, RefreshCw, Download } from 'lucide-react';
+import { Mic, CheckCircle, XCircle, RefreshCw } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useServiceStatus } from '@/contexts/ServiceStatusContext';
+import { useToast } from '@/contexts/ToastContext';
 
 export default function STTSettings() {
   const { statuses, refresh } = useServiceStatus();
-  const [initializing, setInitializing] = useState(false);
+  const { showSuccess, showError } = useToast();
   const [selectedLanguage, setSelectedLanguage] = useState<string>('en');
 
   const sttStatus = statuses?.stt;
 
-  const handleInitialize = async () => {
-    try {
-      setInitializing(true);
-      const result = await api.initializeSTT() as any;
-      alert(`STT initialized successfully! Provider: ${result.provider}`);
-      await refresh();
-    } catch (error: any) {
-      console.error('Error initializing STT:', error);
-      alert(`Failed to initialize STT: ${error.message || 'Unknown error'}`);
-    } finally {
-      setInitializing(false);
-    }
-  };
 
   const getStatusIcon = () => {
     if (sttStatus?.status === 'offline') {

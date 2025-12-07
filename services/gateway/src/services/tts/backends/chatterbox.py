@@ -134,10 +134,84 @@ class ChatterboxBackend(TTSBackend):
             # Remove any problematic characters that might cause encoding issues
             text_clean = text.encode('utf-8', errors='replace').decode('utf-8')
             
+            # CRITICAL FIX: The external Chatterbox service has emoji print statements that crash on Windows
+            # We MUST query the actual voice library API to get real voice names, and ONLY send those
+            # If voice doesn't exist, send None (not "default" or "alloy") to avoid triggering emoji prints
+            
+            # Step 1: Query the actual voice library to get real voice names
+            valid_voice_names = set()
+            try:
+                if not self._http_client:
+                    await self.initialize()
+                if self._http_client:
+                    # Query the actual /voices endpoint to get real voice names from the library
+                    response = await self._http_client.get("/voices", timeout=10.0)
+                    if response.status_code == 200:
+                        data = response.json()
+                        voices_list = data.get("voices", [])
+                        # Extract actual voice names/IDs from the library
+                        for voice_item in voices_list:
+                            if isinstance(voice_item, str):
+                                valid_voice_names.add(voice_item.lower())
+                            elif isinstance(voice_item, dict):
+                                # Handle different response formats
+                                if "name" in voice_item:
+                                    valid_voice_names.add(voice_item["name"].lower())
+                                if "id" in voice_item:
+                                    valid_voice_names.add(voice_item["id"].lower())
+                                if "voice_name" in voice_item:
+                                    valid_voice_names.add(voice_item["voice_name"].lower())
+            except Exception as e:
+                logger.warning(f"Could not query voice library: {e}, will omit voice parameter")
+                valid_voice_names = set()
+            
+            # Step 2: Determine what voice to use
+            requested_voice = voice or self._voice
+            voice_to_send = None  # Default: send None to use system default
+            
+            if requested_voice:
+                requested_voice_lower = requested_voice.lower().strip()
+                # Only use the voice if it exists in the actual voice library
+                if requested_voice_lower in valid_voice_names:
+                    # Find the exact case-matched voice name
+                    try:
+                        if self._http_client:
+                            response = await self._http_client.get("/voices", timeout=10.0)
+                            if response.status_code == 200:
+                                data = response.json()
+                                voices_list = data.get("voices", [])
+                                for voice_item in voices_list:
+                                    if isinstance(voice_item, str):
+                                        if voice_item.lower() == requested_voice_lower:
+                                            voice_to_send = voice_item
+                                            break
+                                    elif isinstance(voice_item, dict):
+                                        for key in ["name", "id", "voice_name"]:
+                                            if key in voice_item and voice_item[key].lower() == requested_voice_lower:
+                                                voice_to_send = voice_item[key]
+                                                break
+                                        if voice_to_send:
+                                            break
+                    except Exception:
+                        pass
+                    
+                    if not voice_to_send:
+                        # Use the requested voice as-is if we found it in the set
+                        voice_to_send = requested_voice
+                else:
+                    # Voice not in library - log and use None (system default)
+                    logger.debug(f"Voice '{requested_voice}' not found in voice library, using system default")
+            
+            # Step 3: Build payload
+            # CRITICAL: We must send voice=None (null in JSON) to avoid the default "alloy"
+            # which triggers the emoji print statement. Sending null makes voice_name=None
+            # in resolve_voice_path_and_language, which returns default without any prints.
             payload = {
                 "input": text_clean,
-                "voice": voice or self._voice or "default"
+                "voice": voice_to_send if voice_to_send else None  # Explicitly null if not found
             }
+            
+            logger.info(f"Chatterbox TTS request: voice={repr(voice_to_send) if voice_to_send else 'None (system default)'}, text_length={len(text_clean)}")
             
             # Add Chatterbox-specific options (only if not default values)
             if "exaggeration" in self._options and self._options["exaggeration"] != 0.5:
@@ -199,26 +273,43 @@ class ChatterboxBackend(TTSBackend):
                 if not self._http_client:
                     return []
             
-            # Use /voices endpoint (not /v1/voices - that's for speech generation)
-            response = await self._http_client.get("/voices", timeout=10.0)
-            if response.status_code == 200:
-                data = response.json()
-                voices_list = data.get("voices", [])
-                voices = []
-                for voice in voices_list:
-                    # Map Chatterbox voice format to our format
-                    voice_id = voice.get("name", voice.get("id", "unknown"))
-                    voices.append({
-                        "id": voice_id,
-                        "name": voice.get("name", voice_id),
-                        "gender": voice.get("gender", "unknown"),
-                        "language": voice.get("language", "en")
-                    })
-                logger.info(f"Fetched {len(voices)} voices from Chatterbox API")
-                return voices
+            voices = []
+            
+            # ALWAYS include "default" voice - it's the system default voice (voice-sample.mp3)
+            # This is always available even if no voices are uploaded
+            voices.append({
+                "id": "default",
+                "name": "Default Voice",
+                "gender": "neutral",
+                "language": "en"
+            })
+            
+            # Also fetch uploaded voices from the voice library
+            try:
+                response = await self._http_client.get("/voices", timeout=10.0)
+                if response.status_code == 200:
+                    data = response.json()
+                    voices_list = data.get("voices", [])
+                    for voice in voices_list:
+                        # Map Chatterbox voice format to our format
+                        voice_id = voice.get("name", voice.get("id", "unknown"))
+                        # Skip if it's already "default" (shouldn't happen, but be safe)
+                        if voice_id != "default":
+                            voices.append({
+                                "id": voice_id,
+                                "name": voice.get("name", voice_id),
+                                "gender": voice.get("gender", "unknown"),
+                                "language": voice.get("language", "en")
+                            })
+            except Exception as e:
+                logger.debug(f"Failed to fetch uploaded voices: {e}, but default voice is always available")
+            
+            logger.info(f"Fetched {len(voices)} voices from Chatterbox API (including default)")
+            return voices
         except Exception as e:
             logger.warning(f"Failed to fetch voices from API: {e}")
-        return []
+            # Even if API fails, return default voice
+            return [{"id": "default", "name": "Default Voice", "gender": "neutral", "language": "en"}]
     
     def get_options(self) -> Dict[str, Any]:
         """Get Chatterbox TTS options."""

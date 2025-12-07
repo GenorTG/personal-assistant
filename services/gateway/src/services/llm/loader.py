@@ -134,8 +134,8 @@ class LLMLoader:
             logger.info("GPU detected - defaulting to all layers on GPU (-1). Set llm_n_gpu_layers=0 to force CPU mode.")
             return -1  # -1 means all layers on GPU
         else:
-            logger.warning("✗ CUDA runtime not available: %s", cuda_message)
-            logger.info("Using CPU mode. Set llm_n_gpu_layers > 0 to use GPU if available.")
+            logger.info("CUDA runtime not available: %s. Using CPU mode.", cuda_message)
+            logger.info("Set llm_n_gpu_layers > 0 to use GPU if available.")
             return 0
     
     async def load_model(

@@ -1,8 +1,22 @@
-'use client';
+"use client";
 
-import { useState, useEffect, useCallback } from 'react';
-import { X, Save, Link, User, FileText, Tag, Loader2, Search, ArrowRight, Check, ExternalLink, ChevronDown } from 'lucide-react';
-import { api, API_BASE } from '@/lib/api';
+import { useState, useEffect, useCallback } from "react";
+import {
+  X,
+  Save,
+  Link,
+  User,
+  FileText,
+  Tag,
+  Loader2,
+  Search,
+  ArrowRight,
+  Check,
+  ExternalLink,
+  ChevronDown,
+} from "lucide-react";
+import { api, API_BASE } from "@/lib/api";
+import { formatBytes } from "@/lib/utils";
 
 interface ModelMetadataEditorProps {
   model: {
@@ -30,26 +44,38 @@ interface HFSearchResult {
 }
 
 interface HFFile {
-  rfilename: string;
-  size: number;
+  rfilename?: string;
+  filename?: string;
+  size?: number;
+  size_str?: string;
+  size_info?: string;
 }
 
-type EditorMode = 'search' | 'manual';
+type EditorMode = "search" | "manual";
 
-export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMetadataEditorProps) {
-  const [mode, setMode] = useState<EditorMode>('search');
-  
+export default function ModelMetadataEditor({
+  model,
+  onClose,
+  onSave,
+}: ModelMetadataEditorProps) {
+  const [mode, setMode] = useState<EditorMode>("search");
+
   // Manual mode fields
-  const [name, setName] = useState(model.name || '');
-  const [author, setAuthor] = useState(model.author || '');
-  const [description, setDescription] = useState(model.description || '');
-  const [repoId, setRepoId] = useState(model.repo_id || '');
-  const [huggingfaceUrl, setHuggingfaceUrl] = useState(model.huggingface_url || '');
-  const [tags, setTags] = useState(model.tags?.join(', ') || '');
-  
+  const [name, setName] = useState(model.name || "");
+  const [author, setAuthor] = useState(model.author || "");
+  const [description, setDescription] = useState(model.description || "");
+  const [repoId, setRepoId] = useState(model.repo_id || "");
+  const [huggingfaceUrl, setHuggingfaceUrl] = useState(
+    model.huggingface_url || ""
+  );
+  const [tags, setTags] = useState(model.tags?.join(", ") || "");
+
   // Search mode fields
   const [searchQuery, setSearchQuery] = useState(
-    model.name?.replace(/[-_]/g, ' ').replace(/\.(gguf|bin)$/i, '').slice(0, 50) || ''
+    model.name
+      ?.replace(/[-_]/g, " ")
+      .replace(/\.(gguf|bin)$/i, "")
+      .slice(0, 50) || ""
   );
   const [searchResults, setSearchResults] = useState<HFSearchResult[]>([]);
   const [selectedRepo, setSelectedRepo] = useState<HFSearchResult | null>(null);
@@ -57,7 +83,7 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
   const [loadingFiles, setLoadingFiles] = useState(false);
-  
+
   // Common state
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -65,12 +91,16 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
       // Only close on Escape if not typing in an input field
-      if (e.key === 'Escape' && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
+      if (
+        e.key === "Escape" &&
+        document.activeElement?.tagName !== "INPUT" &&
+        document.activeElement?.tagName !== "TEXTAREA"
+      ) {
         onClose();
       }
     };
-    window.addEventListener('keydown', handleEscape);
-    return () => window.removeEventListener('keydown', handleEscape);
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
   }, [onClose]);
 
   useEffect(() => {
@@ -81,49 +111,61 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
 
   const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) {
-      setError('Please enter a search query');
+      setError("Please enter a search query");
       return;
     }
-    
+
     setSearching(true);
     setError(null);
     setSearchResults([]);
     setSelectedRepo(null);
     setRepoFiles([]);
     setSelectedFile(null);
-    
+
     try {
       // Search for models - append "gguf" if not already in query
       const query = searchQuery.trim();
-      const searchQueryWithGGUF = query.toLowerCase().includes('gguf') 
-        ? query 
+      const searchQueryWithGGUF = query.toLowerCase().includes("gguf")
+        ? query
         : `${query} gguf`;
-      
-      console.log('Searching with query:', searchQueryWithGGUF);
+
+      console.log("Searching with query:", searchQueryWithGGUF);
       const response: any = await api.searchModels(searchQueryWithGGUF, 20);
-      console.log('Search response:', response);
-      
+      console.log("Search response:", response);
+
       // Handle different response formats - backend returns array directly
       let results: HFSearchResult[] = [];
       if (Array.isArray(response)) {
         results = response;
-      } else if (response && typeof response === 'object' && 'results' in response && Array.isArray(response.results)) {
+      } else if (
+        response &&
+        typeof response === "object" &&
+        "results" in response &&
+        Array.isArray(response.results)
+      ) {
         results = response.results;
-      } else if (response && typeof response === 'object' && 'data' in response && Array.isArray(response.data)) {
+      } else if (
+        response &&
+        typeof response === "object" &&
+        "data" in response &&
+        Array.isArray(response.data)
+      ) {
         results = response.data;
       }
-      
-      console.log('Parsed results:', results);
+
+      console.log("Parsed results:", results);
       setSearchResults(results);
 
       if (results.length === 0) {
-        setError(`No repositories found for "${query}". Try different search terms or check your spelling.`);
+        setError(
+          `No repositories found for "${query}". Try different search terms or check your spelling.`
+        );
       } else {
         setError(null);
       }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      console.error('Search error:', err);
+      const message = err instanceof Error ? err.message : "Unknown error";
+      console.error("Search error:", err);
       setError(`Search failed: ${message}. Please try again.`);
       setSearchResults([]);
     } finally {
@@ -137,67 +179,83 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
     setRepoFiles([]);
     setSelectedFile(null);
     setError(null);
-    
+
     try {
       const repoId = repo.id || repo.model_id;
       if (!repoId) {
-        throw new Error('Repository ID is missing');
+        throw new Error("Repository ID is missing");
       }
-      
-      const response = await fetch(`${API_BASE}/api/models/${encodeURIComponent(repoId)}/files`);
+
+      const response = await fetch(
+        `${API_BASE}/api/models/${encodeURIComponent(repoId)}/files`
+      );
       if (!response.ok) {
         throw new Error(`Failed to fetch files: ${response.statusText}`);
       }
       const data = await response.json();
-      
-      const ggufFiles = (data.files || []).filter((f: HFFile) => 
-        f.rfilename.toLowerCase().endsWith('.gguf')
-      );
-      
+
+      // Backend returns files with 'filename' field, but we need to normalize to 'rfilename' for compatibility
+      const allFiles = data.files || [];
+      const ggufFiles = allFiles
+        .map((f: any) => {
+          // Normalize: use 'filename' if 'rfilename' is not present
+          const filename = f.rfilename || f.filename || "";
+          return {
+            ...f,
+            rfilename: filename, // Always set rfilename for consistency
+            filename: filename, // Keep filename too
+            size: f.size || 0, // Default size to 0 if not provided
+          };
+        })
+        .filter(
+          (f: HFFile) =>
+            f.rfilename &&
+            typeof f.rfilename === "string" &&
+            f.rfilename.toLowerCase().endsWith(".gguf")
+        );
+
       setRepoFiles(ggufFiles);
-      
-      const currentName = model.model_id.split('/').pop()?.toLowerCase() || '';
-      const match = ggufFiles.find((f: HFFile) => 
-        f.rfilename.toLowerCase() === currentName ||
-        f.rfilename.toLowerCase().includes(currentName.replace('.gguf', ''))
-      );
-      
+
+      const currentName =
+        model.model_id.split(/[/\\]/).pop()?.toLowerCase() || "";
+      const match = ggufFiles.find((f: HFFile) => {
+        const fname = (f.rfilename || f.filename || "").toLowerCase();
+        return (
+          fname === currentName ||
+          fname.includes(currentName.replace(".gguf", "")) ||
+          currentName.includes(fname.replace(".gguf", ""))
+        );
+      });
+
       if (match) {
-        setSelectedFile(match.rfilename);
+        setSelectedFile(match.rfilename || match.filename || "");
       } else if (ggufFiles.length === 1) {
-        setSelectedFile(ggufFiles[0].rfilename);
+        setSelectedFile(ggufFiles[0].rfilename || ggufFiles[0].filename || "");
       }
-      
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      console.error('Error fetching files:', err);
+      const message = err instanceof Error ? err.message : "Unknown error";
+      console.error("Error fetching files:", err);
       setError(`Failed to load files from repository: ${message}`);
     } finally {
       setLoadingFiles(false);
     }
   };
 
-  const formatSize = (bytes: number) => {
-    if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
-    if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(2)} MB`;
-    return `${bytes} B`;
-  };
-
   const handleLinkAndOrganize = async () => {
     if (!selectedRepo) {
-      setError('Please select a repository');
+      setError("Please select a repository");
       return;
     }
-    
+
     const repoId = selectedRepo.id || selectedRepo.model_id;
     if (!repoId) {
-      setError('Repository ID is missing');
+      setError("Repository ID is missing");
       return;
     }
-    
+
     setSaving(true);
     setError(null);
-    
+
     try {
       await api.linkAndOrganizeModel(
         model.model_id,
@@ -207,9 +265,9 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
       onSave();
       onClose();
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      console.error('Error linking model:', err);
-      setError(message || 'Failed to link model');
+      const message = err instanceof Error ? err.message : "Unknown error";
+      console.error("Error linking model:", err);
+      setError(message || "Failed to link model");
     } finally {
       setSaving(false);
     }
@@ -227,47 +285,76 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
         description: description.trim() || undefined,
         repo_id: repoId.trim() || undefined,
         huggingface_url: huggingfaceUrl.trim() || undefined,
-        tags: tags.trim() ? tags.split(',').map(t => t.trim()).filter(Boolean) : undefined,
+        tags: tags.trim()
+          ? tags
+              .split(",")
+              .map((t) => t.trim())
+              .filter(Boolean)
+          : undefined,
       };
 
       await api.setModelMetadata(model.model_id, metadata);
       onSave();
       onClose();
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      console.error('Error saving metadata:', err);
-      setError(message || 'Failed to save metadata');
+      const message = err instanceof Error ? err.message : "Unknown error";
+      console.error("Error saving metadata:", err);
+      setError(message || "Failed to save metadata");
     } finally {
       setSaving(false);
     }
   };
 
-  const handleBackdropClick = (e: React.MouseEvent) => {
-    // Only close if clicking directly on the backdrop (not on modal content)
+  // Track mousedown to prevent closing when dragging text selection outside modal
+  const [mouseDownInside, setMouseDownInside] = useState(false);
+
+  const handleBackdropMouseDown = (e: React.MouseEvent) => {
+    // Track if mousedown was on backdrop (outside modal)
     if (e.target === e.currentTarget) {
-      onClose();
+      setMouseDownInside(false);
     }
   };
 
+  const handleBackdropMouseUp = (e: React.MouseEvent) => {
+    // Only close if both mousedown and mouseup were on backdrop
+    if (e.target === e.currentTarget && !mouseDownInside) {
+      onClose();
+    }
+    setMouseDownInside(false);
+  };
+
+  const handleContentMouseDown = (e: React.MouseEvent) => {
+    // Track that mousedown was inside modal
+    setMouseDownInside(true);
+    e.stopPropagation();
+  };
+
   return (
-    <div 
+    <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
-      onClick={handleBackdropClick}
+      onMouseDown={handleBackdropMouseDown}
+      onMouseUp={handleBackdropMouseUp}
     >
-      <div 
+      <div
         className="modal-content bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] flex flex-col"
+        onMouseDown={handleContentMouseDown}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="p-6 border-b border-gray-200 flex-shrink-0">
           <div className="flex items-center justify-between mb-4">
             <div>
-              <h2 className="text-xl font-bold text-gray-900">Edit Model Metadata</h2>
-              <p className="text-sm text-gray-500 mt-1 truncate max-w-md" title={model.model_id}>
+              <h2 className="text-xl font-bold text-gray-900">
+                Edit Model Metadata
+              </h2>
+              <p
+                className="text-sm text-gray-500 mt-1 truncate max-w-md"
+                title={model.model_id}
+              >
                 {model.model_id}
               </p>
             </div>
-            <button 
+            <button
               onClick={onClose}
               className="p-2 rounded-lg hover:bg-gray-100 transition-colors"
               title="Close (Esc)"
@@ -275,26 +362,26 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
               <X size={24} className="text-gray-500" />
             </button>
           </div>
-          
+
           {/* Mode Tabs */}
           <div className="flex gap-2">
             <button
-              onClick={() => setMode('search')}
+              onClick={() => setMode("search")}
               className={`flex-1 py-2 px-4 rounded-lg font-medium transition-colors ${
-                mode === 'search'
-                  ? 'bg-primary-100 text-primary-700 border-2 border-primary-300'
-                  : 'bg-gray-100 text-gray-600 border-2 border-transparent hover:bg-gray-200'
+                mode === "search"
+                  ? "bg-primary-100 text-primary-700 border-2 border-primary-300"
+                  : "bg-gray-100 text-gray-600 border-2 border-transparent hover:bg-gray-200"
               }`}
             >
               <Search size={16} className="inline mr-2" />
               Find on HuggingFace
             </button>
             <button
-              onClick={() => setMode('manual')}
+              onClick={() => setMode("manual")}
               className={`flex-1 py-2 px-4 rounded-lg font-medium transition-colors ${
-                mode === 'manual'
-                  ? 'bg-primary-100 text-primary-700 border-2 border-primary-300'
-                  : 'bg-gray-100 text-gray-600 border-2 border-transparent hover:bg-gray-200'
+                mode === "manual"
+                  ? "bg-primary-100 text-primary-700 border-2 border-primary-300"
+                  : "bg-gray-100 text-gray-600 border-2 border-transparent hover:bg-gray-200"
               }`}
             >
               <FileText size={16} className="inline mr-2" />
@@ -305,7 +392,7 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-6">
-          {mode === 'search' ? (
+          {mode === "search" ? (
             <div className="space-y-4">
               {/* Search Box */}
               <div>
@@ -317,7 +404,7 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
                     type="text"
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
                     placeholder="e.g., mistral 7b, llama 3, noromaid..."
                     className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
                   />
@@ -326,7 +413,11 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
                     disabled={searching || !searchQuery.trim()}
                     className="px-4 py-2.5 bg-primary-600 text-white rounded-lg font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
                   >
-                    {searching ? <Loader2 size={18} className="animate-spin" /> : <Search size={18} />}
+                    {searching ? (
+                      <Loader2 size={18} className="animate-spin" />
+                    ) : (
+                      <Search size={18} />
+                    )}
                     Search
                   </button>
                 </div>
@@ -340,26 +431,37 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
                   </label>
                   <div className="border border-gray-200 rounded-lg max-h-48 overflow-y-auto">
                     {searchResults.map((repo) => {
-                      const repoId = repo.id || repo.model_id || '';
-                      const repoName = repo.name || repoId.split('/').pop() || repoId;
+                      const repoId = repo.id || repo.model_id || "";
                       return (
                         <button
                           key={repoId}
                           onClick={() => handleSelectRepo(repo)}
                           className={`w-full text-left px-4 py-3 border-b border-gray-100 last:border-b-0 hover:bg-gray-50 transition-colors ${
-                            (selectedRepo?.id || selectedRepo?.model_id) === repoId ? 'bg-primary-50 border-l-4 border-l-primary-500' : ''
+                            (selectedRepo?.id || selectedRepo?.model_id) ===
+                            repoId
+                              ? "bg-primary-50 border-l-4 border-l-primary-500"
+                              : ""
                           }`}
                         >
                           <div className="flex items-center justify-between">
                             <div className="flex-1 min-w-0">
-                              <div className="font-medium text-gray-900 truncate">{repoId}</div>
+                              <div className="font-medium text-gray-900 truncate">
+                                {repoId}
+                              </div>
                               <div className="text-xs text-gray-500 flex gap-3 mt-1">
-                                <span>Downloads: {repo.downloads?.toLocaleString() || 0}</span>
+                                <span>
+                                  Downloads:{" "}
+                                  {repo.downloads?.toLocaleString() || 0}
+                                </span>
                                 <span>Likes: {repo.likes || 0}</span>
                               </div>
                             </div>
-                            {(selectedRepo?.id || selectedRepo?.model_id) === repoId && (
-                              <Check size={20} className="text-primary-600 flex-shrink-0" />
+                            {(selectedRepo?.id || selectedRepo?.model_id) ===
+                              repoId && (
+                              <Check
+                                size={20}
+                                className="text-primary-600 flex-shrink-0"
+                              />
                             )}
                           </div>
                         </button>
@@ -373,7 +475,8 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
               {selectedRepo && (
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Select Quantization File (optional - keeps original if not selected)
+                    Select Quantization File (optional - keeps original if not
+                    selected)
                   </label>
                   {loadingFiles ? (
                     <div className="flex items-center justify-center py-6 text-gray-500">
@@ -383,45 +486,81 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
                   ) : repoFiles.length > 0 ? (
                     <div className="relative">
                       <select
-                        value={selectedFile || ''}
-                        onChange={(e) => setSelectedFile(e.target.value || null)}
+                        value={selectedFile || ""}
+                        onChange={(e) =>
+                          setSelectedFile(e.target.value || null)
+                        }
                         className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 appearance-none bg-white transition-all"
                       >
                         <option value="">Keep original filename</option>
-                        {repoFiles.map((file) => (
-                          <option key={file.rfilename} value={file.rfilename}>
-                            {file.rfilename} ({formatSize(file.size)})
-                          </option>
-                        ))}
+                        {repoFiles.map((file) => {
+                          const filename =
+                            file.rfilename || file.filename || "";
+                          const size = file.size || 0;
+                          const sizeStr =
+                            file.size_str ||
+                            (size > 0 ? formatBytes(size) : "");
+                          const quantInfo = file.size_info
+                            ? ` - ${file.size_info}`
+                            : "";
+                          return (
+                            <option key={filename} value={filename}>
+                              {filename}
+                              {sizeStr
+                                ? ` (${sizeStr}${quantInfo})`
+                                : quantInfo
+                                ? ` (${quantInfo.trim()})`
+                                : ""}
+                            </option>
+                          );
+                        })}
                       </select>
-                      <ChevronDown size={18} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
+                      <ChevronDown
+                        size={18}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none"
+                      />
                     </div>
                   ) : (
-                    <p className="text-sm text-gray-500 py-2">No GGUF files found in this repository</p>
+                    <p className="text-sm text-gray-500 py-2">
+                      No GGUF files found in this repository
+                    </p>
                   )}
                 </div>
               )}
 
               {/* Selected Summary */}
-              {selectedRepo && (() => {
-                const repoId = selectedRepo.id || selectedRepo.model_id || '';
-                const author = selectedRepo.author || repoId.split('/')[0] || 'Unknown';
-                const repoName = repoId.split('/')[1] || repoId.split('/').pop() || '';
-                return (
-                  <div className="bg-primary-50 border border-primary-200 rounded-lg p-4">
-                    <h4 className="font-medium text-primary-900 mb-2">Ready to Link</h4>
-                    <div className="text-sm text-primary-700 space-y-1">
-                      <p><strong>Repository:</strong> {repoId}</p>
-                      <p><strong>Your file:</strong> {model.model_id}</p>
-                      {selectedFile && <p><strong>Rename to:</strong> {selectedFile}</p>}
-                      <p className="text-primary-600 mt-2 flex items-center gap-1">
-                        <ArrowRight size={14} />
-                        Will move to: data/models/{author}/{repoName}/
-                      </p>
+              {selectedRepo &&
+                (() => {
+                  const repoId = selectedRepo.id || selectedRepo.model_id || "";
+                  const author =
+                    selectedRepo.author || repoId.split("/")[0] || "Unknown";
+                  const repoName =
+                    repoId.split("/")[1] || repoId.split("/").pop() || "";
+                  return (
+                    <div className="bg-primary-50 border border-primary-200 rounded-lg p-4">
+                      <h4 className="font-medium text-primary-900 mb-2">
+                        Ready to Link
+                      </h4>
+                      <div className="text-sm text-primary-700 space-y-1">
+                        <p>
+                          <strong>Repository:</strong> {repoId}
+                        </p>
+                        <p>
+                          <strong>Your file:</strong> {model.model_id}
+                        </p>
+                        {selectedFile && (
+                          <p>
+                            <strong>Rename to:</strong> {selectedFile}
+                          </p>
+                        )}
+                        <p className="text-primary-600 mt-2 flex items-center gap-1">
+                          <ArrowRight size={14} />
+                          Will move to: data/models/{author}/{repoName}/
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                );
-              })()}
+                  );
+                })()}
             </div>
           ) : (
             /* Manual Mode Form */
@@ -536,8 +675,8 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
             >
               Cancel
             </button>
-            
-            {mode === 'search' ? (
+
+            {mode === "search" ? (
               <button
                 onClick={handleLinkAndOrganize}
                 disabled={saving || !selectedRepo}
@@ -548,7 +687,7 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
                 ) : (
                   <Link size={18} />
                 )}
-                {saving ? 'Linking...' : 'Link & Organize'}
+                {saving ? "Linking..." : "Link & Organize"}
               </button>
             ) : (
               <button
@@ -561,7 +700,7 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
                 ) : (
                   <Save size={18} />
                 )}
-                {saving ? 'Saving...' : 'Save Metadata'}
+                {saving ? "Saving..." : "Save Metadata"}
               </button>
             )}
           </div>
@@ -570,4 +709,3 @@ export default function ModelMetadataEditor({ model, onClose, onSave }: ModelMet
     </div>
   );
 }
-

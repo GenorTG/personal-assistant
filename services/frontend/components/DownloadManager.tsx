@@ -1,14 +1,27 @@
-'use client';
+"use client";
 
-import { useState, useEffect, useCallback } from 'react';
-import { X, Download, Loader2, CheckCircle, XCircle, Clock, Trash2, RefreshCw, ChevronDown, ChevronUp } from 'lucide-react';
-import { api } from '@/lib/api';
+import { useState, useEffect, useCallback } from "react";
+import {
+  X,
+  Download,
+  Loader2,
+  CheckCircle,
+  XCircle,
+  Clock,
+  Trash2,
+  RefreshCw,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
+import { api } from "@/lib/api";
+import { useToast } from "@/contexts/ToastContext";
+import { formatBytes, formatTime, formatDate } from "@/lib/utils";
 
 interface DownloadItem {
   id: string;
   repo_id: string;
   filename: string;
-  status: 'pending' | 'downloading' | 'completed' | 'failed' | 'cancelled';
+  status: "pending" | "downloading" | "completed" | "failed" | "cancelled";
   progress: number;
   bytes_downloaded: number;
   total_bytes: number;
@@ -33,23 +46,32 @@ interface DownloadManagerProps {
   onDownloadComplete?: () => void;
 }
 
-export default function DownloadManager({ isOpen, onClose, onDownloadComplete }: DownloadManagerProps) {
-  const [downloads, setDownloads] = useState<DownloadsResponse>({ active: [], history: [], active_count: 0 });
+export default function DownloadManager({
+  isOpen,
+  onClose,
+  onDownloadComplete,
+}: DownloadManagerProps) {
+  const { showConfirm } = useToast();
+  const [downloads, setDownloads] = useState<DownloadsResponse>({
+    active: [],
+    history: [],
+    active_count: 0,
+  });
   const [loading, setLoading] = useState(true);
   const [showHistory, setShowHistory] = useState(false);
 
   const loadDownloads = useCallback(async () => {
     try {
-      const data = await api.listDownloads() as DownloadsResponse;
+      const data = (await api.listDownloads()) as DownloadsResponse;
       setDownloads(data);
-      
+
       // Check if any downloads just completed
-      const justCompleted = data.active.some(d => d.status === 'completed');
+      const justCompleted = data.active.some((d) => d.status === "completed");
       if (justCompleted && onDownloadComplete) {
         onDownloadComplete();
       }
     } catch (error) {
-      console.error('Error loading downloads:', error);
+      console.error("Error loading downloads:", error);
     } finally {
       setLoading(false);
     }
@@ -58,7 +80,7 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
   useEffect(() => {
     if (isOpen) {
       loadDownloads();
-      
+
       // Poll for updates every 1 second while open
       const interval = setInterval(loadDownloads, 1000);
       return () => clearInterval(interval);
@@ -70,7 +92,7 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
       await api.cancelDownload(downloadId);
       await loadDownloads();
     } catch (error) {
-      console.error('Error cancelling download:', error);
+      console.error("Error cancelling download:", error);
     }
   };
 
@@ -79,51 +101,32 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
       await api.retryDownload(downloadId);
       await loadDownloads();
     } catch (error) {
-      console.error('Error retrying download:', error);
+      console.error("Error retrying download:", error);
     }
   };
 
   const handleClearHistory = async () => {
-    if (!confirm('Clear download history older than 7 days?')) return;
-    try {
-      await api.clearDownloadHistory(7);
-      await loadDownloads();
-    } catch (error) {
-      console.error('Error clearing history:', error);
-    }
-  };
-
-  const formatBytes = (bytes: number): string => {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-  };
-
-  const formatTime = (seconds: number | undefined): string => {
-    if (!seconds || seconds <= 0) return '--';
-    if (seconds < 60) return `${seconds}s`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-  };
-
-  const formatDate = (dateString: string | undefined): string => {
-    if (!dateString) return '--';
-    return new Date(dateString).toLocaleString();
+    showConfirm("Clear download history older than 7 days?", async () => {
+      try {
+        await api.clearDownloadHistory(7);
+        await loadDownloads();
+      } catch (error) {
+        console.error("Error clearing history:", error);
+      }
+    });
   };
 
   const getStatusIcon = (status: string) => {
     switch (status) {
-      case 'pending':
+      case "pending":
         return <Clock size={16} className="text-yellow-500" />;
-      case 'downloading':
+      case "downloading":
         return <Loader2 size={16} className="text-blue-500 animate-spin" />;
-      case 'completed':
+      case "completed":
         return <CheckCircle size={16} className="text-green-500" />;
-      case 'failed':
+      case "failed":
         return <XCircle size={16} className="text-red-500" />;
-      case 'cancelled':
+      case "cancelled":
         return <XCircle size={16} className="text-gray-400" />;
       default:
         return <Clock size={16} className="text-gray-400" />;
@@ -132,31 +135,62 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
 
   const getStatusColor = (status: string): string => {
     switch (status) {
-      case 'pending': return 'bg-yellow-50 border-yellow-200';
-      case 'downloading': return 'bg-blue-50 border-blue-200';
-      case 'completed': return 'bg-green-50 border-green-200';
-      case 'failed': return 'bg-red-50 border-red-200';
-      case 'cancelled': return 'bg-gray-50 border-gray-200';
-      default: return 'bg-gray-50 border-gray-200';
+      case "pending":
+        return "bg-yellow-50 border-yellow-200";
+      case "downloading":
+        return "bg-blue-50 border-blue-200";
+      case "completed":
+        return "bg-green-50 border-green-200";
+      case "failed":
+        return "bg-red-50 border-red-200";
+      case "cancelled":
+        return "bg-gray-50 border-gray-200";
+      default:
+        return "bg-gray-50 border-gray-200";
     }
   };
 
   if (!isOpen) return null;
 
-  const activeDownloads = downloads.active.filter(d => 
-    d.status === 'pending' || d.status === 'downloading'
+  const activeDownloads = downloads.active.filter(
+    (d) => d.status === "pending" || d.status === "downloading"
   );
-  const recentCompleted = downloads.history.filter(d => 
-    d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled'
-  ).slice(0, 10);
+  const recentCompleted = downloads.history
+    .filter(
+      (d) =>
+        d.status === "completed" ||
+        d.status === "failed" ||
+        d.status === "cancelled"
+    )
+    .slice(0, 10);
+
+  // Track mousedown to prevent closing when dragging text selection outside modal
+  const [mouseDownInside, setMouseDownInside] = useState(false);
 
   return (
-    <div 
+    <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
-      onClick={(e) => e.target === e.currentTarget && onClose()}
+      onMouseDown={(e) => {
+        // Track if mousedown was on backdrop (outside modal)
+        if (e.target === e.currentTarget) {
+          setMouseDownInside(false);
+        }
+      }}
+      onMouseUp={(e) => {
+        // Only close if both mousedown and mouseup were on backdrop
+        if (e.target === e.currentTarget && !mouseDownInside) {
+          onClose();
+        }
+        setMouseDownInside(false);
+      }}
     >
-      <div 
+      <div
         className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col"
+        onMouseDown={(e) => {
+          // Track that mousedown was inside modal
+          setMouseDownInside(true);
+          e.stopPropagation();
+        }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -166,14 +200,15 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
             <div>
               <h2 className="text-xl font-bold text-gray-900">Downloads</h2>
               <p className="text-sm text-gray-500">
-                {activeDownloads.length > 0 
-                  ? `${activeDownloads.length} active download${activeDownloads.length > 1 ? 's' : ''}`
-                  : 'No active downloads'
-                }
+                {activeDownloads.length > 0
+                  ? `${activeDownloads.length} active download${
+                      activeDownloads.length > 1 ? "s" : ""
+                    }`
+                  : "No active downloads"}
               </p>
             </div>
           </div>
-          <button 
+          <button
             onClick={onClose}
             className="p-2 rounded-lg hover:bg-gray-100 transition-colors"
           >
@@ -197,9 +232,11 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
                   </h3>
                   <div className="space-y-3">
                     {activeDownloads.map((download) => (
-                      <div 
+                      <div
                         key={download.id}
-                        className={`p-4 rounded-lg border ${getStatusColor(download.status)}`}
+                        className={`p-4 rounded-lg border ${getStatusColor(
+                          download.status
+                        )}`}
                       >
                         <div className="flex items-start justify-between mb-2">
                           <div className="flex-1 min-w-0">
@@ -221,20 +258,21 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
                             <X size={16} />
                           </button>
                         </div>
-                        
+
                         {/* Progress Bar */}
                         <div className="w-full bg-gray-200 rounded-full h-2 mb-2">
-                          <div 
+                          <div
                             className="bg-blue-500 h-2 rounded-full transition-all duration-300"
                             style={{ width: `${download.progress}%` }}
                           />
                         </div>
-                        
+
                         {/* Stats */}
                         <div className="flex items-center justify-between text-xs text-gray-600">
                           <span>
-                            {formatBytes(download.bytes_downloaded)} / {formatBytes(download.total_bytes)}
-                            {' '}({download.progress.toFixed(1)}%)
+                            {formatBytes(download.bytes_downloaded)} /{" "}
+                            {formatBytes(download.total_bytes)} (
+                            {download.progress.toFixed(1)}%)
                           </span>
                           <div className="flex items-center gap-3">
                             <span>{download.speed_mbps.toFixed(1)} MB/s</span>
@@ -252,7 +290,9 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
                 <div className="text-center py-12 text-gray-500">
                   <Download size={48} className="mx-auto mb-3 opacity-20" />
                   <p className="text-lg font-medium">No downloads yet</p>
-                  <p className="text-sm">Downloads will appear here when you start downloading models</p>
+                  <p className="text-sm">
+                    Downloads will appear here when you start downloading models
+                  </p>
                 </div>
               )}
 
@@ -264,15 +304,21 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
                     className="flex items-center justify-between w-full text-sm font-semibold text-gray-700 uppercase tracking-wide mb-3 hover:text-gray-900"
                   >
                     <span>Download History ({recentCompleted.length})</span>
-                    {showHistory ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                    {showHistory ? (
+                      <ChevronUp size={16} />
+                    ) : (
+                      <ChevronDown size={16} />
+                    )}
                   </button>
-                  
+
                   {showHistory && (
                     <div className="space-y-2">
                       {recentCompleted.map((download) => (
-                        <div 
+                        <div
                           key={download.id}
-                          className={`p-3 rounded-lg border ${getStatusColor(download.status)}`}
+                          className={`p-3 rounded-lg border ${getStatusColor(
+                            download.status
+                          )}`}
                         >
                           <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2 flex-1 min-w-0">
@@ -282,7 +328,7 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
                               </span>
                             </div>
                             <div className="flex items-center gap-2">
-                              {download.status === 'failed' && (
+                              {download.status === "failed" && (
                                 <button
                                   onClick={() => handleRetry(download.id)}
                                   className="p-1 rounded hover:bg-white/50 text-gray-500 hover:text-blue-600"
@@ -297,7 +343,10 @@ export default function DownloadManager({ isOpen, onClose, onDownloadComplete }:
                             </div>
                           </div>
                           {download.error && (
-                            <p className="text-xs text-red-600 mt-1 truncate" title={download.error}>
+                            <p
+                              className="text-xs text-red-600 mt-1 truncate"
+                              title={download.error}
+                            >
                               Error: {download.error}
                             </p>
                           )}
@@ -341,9 +390,9 @@ export function DownloadBadge({ onClick }: { onClick: () => void }) {
   useEffect(() => {
     const checkDownloads = async () => {
       try {
-        const data = await api.listDownloads() as DownloadsResponse;
-        const active = data.active.filter(d => 
-          d.status === 'pending' || d.status === 'downloading'
+        const data = (await api.listDownloads()) as DownloadsResponse;
+        const active = data.active.filter(
+          (d) => d.status === "pending" || d.status === "downloading"
         );
         setActiveCount(active.length);
       } catch {
@@ -362,7 +411,10 @@ export function DownloadBadge({ onClick }: { onClick: () => void }) {
       className="relative p-2 rounded-lg hover:bg-gray-100 transition-colors"
       title="Downloads"
     >
-      <Download size={20} className={activeCount > 0 ? 'text-blue-600' : 'text-gray-500'} />
+      <Download
+        size={20}
+        className={activeCount > 0 ? "text-blue-600" : "text-gray-500"}
+      />
       {activeCount > 0 && (
         <span className="absolute -top-1 -right-1 w-5 h-5 bg-blue-600 text-white text-xs rounded-full flex items-center justify-center font-medium animate-pulse">
           {activeCount}
@@ -371,4 +423,3 @@ export function DownloadBadge({ onClick }: { onClick: () => void }) {
     </button>
   );
 }
-

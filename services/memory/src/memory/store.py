@@ -804,7 +804,7 @@ class MemoryStore:
         except Exception as e:
             print(f"Error deleting system prompt: {e}")
             return False
-    
+
     async def reset_all_data(self, keep_models: bool = True) -> Dict[str, Any]:
         """Reset all app data (conversations, settings, vector store).
         

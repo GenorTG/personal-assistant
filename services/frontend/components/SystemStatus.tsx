@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
-import { Activity, Server, Cpu, HardDrive } from 'lucide-react';
+import { Activity, Cpu, HardDrive } from 'lucide-react';
 
 interface ServiceStatus {
   id: string;

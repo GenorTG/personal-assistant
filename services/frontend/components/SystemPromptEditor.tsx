@@ -3,12 +3,14 @@
 import { useState, useEffect } from 'react';
 import { Save, RotateCcw, FileText, Loader } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useToast } from '@/contexts/ToastContext';
 
 interface SystemPromptEditorProps {
   onClose?: () => void;
 }
 
-export default function SystemPromptEditor({ onClose }: SystemPromptEditorProps) {
+export default function SystemPromptEditor({}: SystemPromptEditorProps) {
+  const { showSuccess, showError, showConfirm } = useToast();
   const [prompt, setPrompt] = useState('');
   const [name, setName] = useState('');
   const [isDefault, setIsDefault] = useState(false);
@@ -52,7 +54,7 @@ export default function SystemPromptEditor({ onClose }: SystemPromptEditorProps)
 
   const handleSave = async () => {
     if (!prompt.trim()) {
-      alert('System prompt cannot be empty');
+      showError('System prompt cannot be empty');
       return;
     }
 
@@ -67,19 +69,19 @@ export default function SystemPromptEditor({ onClose }: SystemPromptEditorProps)
         }
       }
       await loadPromptsList();
-      alert('System prompt saved successfully!');
+      showSuccess('System prompt saved successfully!');
     } catch (error) {
       console.error('Error saving system prompt:', error);
-      alert('Failed to save system prompt');
+      showError('Failed to save system prompt');
     } finally {
       setSaving(false);
     }
   };
 
   const handleReset = () => {
-    if (confirm('Reset to default system prompt? This will discard your changes.')) {
+    showConfirm('Reset to default system prompt? This will discard your changes.', () => {
       loadSystemPrompt();
-    }
+    });
   };
 
   const handleLoadPrompt = async (promptId: string) => {
@@ -94,24 +96,24 @@ export default function SystemPromptEditor({ onClose }: SystemPromptEditorProps)
       }
     } catch (error) {
       console.error('Error loading prompt:', error);
-      alert('Failed to load prompt');
+      showError('Failed to load prompt');
     }
   };
 
   const handleDeletePrompt = async (promptId: string) => {
-    if (!confirm('Delete this system prompt?')) return;
-    
-    try {
-      await api.deleteSystemPrompt(promptId);
-      await loadPromptsList();
-      if (selectedPromptId === promptId) {
-        await loadSystemPrompt();
+    showConfirm('Delete this system prompt?', async () => {
+      try {
+        await api.deleteSystemPrompt(promptId);
+        await loadPromptsList();
+        if (selectedPromptId === promptId) {
+          await loadSystemPrompt();
+        }
+        showSuccess('Prompt deleted successfully');
+      } catch (error) {
+        console.error('Error deleting prompt:', error);
+        showError('Failed to delete prompt');
       }
-      alert('Prompt deleted successfully');
-    } catch (error) {
-      console.error('Error deleting prompt:', error);
-      alert('Failed to delete prompt');
-    }
+    });
   };
 
   if (loading) {
