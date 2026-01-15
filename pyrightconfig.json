@@ -1,0 +1,77 @@
+{
+  "include": [
+    "services/gateway/src",
+    "services/stt-whisper/src",
+    "services/tts-piper/src",
+    "services/tts-kokoro",
+    "launcher-gtk4"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/node_modules",
+    "**/.venv",
+    "**/venv",
+    "**/services/.core_venv/lib",
+    "**/services/.core_venv/include",
+    "**/services/.core_venv/share"
+  ],
+  "venvPath": "services",
+  "venv": ".core_venv",
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "reportUnusedImport": true,
+  "reportUnusedClass": true,
+  "reportUnusedFunction": true,
+  "reportUnusedVariable": true,
+  "reportDuplicateImport": true,
+  "reportWildcardImportFromLibrary": false,
+  "reportOptionalSubscript": false,
+  "reportOptionalMemberAccess": false,
+  "reportOptionalCall": false,
+  "reportOptionalIterable": false,
+  "reportOptionalContextManager": false,
+  "reportOptionalOperand": false,
+  "reportPrivateImportUsage": false,
+  "stubPath": "",
+  "executionEnvironments": [
+    {
+      "root": "services/gateway",
+      "pythonVersion": "3.12",
+      "pythonPlatform": "Linux",
+      "extraPaths": [
+        "src"
+      ]
+    },
+    {
+      "root": "services/stt-whisper",
+      "pythonVersion": "3.12",
+      "pythonPlatform": "Linux",
+      "extraPaths": [
+        "src"
+      ]
+    },
+    {
+      "root": "services/tts-piper",
+      "pythonVersion": "3.12",
+      "pythonPlatform": "Linux",
+      "extraPaths": [
+        "src"
+      ]
+    },
+    {
+      "root": "services/tts-kokoro",
+      "pythonVersion": "3.12",
+      "pythonPlatform": "Linux"
+    },
+    {
+      "root": "launcher-gtk4",
+      "pythonVersion": "3.12",
+      "pythonPlatform": "Linux"
+    }
+  ]
+}
+
+

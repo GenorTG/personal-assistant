@@ -31,6 +31,7 @@ from .memory import router as memory_router
 from .tools import router as tools_router
 from .files import router as files_router
 from .proxy import router as proxy_router
+from .websocket import router as websocket_router
 
 # Create a combined router that includes all sub-routers
 router = APIRouter()
@@ -49,6 +50,7 @@ router.include_router(memory_router)
 router.include_router(tools_router)
 router.include_router(files_router)
 router.include_router(proxy_router)
+router.include_router(websocket_router)
 
 __all__ = [
     "router",
@@ -65,4 +67,5 @@ __all__ = [
     "tools_router",
     "files_router",
     "proxy_router",
+    "websocket_router",
 ]

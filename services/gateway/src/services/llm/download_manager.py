@@ -2,104 +2,17 @@
 
 from typing import Dict, Any, List, Optional, Callable
 from pathlib import Path
-from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
 import asyncio
-import json
 import logging
 import uuid
 import threading
-from huggingface_hub import hf_hub_download
-from tqdm import tqdm
 from .file_stores import DownloadHistoryStore
+from .download_models import Download, DownloadStatus
+from .download_executor import execute_download
+from .download_metadata import save_model_metadata
 
 logger = logging.getLogger(__name__)
-
-
-class DownloadStatus(str, Enum):
-    """Download status enum."""
-    PENDING = "pending"
-    DOWNLOADING = "downloading"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
-@dataclass
-class Download:
-    """Represents a download task."""
-    id: str
-    repo_id: str
-    filename: str
-    status: DownloadStatus = DownloadStatus.PENDING
-    progress: float = 0.0  # 0-100
-    bytes_downloaded: int = 0
-    total_bytes: int = 0
-    speed_bps: float = 0.0  # bytes per second
-    error: Optional[str] = None
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    model_path: Optional[str] = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            "id": self.id,
-            "repo_id": self.repo_id,
-            "filename": self.filename,
-            "status": self.status.value,
-            "progress": round(self.progress, 1),
-            "bytes_downloaded": self.bytes_downloaded,
-            "total_bytes": self.total_bytes,
-            "speed_bps": round(self.speed_bps, 0),
-            "speed_mbps": round(self.speed_bps / 1024 / 1024, 2),
-            "error": self.error,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
-            "model_path": self.model_path,
-            "eta_seconds": self._calculate_eta(),
-        }
-    
-    def _calculate_eta(self) -> Optional[int]:
-        """Calculate estimated time remaining in seconds."""
-        if self.speed_bps <= 0 or self.total_bytes <= 0:
-            return None
-        remaining_bytes = self.total_bytes - self.bytes_downloaded
-        if remaining_bytes <= 0:
-            return 0
-        return int(remaining_bytes / self.speed_bps)
-
-
-class ProgressCallback:
-    """Progress callback for huggingface_hub downloads."""
-    
-    def __init__(self, download: Download, on_progress: Callable[[Download], None]):
-        self.download = download
-        self.on_progress = on_progress
-        self.last_update = datetime.now()
-        self.last_bytes = 0
-    
-    def __call__(self, progress: tqdm):
-        """Called by huggingface_hub with tqdm progress bar."""
-        if hasattr(progress, 'n') and hasattr(progress, 'total'):
-            now = datetime.now()
-            elapsed = (now - self.last_update).total_seconds()
-            
-            self.download.bytes_downloaded = progress.n
-            self.download.total_bytes = progress.total or 0
-            
-            if self.download.total_bytes > 0:
-                self.download.progress = (progress.n / self.download.total_bytes) * 100
-            
-            # Calculate speed (bytes per second)
-            if elapsed > 0.5:  # Update speed every 0.5 seconds
-                bytes_diff = progress.n - self.last_bytes
-                self.download.speed_bps = bytes_diff / elapsed
-                self.last_update = now
-                self.last_bytes = progress.n
-            
-            self.on_progress(self.download)
 
 
 class DownloadManager:
@@ -126,6 +39,51 @@ class DownloadManager:
                 callback(download)
             except Exception as e:
                 logger.error(f"Error in subscriber callback: {e}")
+        
+        # Broadcast via WebSocket (fire and forget)
+        try:
+            from ...services.websocket_manager import get_websocket_manager
+            ws_manager = get_websocket_manager()
+            
+            # Create async task to broadcast
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self._broadcast_download_update(ws_manager, download))
+            else:
+                asyncio.run(self._broadcast_download_update(ws_manager, download))
+        except Exception as e:
+            logger.debug(f"Failed to broadcast download update: {e}")
+    
+    async def _broadcast_download_update(self, ws_manager, download: Download):
+        """Broadcast download update via WebSocket."""
+        try:
+            if download.status == DownloadStatus.COMPLETED:
+                await ws_manager.broadcast_download_completed(
+                    download.id,
+                    {
+                        "filename": download.filename,
+                        "repo_id": download.repo_id,
+                        "model_path": download.model_path,
+                        "total_bytes": download.total_bytes,
+                    }
+                )
+            else:
+                await ws_manager.broadcast_download_progress(
+                    download.id,
+                    {
+                        "filename": download.filename,
+                        "repo_id": download.repo_id,
+                        "status": download.status.value,
+                        "progress": download.progress,
+                        "bytes_downloaded": download.bytes_downloaded,
+                        "total_bytes": download.total_bytes,
+                        "speed_bps": download.speed_bps,
+                        "speed_mbps": download.speed_mbps,
+                        "eta_seconds": download.eta_seconds,
+                    }
+                )
+        except Exception as e:
+            logger.debug(f"Error in _broadcast_download_update: {e}")
     
     def subscribe(self, download_id: str, callback: Callable[[Download], None]):
         """Subscribe to progress updates for a download."""
@@ -188,140 +146,41 @@ class DownloadManager:
             model_folder = self.models_dir / author / repo_name
             model_folder.mkdir(parents=True, exist_ok=True)
             
-            # Create progress callback
-            def on_progress(d: Download):
-                self._notify_subscribers(d)
-            
-            # Download with progress tracking
+            # Get the event loop for progress callbacks
             loop = asyncio.get_event_loop()
             
-            def do_download():
-                # Use file monitoring approach for more reliable progress tracking
-                from huggingface_hub import hf_hub_download, HfApi
-                import time
-                import os
-                import threading
-                
-                # Get expected file size first
-                api = HfApi()
-                expected_size = 0
+            # Create progress callback that saves to disk
+            def on_progress(d: Download):
+                self._notify_subscribers(d)
+                # Save progress updates to disk (fire and forget)
+                # Use run_coroutine_threadsafe since we're in a sync thread from run_in_executor
                 try:
-                    # Try to get file size from HuggingFace
-                    paths_info = api.get_paths_info(download.repo_id, paths=[download.filename], repo_type="model")
-                    if paths_info and isinstance(paths_info, list) and len(paths_info) > 0:
-                        file_info = paths_info[0]
-                        if isinstance(file_info, dict):
-                            expected_size = file_info.get("size", 0)
-                        elif hasattr(file_info, 'size'):
-                            expected_size = file_info.size or 0
-                except Exception as e:
-                    logger.debug(f"Could not get file size: {e}")
-                
-                download.total_bytes = expected_size
-                if expected_size > 0:
-                    download.bytes_downloaded = 0
-                    download.progress = 0.0
-                
-                # Start download in a separate thread with file monitoring
-                download_path = None
-                download_error = None
-                
-                def monitor_progress():
-                    """Monitor file size during download."""
-                    target_file = None
-                    last_size = 0
-                    last_time = time.time()
-                    check_count = 0
-                    
-                    while download.status == DownloadStatus.DOWNLOADING:
+                    if loop.is_running():
+                        # Schedule the save operation from the sync thread
+                        future = asyncio.run_coroutine_threadsafe(self._save_download(d), loop)
+                        # Log save attempt
+                        logger.debug(f"[DOWNLOAD SAVE] Scheduled save for {d.id}: progress={d.progress:.1f}%, bytes={d.bytes_downloaded}/{d.total_bytes}, speed={d.speed_bps/1024/1024:.2f} MB/s")
+                        # Check for exceptions (non-blocking)
                         try:
-                            check_count += 1
-                            
-                            # Find the file being downloaded
-                            if target_file is None or not target_file.exists():
-                                # Check direct path first (hf_hub_download might save directly to local_dir)
-                                direct_path = model_folder / download.filename
-                                if direct_path.exists():
-                                    target_file = direct_path
-                                else:
-                                    # Look for the file recursively in the model folder
-                                    for file in model_folder.rglob(download.filename):
-                                        if file.is_file():
-                                            target_file = file
-                                            break
-                                    
-                                    # Also check for temporary files (hf_hub_download might use .tmp extension)
-                                    if target_file is None:
-                                        for file in model_folder.rglob(f"{download.filename}*"):
-                                            if file.is_file() and (file.suffix == '.tmp' or '.tmp' in file.name):
-                                                target_file = file
-                                                break
-                            
-                            if target_file and target_file.exists():
-                                current_size = target_file.stat().st_size
-                                
-                                # Always update if size changed, or every 10 checks (5 seconds) even if same
-                                if current_size != last_size or check_count % 10 == 0:
-                                    now = time.time()
-                                    elapsed = now - last_time if last_time > 0 else 0.5
-                                    
-                                    download.bytes_downloaded = current_size
-                                    if expected_size > 0:
-                                        download.progress = min((current_size / expected_size) * 100, 99.9)  # Cap at 99.9% until complete
-                                    
-                                    # Calculate speed
-                                    if elapsed > 0.1 and current_size > last_size:
-                                        bytes_diff = current_size - last_size
-                                        download.speed_bps = bytes_diff / elapsed
-                                        last_time = now
-                                        last_size = current_size
-                                        
-                                        # Notify progress
-                                        on_progress(download)
-                                    elif current_size != last_size:
-                                        # Size changed but not enough time elapsed - still update
-                                        last_size = current_size
-                                        on_progress(download)
-                            
-                            time.sleep(0.5)  # Check every 0.5 seconds
-                        except Exception as e:
-                            logger.debug(f"Progress monitoring error: {e}")
-                            time.sleep(1)
-                
-                # Start progress monitoring thread
-                monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
-                monitor_thread.start()
-                
-                try:
-                    # Download to the model subfolder
-                    path = hf_hub_download(
-                        repo_id=download.repo_id,
-                        filename=download.filename,
-                        local_dir=str(model_folder),
-                        local_dir_use_symlinks=False,
-                        resume_download=True
-                    )
-                    
-                    # Final update - ensure we have the correct size
-                    if path and os.path.exists(path):
-                        final_size = os.path.getsize(path)
-                        download.bytes_downloaded = final_size
-                        download.total_bytes = final_size
-                        download.progress = 100.0
-                        on_progress(download)
-                    
-                    return path
+                            future.result(timeout=1.0)
+                            logger.debug(f"[DOWNLOAD SAVE] Successfully saved progress for {d.id}")
+                        except Exception as save_error:
+                            logger.error(f"[DOWNLOAD SAVE] Error saving progress for {d.id}: {save_error}", exc_info=True)
+                    else:
+                        # Shouldn't happen, but fallback
+                        logger.warning(f"[DOWNLOAD SAVE] Loop not running, using fallback for {d.id}")
+                        asyncio.run(self._save_download(d))
                 except Exception as e:
-                    download_error = e
-                    raise
-                finally:
-                    # Wait a bit for final progress update
-                    time.sleep(0.5)
+                    logger.error(f"[DOWNLOAD SAVE] Error saving progress update for {d.id}: {e}", exc_info=True)
             
-            model_path = await loop.run_in_executor(None, do_download)
+            # Download with progress tracking
+            model_path = await loop.run_in_executor(
+                None,
+                lambda: execute_download(download, model_folder, on_progress)
+            )
             
             # Fetch and save model metadata
-            await self._save_model_metadata_file(download.repo_id, model_folder, download.filename)
+            await save_model_metadata(download.repo_id, model_folder, download.filename, loop)
             
             # Mark as completed
             download.status = DownloadStatus.COMPLETED
@@ -330,6 +189,12 @@ class DownloadManager:
             download.model_path = str(model_path)
             
             logger.info(f"Download completed: {download.filename} -> {model_path}")
+            
+            # Trigger model discovery for the newly downloaded model
+            # Note: We don't need to run discovery here since save_model_metadata already
+            # creates the model_info.json file. Discovery is mainly for manually added models.
+            # However, we should ensure the model is properly registered.
+            logger.info(f"Model download and metadata save completed for {model_path}")
             
         except Exception as e:
             download.status = DownloadStatus.FAILED
@@ -343,117 +208,15 @@ class DownloadManager:
     
     async def _save_download(self, download: Download):
         """Save download to file store."""
-        download_data = download.to_dict()
-        download_data["created_at"] = datetime.now().isoformat()
-        await self.history_store.save_download(download_data)
-    
-    async def _save_model_metadata_file(self, repo_id: str, model_folder: Path, filename: str):
-        """Fetch and save model metadata to a JSON file alongside the model.
-        
-        Creates a model_info.json file with full HuggingFace repo metadata.
-        """
-        from huggingface_hub import HfApi
-        
-        loop = asyncio.get_event_loop()
-        
         try:
-            def fetch_metadata():
-                api = HfApi()
-                model_info = api.model_info(repo_id)
-                
-                # Extract author
-                author = repo_id.split('/')[0] if '/' in repo_id else 'unknown'
-                
-                # Get description
-                description = ""
-                try:
-                    if hasattr(model_info, 'cardData') and model_info.cardData:
-                        description = getattr(model_info.cardData, 'text', '') or ''
-                except Exception:
-                    pass
-                
-                # Try to fetch config.json from HuggingFace to get MoE info
-                moe_info = None
-                try:
-                    from huggingface_hub import hf_hub_download
-                    import tempfile
-                    import json as json_module
-                    
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        config_path = hf_hub_download(
-                            repo_id=repo_id,
-                            filename="config.json",
-                            local_dir=tmpdir,
-                            local_dir_use_symlinks=False
-                        )
-                        
-                        with open(config_path, 'r', encoding='utf-8') as f:
-                            config = json_module.load(f)
-                            
-                            # Extract MoE info from config.json
-                            num_experts = config.get("num_local_experts") or config.get("num_experts")
-                            experts_per_token = config.get("num_experts_per_tok")
-                            
-                            if num_experts and num_experts > 1:
-                                moe_info = {
-                                    "is_moe": True,
-                                    "num_experts": num_experts,
-                                    "experts_per_token": experts_per_token or 2
-                                }
-                                logger.info(f"Extracted MoE info from HuggingFace config.json: {num_experts} experts")
-                except Exception as e:
-                    logger.debug(f"Could not fetch config.json from HuggingFace for {repo_id}: {e}")
-                
-                # Build metadata
-                metadata = {
-                    "repo_id": repo_id,
-                    "author": author,
-                    "name": repo_id.split('/')[-1] if '/' in repo_id else repo_id,
-                    "filename": filename,
-                    "description": description[:2000] if description else "",
-                    "downloads": getattr(model_info, 'downloads', 0) or 0,
-                    "likes": getattr(model_info, 'likes', 0) or 0,
-                    "tags": list(getattr(model_info, 'tags', [])),
-                    "last_modified": str(getattr(model_info, 'lastModified', '')) if hasattr(model_info, 'lastModified') else None,
-                    "source": "huggingface",
-                    "downloaded_at": datetime.now().isoformat(),
-                    "huggingface_url": f"https://huggingface.co/{repo_id}",
-                }
-                
-                # Add MoE info if found
-                if moe_info:
-                    metadata["moe"] = moe_info
-                
-                return metadata
-            
-            metadata = await loop.run_in_executor(None, fetch_metadata)
-            
-            # Save to model_info.json
-            metadata_file = model_folder / "model_info.json"
-            with open(metadata_file, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, indent=2, ensure_ascii=False)
-            
-            logger.info(f"Saved model metadata to {metadata_file}")
-            
+            download_data = download.to_dict()
+            download_data["created_at"] = datetime.now().isoformat()
+            await self.history_store.save_download(download_data)
+            logger.debug(f"[DOWNLOAD SAVE] Saved download {download.id} to file store: status={download.status.value}, progress={download.progress:.1f}%")
         except Exception as e:
-            logger.error(f"Failed to save model metadata for {repo_id}: {e}")
-            # Don't fail the download if metadata save fails
-            # Create a minimal metadata file
-            minimal_metadata = {
-                "repo_id": repo_id,
-                "author": repo_id.split('/')[0] if '/' in repo_id else 'unknown',
-                "name": repo_id.split('/')[-1] if '/' in repo_id else repo_id,
-                "filename": filename,
-                "source": "huggingface",
-                "downloaded_at": datetime.now().isoformat(),
-                "huggingface_url": f"https://huggingface.co/{repo_id}",
-            }
-            try:
-                metadata_file = model_folder / "model_info.json"
-                with open(metadata_file, 'w', encoding='utf-8') as f:
-                    json.dump(minimal_metadata, f, indent=2, ensure_ascii=False)
-            except Exception as e2:
-                logger.error(f"Failed to save minimal metadata: {e2}")
+            logger.error(f"[DOWNLOAD SAVE] Failed to save download {download.id} to file store: {e}", exc_info=True)
+            raise
+    
     
     def get_active_downloads(self) -> List[Download]:
         """Get all active (pending/downloading) downloads."""

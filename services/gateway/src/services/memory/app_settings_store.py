@@ -225,107 +225,482 @@ class FileSystemPromptStore:
 
 
 class FileCharacterCardStore:
-    """File-based storage for character cards.
+    """File-based storage for multiple character cards.
     
     Structure:
-    - character_card.json - Single character card file
+    - character_cards/ - Directory containing character card files
+      - {card_id}.json - Individual character card files
+    - current_character_card_id.json - ID of currently active character card
     """
     
     def __init__(self, base_dir: Path):
         self.base_dir = Path(base_dir)
-        self.card_file = self.base_dir / "character_card.json"
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.cards_dir = self.base_dir / "character_cards"
+        self.current_id_file = self.base_dir / "current_character_card_id.json"
+        self.cards_dir.mkdir(parents=True, exist_ok=True)
     
-    async def get_character_card(self) -> Optional[Dict[str, Any]]:
-        """Get character card.
+    async def list_character_cards(self) -> List[Dict[str, Any]]:
+        """List all character cards.
+        
+        Returns:
+            List of character card dicts with 'id' and 'name' fields
+        """
+        cards = []
+        if not self.cards_dir.exists():
+            return cards
+        
+        try:
+            for card_file in self.cards_dir.glob("*.json"):
+                card_id = card_file.stem
+                try:
+                    async with aiofiles.open(card_file, 'r', encoding='utf-8') as f:
+                        content = await f.read()
+                        card_data = json.loads(content)
+                        cards.append({
+                            "id": card_id,
+                            "name": card_data.get("name", card_id),
+                            **card_data
+                        })
+                except Exception as e:
+                    logger.warning(f"Error loading character card {card_id}: {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"Error listing character cards: {e}")
+        
+        return cards
+    
+    async def get_character_card(self, card_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Get character card by ID, or current active card if ID is None.
+        
+        Args:
+            card_id: Character card ID, or None to get current active card
         
         Returns:
             Character card dict or None
         """
-        if not self.card_file.exists():
+        # If no ID provided, get current active card ID
+        if card_id is None:
+            if self.current_id_file.exists():
+                try:
+                    async with aiofiles.open(self.current_id_file, 'r', encoding='utf-8') as f:
+                        content = await f.read()
+                        card_id = json.loads(content).get("card_id")
+                except Exception:
+                    # Fallback: try to get first card or legacy single card
+                    cards = await self.list_character_cards()
+                    if cards:
+                        card_id = cards[0]["id"]
+                    else:
+                        # Try legacy single card file
+                        legacy_file = self.base_dir / "character_card.json"
+                        if legacy_file.exists():
+                            try:
+                                async with aiofiles.open(legacy_file, 'r', encoding='utf-8') as f:
+                                    content = await f.read()
+                                    return json.loads(content)
+                            except Exception:
+                                pass
+                        return None
+        
+        card_file = self.cards_dir / f"{card_id}.json"
+        if not card_file.exists():
             return None
         
         try:
-            async with aiofiles.open(self.card_file, 'r', encoding='utf-8') as f:
+            async with aiofiles.open(card_file, 'r', encoding='utf-8') as f:
                 content = await f.read()
-                return json.loads(content)
+                card_data = json.loads(content)
+                card_data["id"] = card_id
+                return card_data
         except Exception as e:
-            logger.error(f"Error loading character card: {e}")
+            logger.error(f"Error loading character card {card_id}: {e}")
             return None
     
-    async def set_character_card(self, card: Optional[Dict[str, Any]]) -> bool:
-        """Set character card.
+    async def create_character_card(self, card: Dict[str, Any]) -> str:
+        """Create a new character card.
         
         Args:
-            card: Character card dict, or None to delete
+            card: Character card dict (must include 'name')
+        
+        Returns:
+            Character card ID
+        """
+        import uuid
+        card_id = str(uuid.uuid4())
+        card["id"] = card_id
+        card["created_at"] = datetime.utcnow().isoformat()
+        
+        card_file = self.cards_dir / f"{card_id}.json"
+        try:
+            async with aiofiles.open(card_file, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(card, indent=2, default=str))
+            
+            # Set as current if it's the first card
+            cards = await self.list_character_cards()
+            if len(cards) == 1:
+                await self.set_current_character_card(card_id)
+            
+            return card_id
+        except Exception as e:
+            logger.error(f"Error creating character card: {e}")
+            raise
+    
+    async def update_character_card(self, card_id: str, card: Dict[str, Any]) -> bool:
+        """Update an existing character card.
+        
+        Args:
+            card_id: Character card ID
+            card: Updated character card dict
         
         Returns:
             True if successful
         """
+        card_file = self.cards_dir / f"{card_id}.json"
+        if not card_file.exists():
+            return False
+        
+        card["id"] = card_id
+        card["updated_at"] = datetime.utcnow().isoformat()
+        
         try:
-            if card is None:
-                if self.card_file.exists():
-                    self.card_file.unlink()
-                return True
-            
-            async with aiofiles.open(self.card_file, 'w', encoding='utf-8') as f:
+            async with aiofiles.open(card_file, 'w', encoding='utf-8') as f:
                 await f.write(json.dumps(card, indent=2, default=str))
             return True
         except Exception as e:
-            logger.error(f"Error saving character card: {e}")
+            logger.error(f"Error updating character card {card_id}: {e}")
             return False
+    
+    async def delete_character_card(self, card_id: str) -> bool:
+        """Delete a character card.
+        
+        Args:
+            card_id: Character card ID
+        
+        Returns:
+            True if successful
+        """
+        card_file = self.cards_dir / f"{card_id}.json"
+        if not card_file.exists():
+            return False
+        
+        try:
+            card_file.unlink()
+            
+            # If this was the current card, clear current or set to another
+            current_id = await self.get_current_character_card_id()
+            if current_id == card_id:
+                cards = await self.list_character_cards()
+                if cards:
+                    await self.set_current_character_card(cards[0]["id"])
+                else:
+                    if self.current_id_file.exists():
+                        self.current_id_file.unlink()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting character card {card_id}: {e}")
+            return False
+    
+    async def set_current_character_card(self, card_id: str) -> bool:
+        """Set the current active character card.
+        
+        Args:
+            card_id: Character card ID
+        
+        Returns:
+            True if successful
+        """
+        # Verify card exists
+        card_file = self.cards_dir / f"{card_id}.json"
+        if not card_file.exists():
+            return False
+        
+        try:
+            async with aiofiles.open(self.current_id_file, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps({"card_id": card_id}, indent=2))
+            return True
+        except Exception as e:
+            logger.error(f"Error setting current character card: {e}")
+            return False
+    
+    async def get_current_character_card_id(self) -> Optional[str]:
+        """Get the current active character card ID.
+        
+        Returns:
+            Character card ID or None
+        """
+        if not self.current_id_file.exists():
+            return None
+        
+        try:
+            async with aiofiles.open(self.current_id_file, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                return json.loads(content).get("card_id")
+        except Exception:
+            return None
+    
+    async def set_character_card(self, card: Optional[Dict[str, Any]]) -> bool:
+        """Legacy method: Set character card (creates new or updates current).
+        
+        Args:
+            card: Character card dict, or None to delete current
+        
+        Returns:
+            True if successful
+        """
+        if card is None:
+            current_id = await self.get_current_character_card_id()
+            if current_id:
+                return await self.delete_character_card(current_id)
+            return True
+        
+        current_id = await self.get_current_character_card_id()
+        if current_id:
+            # Update existing
+            return await self.update_character_card(current_id, card)
+        else:
+            # Create new
+            card_id = await self.create_character_card(card)
+            return await self.set_current_character_card(card_id)
 
 
 class FileUserProfileStore:
-    """File-based storage for user profiles.
+    """File-based storage for multiple user profiles.
     
     Structure:
-    - user_profile.json - Single user profile file
+    - user_profiles/ - Directory containing user profile files
+      - {profile_id}.json - Individual user profile files
+    - current_user_profile_id.json - ID of currently active user profile
     """
     
     def __init__(self, base_dir: Path):
         self.base_dir = Path(base_dir)
-        self.profile_file = self.base_dir / "user_profile.json"
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.profiles_dir = self.base_dir / "user_profiles"
+        self.current_id_file = self.base_dir / "current_user_profile_id.json"
+        self.profiles_dir.mkdir(parents=True, exist_ok=True)
     
-    async def get_user_profile(self) -> Optional[Dict[str, Any]]:
-        """Get user profile.
+    async def list_user_profiles(self) -> List[Dict[str, Any]]:
+        """List all user profiles.
+        
+        Returns:
+            List of user profile dicts with 'id' and 'name' fields
+        """
+        profiles = []
+        if not self.profiles_dir.exists():
+            return profiles
+        
+        try:
+            for profile_file in self.profiles_dir.glob("*.json"):
+                profile_id = profile_file.stem
+                try:
+                    async with aiofiles.open(profile_file, 'r', encoding='utf-8') as f:
+                        content = await f.read()
+                        profile_data = json.loads(content)
+                        profiles.append({
+                            "id": profile_id,
+                            "name": profile_data.get("name", profile_id),
+                            **profile_data
+                        })
+                except Exception as e:
+                    logger.warning(f"Error loading user profile {profile_id}: {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"Error listing user profiles: {e}")
+        
+        return profiles
+    
+    async def get_user_profile(self, profile_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Get user profile by ID, or current active profile if ID is None.
+        
+        Args:
+            profile_id: User profile ID, or None to get current active profile
         
         Returns:
             User profile dict or None
         """
-        if not self.profile_file.exists():
+        # If no ID provided, get current active profile ID
+        if profile_id is None:
+            if self.current_id_file.exists():
+                try:
+                    async with aiofiles.open(self.current_id_file, 'r', encoding='utf-8') as f:
+                        content = await f.read()
+                        profile_id = json.loads(content).get("profile_id")
+                except Exception:
+                    # Fallback: try to get first profile or legacy single profile
+                    profiles = await self.list_user_profiles()
+                    if profiles:
+                        profile_id = profiles[0]["id"]
+                    else:
+                        # Try legacy single profile file
+                        legacy_file = self.base_dir / "user_profile.json"
+                        if legacy_file.exists():
+                            try:
+                                async with aiofiles.open(legacy_file, 'r', encoding='utf-8') as f:
+                                    content = await f.read()
+                                    return json.loads(content)
+                            except Exception:
+                                pass
+                        return None
+        
+        profile_file = self.profiles_dir / f"{profile_id}.json"
+        if not profile_file.exists():
             return None
         
         try:
-            async with aiofiles.open(self.profile_file, 'r', encoding='utf-8') as f:
+            async with aiofiles.open(profile_file, 'r', encoding='utf-8') as f:
                 content = await f.read()
-                return json.loads(content)
+                profile_data = json.loads(content)
+                profile_data["id"] = profile_id
+                return profile_data
         except Exception as e:
-            logger.error(f"Error loading user profile: {e}")
+            logger.error(f"Error loading user profile {profile_id}: {e}")
             return None
     
-    async def set_user_profile(self, profile: Optional[Dict[str, Any]]) -> bool:
-        """Set user profile.
+    async def create_user_profile(self, profile: Dict[str, Any]) -> str:
+        """Create a new user profile.
         
         Args:
-            profile: User profile dict, or None to delete
+            profile: User profile dict (must include 'name')
+        
+        Returns:
+            User profile ID
+        """
+        profile_id = str(uuid.uuid4())
+        profile["id"] = profile_id
+        profile["created_at"] = datetime.utcnow().isoformat()
+        
+        profile_file = self.profiles_dir / f"{profile_id}.json"
+        try:
+            async with aiofiles.open(profile_file, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(profile, indent=2, default=str))
+            
+            # Set as current if it's the first profile
+            profiles = await self.list_user_profiles()
+            if len(profiles) == 1:
+                await self.set_current_user_profile(profile_id)
+            
+            return profile_id
+        except Exception as e:
+            logger.error(f"Error creating user profile: {e}")
+            raise
+    
+    async def update_user_profile(self, profile_id: str, profile: Dict[str, Any]) -> bool:
+        """Update an existing user profile.
+        
+        Args:
+            profile_id: User profile ID
+            profile: Updated user profile dict
         
         Returns:
             True if successful
         """
+        profile_file = self.profiles_dir / f"{profile_id}.json"
+        if not profile_file.exists():
+            return False
+        
+        profile["id"] = profile_id
+        profile["updated_at"] = datetime.utcnow().isoformat()
+        
         try:
-            if profile is None:
-                if self.profile_file.exists():
-                    self.profile_file.unlink()
-                return True
-            
-            async with aiofiles.open(self.profile_file, 'w', encoding='utf-8') as f:
+            async with aiofiles.open(profile_file, 'w', encoding='utf-8') as f:
                 await f.write(json.dumps(profile, indent=2, default=str))
             return True
         except Exception as e:
-            logger.error(f"Error saving user profile: {e}")
+            logger.error(f"Error updating user profile {profile_id}: {e}")
             return False
+    
+    async def delete_user_profile(self, profile_id: str) -> bool:
+        """Delete a user profile.
+        
+        Args:
+            profile_id: User profile ID
+        
+        Returns:
+            True if successful
+        """
+        profile_file = self.profiles_dir / f"{profile_id}.json"
+        if not profile_file.exists():
+            return False
+        
+        try:
+            profile_file.unlink()
+            
+            # If this was the current profile, clear current or set to another
+            current_id = await self.get_current_user_profile_id()
+            if current_id == profile_id:
+                profiles = await self.list_user_profiles()
+                if profiles:
+                    await self.set_current_user_profile(profiles[0]["id"])
+                else:
+                    if self.current_id_file.exists():
+                        self.current_id_file.unlink()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting user profile {profile_id}: {e}")
+            return False
+    
+    async def set_current_user_profile(self, profile_id: str) -> bool:
+        """Set the current active user profile.
+        
+        Args:
+            profile_id: User profile ID
+        
+        Returns:
+            True if successful
+        """
+        # Verify profile exists
+        profile_file = self.profiles_dir / f"{profile_id}.json"
+        if not profile_file.exists():
+            return False
+        
+        try:
+            async with aiofiles.open(self.current_id_file, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps({"profile_id": profile_id}, indent=2))
+            return True
+        except Exception as e:
+            logger.error(f"Error setting current user profile: {e}")
+            return False
+    
+    async def get_current_user_profile_id(self) -> Optional[str]:
+        """Get the current active user profile ID.
+        
+        Returns:
+            User profile ID or None
+        """
+        if not self.current_id_file.exists():
+            return None
+        
+        try:
+            async with aiofiles.open(self.current_id_file, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                return json.loads(content).get("profile_id")
+        except Exception:
+            return None
+    
+    async def set_user_profile(self, profile: Optional[Dict[str, Any]]) -> bool:
+        """Legacy method: Set user profile (creates new or updates current).
+        
+        Args:
+            profile: User profile dict, or None to delete current
+        
+        Returns:
+            True if successful
+        """
+        if profile is None:
+            current_id = await self.get_current_user_profile_id()
+            if current_id:
+                return await self.delete_user_profile(current_id)
+            return True
+        
+        current_id = await self.get_current_user_profile_id()
+        if current_id:
+            # Update existing
+            return await self.update_user_profile(current_id, profile)
+        else:
+            # Create new
+            profile_id = await self.create_user_profile(profile)
+            return await self.set_current_user_profile(profile_id)
 
 
 class FileSamplerSettingsStore:

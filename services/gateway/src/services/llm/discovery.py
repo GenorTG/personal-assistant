@@ -74,18 +74,40 @@ class ModelDiscovery:
         self.models_dir = Path(models_dir)
         self.data_dir = Path(data_dir)
         self.models_dir.mkdir(parents=True, exist_ok=True)
+        # Also check root-level data/models/ directory (legacy location)
+        self.base_dir = self.models_dir.parent.parent.parent if self.models_dir.parent.parent.parent.exists() else None
+        self.legacy_models_dir = self.base_dir / "data" / "models" if self.base_dir else None
         self._api = HfApi()
         self.metadata_store = ModelMetadataStore(models_dir)
         self.info_extractor = ModelInfoExtractor(models_dir)
     
     def scan_models_directory(self) -> List[Path]:
-        """Scan the models directory for GGUF files.
+        """Scan the models directory for GGUF files (recursively).
+        
+        Scans both:
+        - services/data/models/ (primary location)
+        - data/models/ (legacy/alternative location)
         
         Returns:
             List of paths to GGUF files found
         """
-        gguf_files = list(self.models_dir.glob("*.gguf"))
-        logger.info(f"Found {len(gguf_files)} GGUF files in {self.models_dir}")
+        gguf_files = []
+        
+        # Scan primary location: services/data/models/
+        if self.models_dir.exists():
+            found = list(self.models_dir.glob("**/*.gguf"))
+            gguf_files.extend(found)
+            logger.debug(f"Found {len(found)} GGUF files in {self.models_dir} (recursive scan)")
+        
+        # Scan legacy location: data/models/ (if different from primary)
+        if self.legacy_models_dir and self.legacy_models_dir.exists() and self.legacy_models_dir != self.models_dir:
+            found = list(self.legacy_models_dir.glob("**/*.gguf"))
+            gguf_files.extend(found)
+            logger.debug(f"Found {len(found)} GGUF files in {self.legacy_models_dir} (recursive scan)")
+        
+        # Remove duplicates (in case both paths point to same location)
+        gguf_files = list(set(gguf_files))
+        logger.info(f"Found {len(gguf_files)} total GGUF files (scanned both locations)")
         return gguf_files
     
     async def discover_all(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
@@ -139,7 +161,7 @@ class ModelDiscovery:
         Returns:
             Model metadata dictionary
         """
-        await self._initialize_db()
+        # Database initialization no longer needed (using file store)
         
         filename = model_path.name
         logger.info(f"Discovering model: {filename}")
@@ -365,11 +387,28 @@ class ModelDiscovery:
             
             results = []
             for model in models:
+                model_id = model.id
+                model_name = model_id.split("/")[-1] if "/" in model.id else model.id
+                tags_list = list(getattr(model, "tags", []))
+                
+                # Detect tool calling support (remote fetch for assurance)
+                from ..llm.tool_calling_detector import detect_tool_calling_from_metadata
+                # Function returns tuple (bool, Optional[str]) - extract just the boolean
+                supports_tool_calling, _ = detect_tool_calling_from_metadata(
+                    model_id=model_id,
+                    model_name=model_name,
+                    architecture=None,  # Not available from list_models
+                    tags=tags_list,
+                    repo_id=model_id,
+                    remote_fetch=True
+                )
+                
                 results.append({
-                    "model_id": model.id,
-                    "name": model.id.split("/")[-1] if "/" in model.id else model.id,
+                    "model_id": model_id,
+                    "name": model_name,
                     "downloads": getattr(model, "downloads", 0),
-                    "tags": list(getattr(model, "tags", []))
+                    "tags": tags_list,
+                    "supports_tool_calling": supports_tool_calling
                 })
             
             return results

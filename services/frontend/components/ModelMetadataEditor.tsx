@@ -15,7 +15,7 @@ import {
   ExternalLink,
   ChevronDown,
 } from "lucide-react";
-import { api, API_BASE } from "@/lib/api";
+import { api } from "@/lib/api";
 import { formatBytes } from "@/lib/utils";
 
 interface ModelMetadataEditorProps {
@@ -60,22 +60,22 @@ export default function ModelMetadataEditor({
 }: ModelMetadataEditorProps) {
   const [mode, setMode] = useState<EditorMode>("search");
 
-  // Manual mode fields
-  const [name, setName] = useState(model.name || "");
-  const [author, setAuthor] = useState(model.author || "");
-  const [description, setDescription] = useState(model.description || "");
-  const [repoId, setRepoId] = useState(model.repo_id || "");
+  // Manual mode fields - initialize with defaults, will be updated if model exists
+  const [name, setName] = useState(model?.name || "");
+  const [author, setAuthor] = useState(model?.author || "");
+  const [description, setDescription] = useState(model?.description || "");
+  const [repoId, setRepoId] = useState(model?.repo_id || "");
   const [huggingfaceUrl, setHuggingfaceUrl] = useState(
-    model.huggingface_url || ""
+    model?.huggingface_url || ""
   );
-  const [tags, setTags] = useState(model.tags?.join(", ") || "");
+  const [tags, setTags] = useState(model?.tags?.join(", ") || "");
 
   // Search mode fields
   const [searchQuery, setSearchQuery] = useState(
-    model.name
-      ?.replace(/[-_]/g, " ")
+    (model?.name || "")
+      .replace(/[-_]/g, " ")
       .replace(/\.(gguf|bin)$/i, "")
-      .slice(0, 50) || ""
+      .slice(0, 50)
   );
   const [searchResults, setSearchResults] = useState<HFSearchResult[]>([]);
   const [selectedRepo, setSelectedRepo] = useState<HFSearchResult | null>(null);
@@ -87,6 +87,27 @@ export default function ModelMetadataEditor({
   // Common state
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Track mousedown to prevent closing when dragging text selection outside modal
+  const [mouseDownInside, setMouseDownInside] = useState(false);
+
+  // Update state when model changes
+  useEffect(() => {
+    if (model) {
+      setName(model.name || "");
+      setAuthor(model.author || "");
+      setDescription(model.description || "");
+      setRepoId(model.repo_id || "");
+      setHuggingfaceUrl(model.huggingface_url || "");
+      setTags(model.tags?.join(", ") || "");
+      setSearchQuery(
+        (model.name || "")
+          .replace(/[-_]/g, " ")
+          .replace(/\.(gguf|bin)$/i, "")
+          .slice(0, 50)
+      );
+    }
+  }, [model]);
 
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
@@ -186,13 +207,7 @@ export default function ModelMetadataEditor({
         throw new Error("Repository ID is missing");
       }
 
-      const response = await fetch(
-        `${API_BASE}/api/models/${encodeURIComponent(repoId)}/files`
-      );
-      if (!response.ok) {
-        throw new Error(`Failed to fetch files: ${response.statusText}`);
-      }
-      const data = await response.json();
+      const data = await api.getModelFiles(repoId);
 
       // Backend returns files with 'filename' field, but we need to normalize to 'rfilename' for compatibility
       const allFiles = data.files || [];
@@ -216,8 +231,10 @@ export default function ModelMetadataEditor({
 
       setRepoFiles(ggufFiles);
 
-      const currentName =
-        model.model_id.split(/[/\\]/).pop()?.toLowerCase() || "";
+      const modelId = model.model_id || '';
+      const currentName = modelId
+        ? modelId.split(/[/\\]/).pop()?.toLowerCase() || ""
+        : "";
       const match = ggufFiles.find((f: HFFile) => {
         const fname = (f.rfilename || f.filename || "").toLowerCase();
         return (
@@ -257,8 +274,13 @@ export default function ModelMetadataEditor({
     setError(null);
 
     try {
+      const modelId = model.model_id || '';
+      if (!modelId) {
+        setError("Model ID is missing");
+        return;
+      }
       await api.linkAndOrganizeModel(
-        model.model_id,
+        modelId,
         repoId,
         selectedFile || undefined
       );
@@ -293,7 +315,12 @@ export default function ModelMetadataEditor({
           : undefined,
       };
 
-      await api.setModelMetadata(model.model_id, metadata);
+      const modelId = model.model_id || '';
+      if (!modelId) {
+        setError("Model ID is missing");
+        return;
+      }
+      await api.setModelMetadata(modelId, metadata);
       onSave();
       onClose();
     } catch (err: unknown) {
@@ -304,9 +331,6 @@ export default function ModelMetadataEditor({
       setSaving(false);
     }
   };
-
-  // Track mousedown to prevent closing when dragging text selection outside modal
-  const [mouseDownInside, setMouseDownInside] = useState(false);
 
   const handleBackdropMouseDown = (e: React.MouseEvent) => {
     // Track if mousedown was on backdrop (outside modal)
@@ -329,6 +353,11 @@ export default function ModelMetadataEditor({
     e.stopPropagation();
   };
 
+  // Early return if model is null (after all hooks)
+  if (!model) {
+    return null;
+  }
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
@@ -336,7 +365,7 @@ export default function ModelMetadataEditor({
       onMouseUp={handleBackdropMouseUp}
     >
       <div
-        className="modal-content bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] flex flex-col"
+        className="modal-content bg-white rounded shadow-2xl max-w-2xl w-full max-h-[90vh] flex flex-col"
         onMouseDown={handleContentMouseDown}
         onClick={(e) => e.stopPropagation()}
       >
@@ -349,14 +378,14 @@ export default function ModelMetadataEditor({
               </h2>
               <p
                 className="text-sm text-gray-500 mt-1 truncate max-w-md"
-                title={model.model_id}
+                title={model.model_id || 'Unknown'}
               >
-                {model.model_id}
+                {model.model_id || 'Unknown'}
               </p>
             </div>
             <button
               onClick={onClose}
-              className="p-2 rounded-lg hover:bg-gray-100 transition-colors"
+              className="p-2 rounded hover:bg-gray-100 transition-colors"
               title="Close (Esc)"
             >
               <X size={24} className="text-gray-500" />
@@ -367,7 +396,7 @@ export default function ModelMetadataEditor({
           <div className="flex gap-2">
             <button
               onClick={() => setMode("search")}
-              className={`flex-1 py-2 px-4 rounded-lg font-medium transition-colors ${
+              className={`flex-1 py-2 px-4 rounded font-medium transition-colors ${
                 mode === "search"
                   ? "bg-primary-100 text-primary-700 border-2 border-primary-300"
                   : "bg-gray-100 text-gray-600 border-2 border-transparent hover:bg-gray-200"
@@ -378,7 +407,7 @@ export default function ModelMetadataEditor({
             </button>
             <button
               onClick={() => setMode("manual")}
-              className={`flex-1 py-2 px-4 rounded-lg font-medium transition-colors ${
+              className={`flex-1 py-2 px-4 rounded font-medium transition-colors ${
                 mode === "manual"
                   ? "bg-primary-100 text-primary-700 border-2 border-primary-300"
                   : "bg-gray-100 text-gray-600 border-2 border-transparent hover:bg-gray-200"
@@ -406,12 +435,12 @@ export default function ModelMetadataEditor({
                     onChange={(e) => setSearchQuery(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && handleSearch()}
                     placeholder="e.g., mistral 7b, llama 3, noromaid..."
-                    className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
+                    className="flex-1 px-4 py-2.5 border border-gray-300 rounded focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
                   />
                   <button
                     onClick={handleSearch}
                     disabled={searching || !searchQuery.trim()}
-                    className="px-4 py-2.5 bg-primary-600 text-white rounded-lg font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+                    className="px-4 py-2.5 bg-primary-600 text-white rounded font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
                   >
                     {searching ? (
                       <Loader2 size={18} className="animate-spin" />
@@ -429,7 +458,7 @@ export default function ModelMetadataEditor({
                   <label className="block text-sm font-medium text-gray-700 mb-2">
                     Select Repository ({searchResults.length} found)
                   </label>
-                  <div className="border border-gray-200 rounded-lg max-h-48 overflow-y-auto">
+                  <div className="border border-gray-200 rounded max-h-48 overflow-y-auto">
                     {searchResults.map((repo) => {
                       const repoId = repo.id || repo.model_id || "";
                       return (
@@ -490,7 +519,7 @@ export default function ModelMetadataEditor({
                         onChange={(e) =>
                           setSelectedFile(e.target.value || null)
                         }
-                        className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 appearance-none bg-white transition-all"
+                        className="w-full px-4 py-2.5 border border-gray-300 rounded focus:ring-2 focus:ring-primary-500 focus:border-primary-500 appearance-none bg-white transition-all"
                       >
                         <option value="">Keep original filename</option>
                         {repoFiles.map((file) => {
@@ -537,7 +566,7 @@ export default function ModelMetadataEditor({
                   const repoName =
                     repoId.split("/")[1] || repoId.split("/").pop() || "";
                   return (
-                    <div className="bg-primary-50 border border-primary-200 rounded-lg p-4">
+                    <div className="bg-primary-50 border border-primary-200 rounded p-4">
                       <h4 className="font-medium text-primary-900 mb-2">
                         Ready to Link
                       </h4>
@@ -546,7 +575,7 @@ export default function ModelMetadataEditor({
                           <strong>Repository:</strong> {repoId}
                         </p>
                         <p>
-                          <strong>Your file:</strong> {model.model_id}
+                          <strong>Your file:</strong> {model.model_id || 'Unknown'}
                         </p>
                         {selectedFile && (
                           <p>
@@ -575,7 +604,7 @@ export default function ModelMetadataEditor({
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="e.g., Mistral 7B Instruct"
-                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
                 />
               </div>
 
@@ -589,7 +618,7 @@ export default function ModelMetadataEditor({
                   value={author}
                   onChange={(e) => setAuthor(e.target.value)}
                   placeholder="e.g., TheBloke, Meta, Mistral AI"
-                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
                 />
               </div>
 
@@ -603,7 +632,7 @@ export default function ModelMetadataEditor({
                   value={repoId}
                   onChange={(e) => setRepoId(e.target.value)}
                   placeholder="e.g., TheBloke/Mistral-7B-Instruct-v0.2-GGUF"
-                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
                 />
                 <p className="text-xs text-gray-500 mt-1">
                   Format: author/model-name (auto-fills URL)
@@ -620,7 +649,7 @@ export default function ModelMetadataEditor({
                   value={huggingfaceUrl}
                   onChange={(e) => setHuggingfaceUrl(e.target.value)}
                   placeholder="https://huggingface.co/..."
-                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
                 />
               </div>
 
@@ -634,7 +663,7 @@ export default function ModelMetadataEditor({
                   onChange={(e) => setDescription(e.target.value)}
                   placeholder="Brief description of the model..."
                   rows={3}
-                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all resize-none"
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all resize-none"
                 />
               </div>
 
@@ -648,7 +677,7 @@ export default function ModelMetadataEditor({
                   value={tags}
                   onChange={(e) => setTags(e.target.value)}
                   placeholder="e.g., gguf, mistral, 7b, q4_k_m"
-                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition-all"
                 />
                 <p className="text-xs text-gray-500 mt-1">
                   Separate tags with commas
@@ -659,7 +688,7 @@ export default function ModelMetadataEditor({
 
           {/* Error */}
           {error && (
-            <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+            <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">
               {error}
             </div>
           )}
@@ -671,7 +700,7 @@ export default function ModelMetadataEditor({
             <button
               type="button"
               onClick={onClose}
-              className="px-5 py-2.5 bg-white border border-gray-300 rounded-lg font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+              className="px-5 py-2.5 bg-white border border-gray-300 rounded font-medium text-gray-700 hover:bg-gray-50 transition-colors"
             >
               Cancel
             </button>
@@ -680,7 +709,7 @@ export default function ModelMetadataEditor({
               <button
                 onClick={handleLinkAndOrganize}
                 disabled={saving || !selectedRepo}
-                className="flex items-center gap-2 px-5 py-2.5 bg-primary-600 text-white rounded-lg font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className="flex items-center gap-2 px-5 py-2.5 bg-primary-600 text-white rounded font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 {saving ? (
                   <Loader2 size={18} className="animate-spin" />
@@ -693,7 +722,7 @@ export default function ModelMetadataEditor({
               <button
                 onClick={handleManualSave}
                 disabled={saving}
-                className="flex items-center gap-2 px-5 py-2.5 bg-primary-600 text-white rounded-lg font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className="flex items-center gap-2 px-5 py-2.5 bg-primary-600 text-white rounded font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 {saving ? (
                   <Loader2 size={18} className="animate-spin" />

@@ -1,7 +1,8 @@
 """Pydantic schemas for API requests and responses."""
-from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatMessage(BaseModel):
@@ -80,6 +81,20 @@ class ChatRequest(BaseModel):
     n_probs: Optional[int] = Field(None, ge=0, description="Return top N probabilities")
 
 
+class LogEntry(BaseModel):
+    """A single log entry from the backend."""
+    timestamp: float = Field(..., description="Unix timestamp of the log entry")
+    level: str = Field(..., description="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL")
+    logger: str = Field(..., description="Name of the logger that produced this log")
+    message: str = Field(..., description="Log message")
+    exception: Optional[str] = Field(None, description="Exception traceback if available")
+
+
+class BaseResponse(BaseModel):
+    """Base response model with optional logs."""
+    logs: Optional[List[LogEntry]] = Field(None, description="Request-scoped logs from the backend")
+
+
 class ChatResponse(BaseModel):
     """Chat response schema."""
     response: str = Field(..., description="Assistant response")
@@ -87,6 +102,7 @@ class ChatResponse(BaseModel):
     context_used: Optional[List[str]] = Field(None, description="Retrieved context from memory")
     tool_calls: Optional[List[Dict[str, Any]]] = Field(None, description="Tool calls made during response")
     metadata: Optional[MessageMetadata] = Field(None, description="Response metadata")
+    logs: Optional[List[LogEntry]] = Field(None, description="Request-scoped logs from the backend")
 
 
 class ConversationHistory(BaseModel):
@@ -125,12 +141,35 @@ class TTSRequest(BaseModel):
     voice: Optional[str] = Field(None, description="Voice identifier")
 
 
+class VoiceModelDownloadRequest(BaseModel):
+    """Request to download a voice/STT model asset."""
+    model_id: Optional[str] = Field(None, description="Model/voice identifier (backend-specific)")
+    url: Optional[str] = Field(None, description="Primary download URL (backend-specific)")
+    aux_url: Optional[str] = Field(None, description="Secondary download URL (backend-specific, e.g. config/metadata)")
+    force: bool = Field(False, description="Force re-download even if files already exist")
+
+
+class VoiceModelDownloadStatus(BaseModel):
+    """Status response for a model/voice download task."""
+    status: str = Field(..., description="queued|downloading|ready|error|not_found")
+    model_id: Optional[str] = Field(None, description="Model/voice identifier")
+    message: Optional[str] = Field(None, description="Human-friendly status message")
+    error: Optional[str] = Field(None, description="Error message if status=error")
+    downloaded: bool = Field(False, description="Whether required files are present")
+    files: Optional[Dict[str, str]] = Field(None, description="Downloaded file paths (if any)")
+
+
 class ModelLoadOptions(BaseModel):
-    """Model loading options schema for llama-cpp-python server.
+    """Model loading options schema for OpenAI-compatible server.
     
-    These parameters match the llama-cpp-python server config format.
+    These parameters match the OpenAI-compatible server config format.
     See: https://github.com/abetlen/llama-cpp-python
     """
+    # Capability overrides
+    supports_tool_calling_override: Optional[bool] = Field(
+        None,
+        description="Force-enable or disable tool calling flag for this model (overrides auto-detection)"
+    )
     # Core parameters
     n_ctx: Optional[int] = Field(None, ge=512, le=131072, description="Context window size")
     n_batch: Optional[int] = Field(None, ge=1, le=4096, description="Batch size for prompt processing")
@@ -164,20 +203,17 @@ class ModelLoadOptions(BaseModel):
     cache_type_v: Optional[str] = Field(None, pattern="^(f16|f32|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1)$", description="KV cache type for V")
     
     # MoE (Mixture of Experts) settings
-    # Note: n_cpu_moe is not a valid parameter for llama-cpp-python server
+    # Note: n_cpu_moe is not a valid parameter for OpenAI-compatible server
     # It was incorrectly documented as "CPU threads for MoE experts"
-    # The correct parameter is n_experts_to_use (number of experts to activate per token)
-    n_experts_to_use: Optional[int] = Field(None, ge=1, le=64, description="Number of experts to use per token (for MoE models). This specifies how many experts are activated for each token during processing.")
-    
     # Deprecated/removed - kept for backwards compatibility, will be ignored
     use_flash_attention: Optional[bool] = Field(None, description="DEPRECATED: Use flash_attn instead")
     offload_kqv: Optional[bool] = Field(None, description="DEPRECATED: Not supported by llama-cpp-python")
 
 
 class SamplerSettings(BaseModel):
-    """Complete sampler settings for llama-cpp-python server.
+    """Complete sampler settings for OpenAI-compatible server.
     
-    These parameters control text generation and match the llama-cpp-python API.
+    These parameters control text generation and match the OpenAI-compatible API.
     """
     # Basic sampling
     temperature: float = Field(0.7, ge=0.0, le=2.0, description="Sampling temperature (0=deterministic, 2=very random)")
@@ -205,6 +241,10 @@ class SamplerSettings(BaseModel):
     stop: Optional[List[str]] = Field(None, description="Stop sequences")
     seed: int = Field(-1, description="Random seed (-1=random)")
     grammar: Optional[str] = Field(None, description="GBNF grammar string for structured output")
+    
+    # Smooth Sampling - quadratic/cubic probability distribution transformation
+    smoothing_factor: Optional[float] = Field(None, ge=0.0, le=1.0, description="Smoothing factor (0.0-1.0). Lower values (0.2-0.3) = more creative. 0.0 = disabled.")
+    smoothing_curve: Optional[float] = Field(None, ge=1.0, description="Smoothing curve (1.0+). Higher = steeper curve, punishes low probability choices more. 1.0 = equivalent to only using smoothing_factor.")
     
     # Advanced parameters
     logit_bias: Optional[Dict[int, float]] = Field(None, description="Bias specific token IDs")
@@ -251,6 +291,7 @@ class AISettings(BaseModel):
     mirostat_tau: float = Field(5.0, ge=0.0, le=10.0, description="Mirostat tau")
     mirostat_eta: float = Field(0.1, ge=0.0, le=1.0, description="Mirostat eta")
     max_tokens: int = Field(512, ge=-1, le=32768, description="Max tokens")
+    stop: Optional[List[str]] = Field(None, description="Stop sequences (JSON array of strings)")
     
     # Advanced Samplers
     # DRY (Dynamic Repetition Penalty) - sequence-based repetition control
@@ -280,6 +321,9 @@ class AISettings(BaseModel):
     llm_remote_api_key: Optional[str] = Field(None, description="API key for remote endpoint (optional)")
     llm_remote_model: Optional[str] = Field(None, description="Model name/ID to use with remote endpoint")
 
+    # Streaming Mode Settings
+    streaming_mode: str = Field("non-streaming", description="Streaming mode: 'streaming' (real-time, no tool calling), 'non-streaming' (with tool calling), 'experimental' (auto-detect)")
+
 
 class AISettingsResponse(BaseModel):
     """AI settings response schema."""
@@ -308,6 +352,7 @@ class ModelInfo(BaseModel):
     downloaded_at: Optional[str] = None
     has_metadata: bool = False
     moe: Optional[Dict[str, Any]] = None  # MoE configuration from model_info.json
+    supports_tool_calling: Optional[bool] = None
 
 
 class ModelMetadata(BaseModel):

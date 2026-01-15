@@ -12,8 +12,11 @@ const nextConfig = {
   },
   // Production optimizations
   ...(process.env.NODE_ENV === 'production' && {
-    output: 'standalone',
     compress: true,
+  }),
+  // Standalone output only for Docker deployments (use NEXT_STANDALONE=true)
+  ...(process.env.NEXT_STANDALONE === 'true' && {
+    output: 'standalone',
   }),
 };
 

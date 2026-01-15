@@ -1,126 +1,213 @@
-
+"""Kokoro TTS backend implementation."""
+import logging
+import asyncio
 import io
 import subprocess
 import sys
 import platform
-import logging
-import asyncio
-import httpx
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+import numpy as np
+import soundfile as sf
+import psutil
+import shutil
+import urllib.request
 from .base import TTSBackend, TTSBackendStatus
+from ....config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
 class KokoroBackend(TTSBackend):
-    """Kokoro TTS backend - Client for external service."""
+    """Kokoro TTS backend - Native implementation using kokoro-onnx library."""
+
+    # kokoro_onnx expects a voices JSON + an ONNX model file (not voices-v1.0.bin)
+    MODEL_FILENAME = "kokoro-v0_19.onnx"
+    VOICES_FILENAME = "voices.json"
+    MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v0_19.onnx"
+    VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.json"
     
     def __init__(self):
         super().__init__("kokoro")
-        self.service_url = "http://localhost:8880"
         self._process = None
-        self._service_dir = Path(__file__).parent.parent.parent.parent.parent.parent / "services" / "tts-kokoro"
+        # Repo-bundled Kokoro assets live at: <project root>/services/tts-kokoro/
+        self._service_dir = settings.base_dir / "services" / "tts-kokoro"
         self._voice: Optional[str] = None
         self._options = {
             "speed": 1.0,
             "lang": "en-us"
         }
-        self._http_client: Optional[httpx.AsyncClient] = None
+        self._kokoro: Optional[Any] = None
+        self._model_path: Optional[Path] = None
+        self._voices_path: Optional[Path] = None
+        self._download_status: Dict[str, Any] = {
+            "status": "not_found",
+            "model_id": "kokoro",
+            "downloaded": False,
+        }
     
-    async def start_service(self) -> bool:
-        """Start the external Kokoro service."""
-        if await self.is_service_running():
-            return True
-            
+    def _find_model_files(self) -> tuple[Optional[Path], Optional[Path]]:
+        """Find Kokoro model and voices files."""
+        # Preferred: gateway-managed voice model directory
+        preferred_dir = settings.voice_models_dir / "kokoro"
+        model_path = preferred_dir / self.MODEL_FILENAME
+        voices_path = preferred_dir / self.VOICES_FILENAME
+        if model_path.exists() and voices_path.exists():
+            return model_path, voices_path
+
+        # Fallback: repo-bundled service directory (this repo ships these files)
+        model_path = self._service_dir / self.MODEL_FILENAME
+        voices_path = self._service_dir / self.VOICES_FILENAME
+        if model_path.exists() and voices_path.exists():
+            return model_path, voices_path
+        
+        # Check models directory
+        if settings.models_dir.exists():
+            for model_file in settings.models_dir.rglob(self.MODEL_FILENAME):
+                voices_file = model_file.parent / self.VOICES_FILENAME
+                if voices_file.exists():
+                    return model_file, voices_file
+        
+        return None, None
+
+    def _ensure_seed_assets(self) -> bool:
+        """
+        Ensure Kokoro assets exist in the gateway-managed voice model directory.
+        If repo-bundled assets are missing, auto-download from the official kokoro-onnx release.
+        """
         try:
-            logger.info("Starting Kokoro service...")
-            venv_python = self._service_dir / ".venv" / ("Scripts" if platform.system() == "Windows" else "bin") / "python"
-            if not venv_python.exists():
-                venv_python = self._service_dir / ".venv" / ("Scripts" if platform.system() == "Windows" else "bin") / "python.exe"
-            
-            if not venv_python.exists():
-                logger.error(f"Kokoro venv python not found at {venv_python}")
-                return False
+            target_dir = settings.voice_models_dir / "kokoro"
+            target_dir.mkdir(parents=True, exist_ok=True)
 
-            # Start process detached
-            if platform.system() == "Windows":
-                creationflags = subprocess.CREATE_NEW_CONSOLE
-                self._process = subprocess.Popen(
-                    [str(venv_python), "main.py"],
-                    cwd=str(self._service_dir),
-                    creationflags=creationflags
-                )
-            else:
-                self._process = subprocess.Popen(
-                    [str(venv_python), "main.py"],
-                    cwd=str(self._service_dir),
-                    start_new_session=True
-                )
-            
-            # Wait for startup
-            for _ in range(10):
-                await asyncio.sleep(1)
-                if await self.is_service_running():
-                    logger.info("Kokoro service started successfully")
-                    return True
-            
-            logger.error("Kokoro service failed to start (timeout)")
-            return False
-            
+            src_model = self._service_dir / self.MODEL_FILENAME
+            src_voices = self._service_dir / self.VOICES_FILENAME
+
+            dst_model = target_dir / self.MODEL_FILENAME
+            dst_voices = target_dir / self.VOICES_FILENAME
+
+            # Prefer copying bundled assets if present
+            if src_model.exists() and not dst_model.exists():
+                shutil.copy2(src_model, dst_model)
+            if src_voices.exists() and not dst_voices.exists():
+                shutil.copy2(src_voices, dst_voices)
+
+            # Otherwise, download missing files
+            if not dst_model.exists():
+                logger.info("Downloading Kokoro model to %s", dst_model)
+                urllib.request.urlretrieve(self.MODEL_URL, dst_model)
+            if not dst_voices.exists():
+                logger.info("Downloading Kokoro voices to %s", dst_voices)
+                urllib.request.urlretrieve(self.VOICES_URL, dst_voices)
+
+            return dst_model.exists() and dst_voices.exists()
         except Exception as e:
-            logger.error(f"Failed to start Kokoro service: {e}")
+            logger.warning(f"Could not seed Kokoro assets: {e}")
             return False
 
-    async def stop_service(self) -> bool:
-        """Stop the external Kokoro service."""
-        # This is tricky because we might not have the handle if it was started externally
-        # For now, we can't easily stop it unless we track the PID or use a kill command
-        # But we can at least try if we have the process handle
-        if self._process:
-            self._process.terminate()
-            self._process = None
-            return True
-        return False
+    def get_download_status(self) -> Dict[str, Any]:
+        """Get current Kokoro model download status."""
+        # Refresh based on file presence
+        model_path, voices_path = self._find_model_files()
+        if model_path and voices_path and model_path.exists() and voices_path.exists():
+            self._download_status = {
+                "status": "ready",
+                "model_id": "kokoro",
+                "downloaded": True,
+                "files": {"model": str(model_path), "voices": str(voices_path)},
+            }
+        return self._download_status
+
+    async def download_model(self, force: bool = False) -> Dict[str, Any]:
+        """Download Kokoro model assets (onnx + voices.json) into voice_models_dir."""
+        self._download_status = {
+            "status": "downloading",
+            "model_id": "kokoro",
+            "downloaded": False,
+            "message": "Downloading Kokoro model assets...",
+        }
+
+        target_dir = settings.voice_models_dir / "kokoro"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dst_model = target_dir / self.MODEL_FILENAME
+        dst_voices = target_dir / self.VOICES_FILENAME
+
+        loop = asyncio.get_event_loop()
+
+        def _download():
+            if force:
+                if dst_model.exists():
+                    dst_model.unlink()
+                if dst_voices.exists():
+                    dst_voices.unlink()
+            # Use shared helper to copy bundled assets or fetch from URL
+            self._ensure_seed_assets()
+
+        try:
+            await loop.run_in_executor(None, _download)
+            return self.get_download_status()
+        except Exception as e:
+            self._download_status = {
+                "status": "error",
+                "model_id": "kokoro",
+                "downloaded": False,
+                "error": str(e),
+            }
+            return self._download_status
 
     async def is_service_running(self) -> bool:
-        """Check if service is running via health check."""
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(f"{self.service_url}/health")
-                return response.status_code == 200
-        except Exception as e:
-            # logger.debug(f"Kokoro health check failed: {e}")
-            return False
+        """Check if Kokoro is initialized (for compatibility)."""
+        return self._kokoro is not None
 
     async def initialize(self) -> bool:
-        """Initialize connection to Kokoro service."""
+        """Initialize Kokoro TTS backend."""
         if self.status == TTSBackendStatus.READY:
             return True
         
         self.status = TTSBackendStatus.INITIALIZING
         
-        # Check if service is running
-        if not await self.is_service_running():
-            self.error_message = "Kokoro service not running (Port 8880). Start the Kokoro service first."
-            self.status = TTSBackendStatus.ERROR
-            return False
-        
-        # Create HTTP client
         try:
-            self._http_client = httpx.AsyncClient(
-                base_url=self.service_url,
-                timeout=60.0
-            )
+            from kokoro_onnx import Kokoro
+            
+            # Find model files
+            model_path, voices_path = self._find_model_files()
+            
+            if not model_path or not voices_path:
+                # Try to seed from repo-bundled assets into voice_models_dir
+                self._ensure_seed_assets()
+                model_path, voices_path = self._find_model_files()
+                if not model_path or not voices_path:
+                    self.error_message = (
+                        "Kokoro model files not found. Please ensure kokoro-v1.0.onnx and voices-v1.0.bin are available."
+                    )
+                    self.status = TTSBackendStatus.ERROR
+                    return False
+        
+            self._model_path = model_path
+            self._voices_path = voices_path
+            
+            # Initialize Kokoro
+            # Run in executor since it might be CPU-intensive
+            loop = asyncio.get_event_loop()
+            
+            def _init():
+                return Kokoro(str(model_path), str(voices_path))
+            
+            self._kokoro = await loop.run_in_executor(None, _init)
+            
             self.status = TTSBackendStatus.READY
             self.error_message = None
+            logger.info(f"Kokoro TTS initialized with model: {model_path}")
             return True
+        except ImportError as e:
+            logger.error(f"kokoro-onnx not installed: {e}")
+            self.error_message = "kokoro-onnx library not installed"
+            self.status = TTSBackendStatus.ERROR
+            return False
         except Exception as e:
-            logger.error(f"Failed to initialize Kokoro HTTP client: {e}")
+            logger.error(f"Failed to initialize Kokoro: {e}")
             self.error_message = f"Failed to initialize: {e}"
-        self.status = TTSBackendStatus.ERROR
-        return False
+            self.status = TTSBackendStatus.ERROR
+            return False
     
     async def synthesize(
         self,
@@ -128,100 +215,74 @@ class KokoroBackend(TTSBackend):
         voice: Optional[str] = None,
         **kwargs
     ) -> bytes:
-        """Synthesize text using Kokoro TTS via HTTP API."""
+        """Synthesize text using Kokoro TTS natively."""
         if not self.is_ready:
             await self.initialize()
         
         if not self.is_ready:
             raise RuntimeError(f"Kokoro TTS backend not ready: {self._error_message}")
         
-        # Ensure HTTP client is initialized
-        if not self._http_client:
-            # Try to reinitialize
-            try:
-                self._http_client = httpx.AsyncClient(
-                    base_url=self.service_url,
-                    timeout=60.0
-                )
-            except Exception as e:
-                raise RuntimeError(f"Kokoro HTTP client not initialized: {e}")
+        if not self._kokoro:
+            raise RuntimeError("Kokoro not initialized")
         
+        # Use voice from parameter or stored voice or default
+        selected_voice = voice or self._voice or "af_bella"
+
+        # Resolve display name to actual voice ID
+        try:
+            available_voices = self.get_available_voices()
+            voice_found = False
+            for v in available_voices:
+                if v.get("id") == selected_voice:
+                    voice_found = True
+                    selected_voice = v.get("id")
+                    break
+            
+            # If not found, try to match by display name
+            if not voice_found:
+                normalized = selected_voice.lower().replace(" ", "_")
+                for v in available_voices:
+                    voice_id = v.get("id", "")
+                    voice_name = v.get("name", "")
+                    if (
+                        voice_id == normalized
+                        or voice_id == selected_voice
+                        or voice_name.lower() == selected_voice.lower()
+                    ):
+                        selected_voice = voice_id
+                        voice_found = True
+                        break
+            
+            # If still not found, use default
+            if not voice_found:
+                logger.warning(f"Voice '{selected_voice}' not found, using af_bella")
+                selected_voice = "af_bella"
+        except Exception as e:
+            logger.warning(f"Failed to resolve Kokoro voice: {e}, using af_bella")
+            selected_voice = "af_bella"
+            
         self._is_generating = True
         
         try:
-            # Use voice from parameter or stored voice
-            # ALWAYS resolve to actual voice ID from available voices
-            selected_voice = voice or self._voice or "af_bella"
+            # Use Kokoro library directly
+            loop = asyncio.get_event_loop()
             
-            # Resolve display name to actual voice ID
-            try:
-                # Get available voices
-                available_voices = self.get_available_voices()
-                    
-                # First try exact match on ID
-                voice_found = False
-                for v in available_voices:
-                    if v.get("id") == selected_voice:
-                        voice_found = True
-                        selected_voice = v.get("id")
-                        break
+            def _synthesize():
+                samples, sample_rate = self._kokoro.create(
+                    text,
+                    voice=selected_voice,
+                    speed=self._options.get("speed", 1.0),
+                    lang=self._options.get("lang", "en-us")
+                )
                 
-                # If not found, try to match by display name
-                if not voice_found:
-                    # Convert display name format to ID format
-                    # "Af Bella" -> "af_bella"
-                    normalized = selected_voice.lower().replace(" ", "_")
-                    for v in available_voices:
-                        voice_id = v.get("id", "")
-                        voice_name = v.get("name", "")
-                        if (voice_id == normalized or 
-                            voice_id == selected_voice or
-                            voice_name.lower() == selected_voice.lower()):
-                            selected_voice = voice_id
-                            voice_found = True
-                            break
-                
-                # If still not found, use default
-                if not voice_found:
-                    logger.warning(f"Voice '{selected_voice}' not found, using af_bella")
-                    selected_voice = "af_bella"
-            except Exception as e:
-                logger.warning(f"Failed to resolve Kokoro voice: {e}, using af_bella")
-                selected_voice = "af_bella"
+                # Convert to WAV bytes
+                buffer = io.BytesIO()
+                sf.write(buffer, samples, sample_rate, format='WAV')
+                buffer.seek(0)
+                return buffer.read()
             
-            # Prepare request payload
-            payload = {
-                "text": text,
-                "voice": selected_voice,
-                "speed": self._options.get("speed", 1.0),
-                "lang": self._options.get("lang", "en-us")
-            }
-            
-            logger.debug(f"Kokoro TTS request: POST {self.service_url}/synthesize with voice={selected_voice}")
-                                    
-            # Make HTTP request to Kokoro service
-            response = await self._http_client.post(
-                "/synthesize",
-                json=payload,
-                timeout=60.0
-            )
-            
-            if response.status_code != 200:
-                error_text = response.text
-                logger.error(f"Kokoro TTS API error: {response.status_code} - {error_text}")
-                raise RuntimeError(f"Kokoro TTS API error: {response.status_code} - {error_text}")
-            
-            # Return audio data
-            return response.content
-        except httpx.TimeoutException as e:
-            logger.error(f"Kokoro TTS API request timed out: {e}")
-            raise RuntimeError(f"Kokoro TTS service request timed out: {str(e)}")
-        except httpx.ConnectError as e:
-            logger.error(f"Kokoro TTS API connection failed: {e}")
-            raise RuntimeError(f"Failed to connect to Kokoro TTS service at {self.service_url}: {str(e)}")
-        except httpx.RequestError as e:
-            logger.error(f"Kokoro TTS API request failed: {e}")
-            raise RuntimeError(f"Failed to connect to Kokoro TTS service: {str(e)}")
+            audio_data = await loop.run_in_executor(None, _synthesize)
+            return audio_data
         except Exception as e:
             logger.error(f"Kokoro TTS synthesis failed: {e}")
             raise
@@ -229,97 +290,21 @@ class KokoroBackend(TTSBackend):
             self._is_generating = False
     
     def get_available_voices(self) -> List[Dict[str, Any]]:
-        """Get available Kokoro voices from the service API (synchronous wrapper)."""
-        # This is a synchronous method, but we need to fetch from HTTP API
-        # Use a simple synchronous HTTP request
-        try:
-            import requests
-            response = requests.get(f"{self.service_url}/voices", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                voice_list = data.get("voices", [])
-                voices = []
-                for voice_id in voice_list:
-                    voices.append({
-                        "id": voice_id,
-                        "name": voice_id.replace('_', ' ').title(),
-                        "language": self._parse_voice_language(voice_id),
-                        "accent": self._parse_voice_accent(voice_id)
-                    })
-                return voices
-        except Exception as e:
-            logger.debug(f"Failed to fetch voices from API: {e}, using fallback list")
-        
-        # Fallback: return hardcoded list of known voices
-        real_voices = [
-            "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica", "af_kore",
-            "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
-            "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael",
-            "am_onyx", "am_puck", "am_santa",
-            "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
-            "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
-            "ef_dora", "em_alex", "em_santa",
-            "ff_siwis",
-            "hf_alpha", "hf_beta",
-            "hm_omega", "hm_psi",
-            "if_sara", "im_nicola",
-            "jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro",
-            "jm_kumo",
-            "pf_dora", "pm_alex", "pm_santa",
-            "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi"
+        """Get available Kokoro voices."""
+        # Hardcoded list of voices supported by Kokoro v1.0
+        voices = [
+            {"id": "af_bella", "name": "Af Bella", "language": "en-us"},
+            {"id": "af_sarah", "name": "Af Sarah", "language": "en-us"},
+            {"id": "am_adam", "name": "Am Adam", "language": "en-us"},
+            {"id": "am_michael", "name": "Am Michael", "language": "en-us"},
+            {"id": "bf_emma", "name": "Bf Emma", "language": "en-us"},
+            {"id": "bf_isabella", "name": "Bf Isabella", "language": "en-us"},
+            {"id": "bm_george", "name": "Bm George", "language": "en-us"},
+            {"id": "bm_lewis", "name": "Bm Lewis", "language": "en-us"},
+            {"id": "af_nicole", "name": "Af Nicole", "language": "en-us"},
+            {"id": "af_sky", "name": "Af Sky", "language": "en-us"}
         ]
-        
-        voices = []
-        for voice_id in real_voices:
-            voices.append({
-                "id": voice_id,
-                "name": voice_id.replace('_', ' ').title(),
-                "language": self._parse_voice_language(voice_id),
-                "accent": self._parse_voice_accent(voice_id)
-            })
         return voices
-    
-    def _parse_voice_language(self, voice_id: str) -> str:
-        """Parse language from voice ID."""
-        # Voice IDs follow pattern: {language_prefix}_{name}
-        # Language prefixes: af, am, bf, bm, ef, em, ff, hf, hm, if, im, jf, jm, pf, pm, zf
-        # af/am = English (American), bf/bm = English (British), ef/em = English (other),
-        # ff = French, hf/hm = Hindi, if/im = Italian, jf/jm = Japanese, pf/pm = Portuguese, zf = Chinese
-        prefix = voice_id.split('_')[0] if '_' in voice_id else voice_id
-        
-        lang_map = {
-            'af': 'en', 'am': 'en',  # American English
-            'bf': 'en', 'bm': 'en',  # British English
-            'ef': 'en', 'em': 'en',  # English (other)
-            'ff': 'fr',  # French
-            'hf': 'hi', 'hm': 'hi',  # Hindi
-            'if': 'it', 'im': 'it',  # Italian
-            'jf': 'ja', 'jm': 'ja',  # Japanese
-            'pf': 'pt', 'pm': 'pt',  # Portuguese
-            'zf': 'zh',  # Chinese
-        }
-        return lang_map.get(prefix, 'en')
-    
-    def _parse_voice_accent(self, voice_id: str) -> str:
-        """Parse accent/gender from voice ID."""
-        # f = female, m = male
-        prefix = voice_id.split('_')[0] if '_' in voice_id else voice_id
-        
-        if len(prefix) >= 2:
-            gender = 'female' if prefix[1] == 'f' else 'male'
-            region = {
-                'af': 'us', 'am': 'us',  # American
-                'bf': 'gb', 'bm': 'gb',  # British
-                'ef': 'en', 'em': 'en',  # English
-                'ff': 'fr',  # French
-                'hf': 'in', 'hm': 'in',  # Hindi
-                'if': 'it', 'im': 'it',  # Italian
-                'jf': 'jp', 'jm': 'jp',  # Japanese
-                'pf': 'pt', 'pm': 'pt',  # Portuguese
-                'zf': 'cn',  # Chinese
-            }.get(prefix, 'neutral')
-            return f"{gender}_{region}"
-        return "neutral"
     
     def get_options(self) -> Dict[str, Any]:
         """Get Kokoro TTS options."""
@@ -334,7 +319,7 @@ class KokoroBackend(TTSBackend):
             },
             "lang": {
                 "value": self._options.get("lang", "en-us"),
-                "description": "Language code (e.g., en-us, en-gb)"
+                "description": "Language code"
             }
         }
     
@@ -344,22 +329,86 @@ class KokoroBackend(TTSBackend):
             if "voice" in options:
                 self._voice = options["voice"]
             
-            # Handle structured options (with value key) or direct values
-            for key in ["speed", "lang"]:
-                if key in options:
-                    value = options[key]
-                    # If it's a dict with 'value' key, extract the value
-                    if isinstance(value, dict) and "value" in value:
-                        value = value["value"]
-                    
-                    if key == "speed" and isinstance(value, (int, float)):
-                        self._options["speed"] = max(0.5, min(2.0, float(value)))
-                    elif key == "lang" and isinstance(value, str):
-                        self._options["lang"] = value
+            if "speed" in options:
+                value = options["speed"]
+                if isinstance(value, dict) and "value" in value:
+                    value = value["value"]
+                if isinstance(value, (int, float)):
+                    self._options["speed"] = max(0.5, min(2.0, float(value)))
+            
+            if "lang" in options:
+                value = options["lang"]
+                if isinstance(value, dict) and "value" in value:
+                    value = value["value"]
+                self._options["lang"] = str(value)
             
             return True
         except Exception as e:
             logger.error("Error setting Kokoro options: %s", str(e))
             return False
 
-
+    def unload_model(self) -> bool:
+        """Unload Kokoro model from memory."""
+        try:
+            self._kokoro = None
+            self._model_path = None
+            self._voices_path = None
+            self.status = TTSBackendStatus.NOT_INITIALIZED
+            self._initialized = False
+            logger.info("Kokoro model unloaded")
+            return True
+        except Exception as e:
+            logger.error(f"Error unloading Kokoro model: {e}")
+            return False
+    
+    def get_model_status(self) -> Dict[str, Any]:
+        """Get current Kokoro model status."""
+        status = {
+            "loaded": self.status == TTSBackendStatus.READY and self._kokoro is not None,
+            "model_path": str(self._model_path) if self._model_path else None,
+            "voices_path": str(self._voices_path) if self._voices_path else None,
+            "voice": self._voice,
+            "status": self.status.value if hasattr(self.status, 'value') else str(self.status)
+        }
+        
+        total_size_mb = 0
+        if self._model_path and self._model_path.exists():
+            stat = self._model_path.stat()
+            total_size_mb += stat.st_size / (1024 * 1024)
+        if self._voices_path and self._voices_path.exists():
+            stat = self._voices_path.stat()
+            total_size_mb += stat.st_size / (1024 * 1024)
+        
+        status["size_mb"] = round(total_size_mb, 2)
+        status["memory_mb"] = round(total_size_mb * 2, 2)  # Approximate memory usage (2x file size)
+        
+        return status
+    
+    def get_memory_usage(self) -> Dict[str, Any]:
+        """Get memory usage for Kokoro backend."""
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / (1024 * 1024)
+            
+            # Estimate model memory (rough estimate based on file sizes)
+            model_memory_mb = 0
+            if self._model_path and self._model_path.exists() and self._voices_path and self._voices_path.exists():
+                model_stat = self._model_path.stat()
+                voices_stat = self._voices_path.stat()
+                total_size = (model_stat.st_size + voices_stat.st_size) / (1024 * 1024)
+                model_memory_mb = total_size * 2  # Approximate (2x file size in memory)
+            
+            return {
+                "total_memory_mb": round(memory_mb, 2),
+                "model_memory_mb": round(model_memory_mb, 2),
+                "base_memory_mb": round(memory_mb - model_memory_mb, 2) if model_memory_mb > 0 else round(memory_mb, 2)
+            }
+        except Exception as e:
+            logger.error(f"Error getting Kokoro memory usage: {e}")
+            return {
+                "total_memory_mb": 0,
+                "model_memory_mb": 0,
+                "base_memory_mb": 0,
+                "error": str(e)
+            }

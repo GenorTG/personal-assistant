@@ -4,8 +4,9 @@ from datetime import datetime
 import httpx
 import json
 import logging
-from ..memory.client import MemoryServiceClient
+from ..memory.store import MemoryStore
 from ..tools.manager import ToolManager
+from .message_builder import MessageBuilder
 from ...utils.helpers import generate_conversation_id, get_timestamp
 from ...config.settings import settings
 
@@ -18,7 +19,7 @@ class ChatManager:
     def __init__(
         self,
         service_manager: Any,  # ServiceManager instance
-        memory_store: MemoryServiceClient,
+        memory_store: MemoryStore,
         tool_manager: Optional[ToolManager] = None
     ):
         logger.info("      Setting up ChatManager...")
@@ -102,6 +103,10 @@ class ChatManager:
             # Generate default name
             await self._generate_conversation_name(conversation_id)
         
+        # Validate message
+        if not message or not isinstance(message, str) or len(message.strip()) == 0:
+            raise ValueError("Message must be a non-empty string")
+        
         # Store user message
         user_msg = {
             "role": "user",
@@ -117,186 +122,270 @@ class ChatManager:
             conversation_id=conversation_id
         )
         
+        # Validate context format
+        if context is not None:
+            if not isinstance(context, dict):
+                logger.warning("Context is not a dict, ignoring: %s", type(context))
+                context = None
+            elif "retrieved_messages" in context and not isinstance(context["retrieved_messages"], list):
+                logger.warning("Context 'retrieved_messages' is not a list, ignoring")
+                context = {"retrieved_messages": []}
+        
         # Get conversation history
         history = self.conversations[conversation_id]
         
-        # Build messages for OpenAI API
-        messages = self._build_messages(message, history, context)
-        
-        # Get LLM settings - use provided sampler_params or fall back to saved settings
-        llm_manager = self.service_manager.llm_manager
-        sampler_settings = llm_manager.sampler_settings
-        
-        # Build request parameters - use sampler_params if provided, otherwise use saved settings
-        if sampler_params:
-            request_params = {
-                "temperature": sampler_params.get("temperature", sampler_settings.temperature),
-                "top_p": sampler_params.get("top_p", sampler_settings.top_p),
-                "max_tokens": sampler_params.get("max_tokens", sampler_settings.max_tokens),
-            }
-            
-            # Add optional parameters if present
-            if "top_k" in sampler_params:
-                request_params["top_k"] = sampler_params["top_k"]
-            if "min_p" in sampler_params:
-                request_params["min_p"] = sampler_params["min_p"]
-            if "repeat_penalty" in sampler_params:
-                request_params["repeat_penalty"] = sampler_params["repeat_penalty"]
-            if "presence_penalty" in sampler_params:
-                request_params["presence_penalty"] = sampler_params["presence_penalty"]
-            if "frequency_penalty" in sampler_params:
-                request_params["frequency_penalty"] = sampler_params["frequency_penalty"]
-            if "typical_p" in sampler_params:
-                request_params["typical_p"] = sampler_params["typical_p"]
-            if "tfs_z" in sampler_params:
-                request_params["tfs_z"] = sampler_params["tfs_z"]
-            if "mirostat_mode" in sampler_params:
-                request_params["mirostat_mode"] = sampler_params["mirostat_mode"]
-                if "mirostat_tau" in sampler_params:
-                    request_params["mirostat_tau"] = sampler_params["mirostat_tau"]
-                if "mirostat_eta" in sampler_params:
-                    request_params["mirostat_eta"] = sampler_params["mirostat_eta"]
+        # Validate history format
+        if not isinstance(history, list):
+            logger.error("History is not a list: %s", type(history))
+            history = []
         else:
-            # Use saved settings
-            request_params = {
-                "temperature": sampler_settings.temperature,
-                "top_p": sampler_settings.top_p,
-                "top_k": sampler_settings.top_k,
-                "max_tokens": sampler_settings.max_tokens,
-                "repeat_penalty": sampler_settings.repeat_penalty,
-            }
+            # Ensure all messages have required fields
+            for i, msg in enumerate(history):
+                if not isinstance(msg, dict):
+                    logger.warning("Message %d is not a dict, skipping: %s", i, msg)
+                    continue
+                if 'role' not in msg or 'content' not in msg:
+                    logger.warning("Message %d missing 'role' or 'content', fixing", i)
+                    msg.setdefault('role', 'user')
+                    msg.setdefault('content', '')
         
-        # Prepare tools if available and model supports tool calling
-        tools = None
-        if self.tool_manager and llm_manager.supports_tool_calling:
-            tool_list = await self.tool_manager.list_tools()
-            if tool_list:
-                tools = [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": t["name"],
-                            "description": t["description"],
-                            "parameters": t.get("schema", {})
-                        }
-                    }
-                    for t in tool_list
-                ]
-        elif self.tool_manager and not llm_manager.supports_tool_calling:
-            logger.debug("Tool calling disabled - model does not support function calling")
+        # Get LLM settings
+        llm_manager = self.service_manager.llm_manager
         
-        # Call gateway's proxy endpoint (which handles vector store integration)
+        # Update sampler settings if provided
+        if sampler_params:
+            llm_manager.update_settings(sampler_params)
+        
+        # Call LLM manager directly (merged from LLM service, no HTTP)
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                # Use gateway's own proxy endpoint
-                gateway_url = f"http://127.0.0.1:{settings.port}"
-                response = await client.post(
-                    f"{gateway_url}/v1/chat/completions",
-                    json={
-                        "model": llm_manager.current_model_name or "current_model",
-                        "messages": messages,
-                        **request_params,  # Include all sampler parameters
-                        "tools": tools,
-                        "stream": False
-                    },
-                    headers={
-                        "X-Conversation-ID": conversation_id
-                    }
+            # Check if model is loaded
+            if not llm_manager.is_model_loaded():
+                raise RuntimeError("No model loaded. Please load a model first.")
+            
+            # Prepare tool results (empty for initial call)
+            tool_results = None
+            
+            # Call LLM manager's generate_response directly
+            # It expects: message (str), history (List[Dict]), context (Dict), tool_results (List[Dict])
+            # Let the LLM decide whether to use tools - no forced detection
+            response = await llm_manager.generate_response(
+                message=message,
+                history=history,
+                context=context,
+                tool_results=tool_results,
+                stream=False
+            )
+            
+            # Validate response
+            if response is None:
+                raise RuntimeError("LLM generate_response returned None")
+            if not isinstance(response, dict):
+                raise RuntimeError(f"LLM generate_response returned invalid type: {type(response)}")
+            
+            assistant_content = response.get("response", "")
+            tool_calls_data = response.get("tool_calls", [])
+            
+            logger.info(f"[CHAT MANAGER] LLM response received - content length: {len(assistant_content)}, tool_calls: {len(tool_calls_data) if tool_calls_data else 0}")
+            
+            # Parse tool calls from OpenAI format
+            parsed_tool_calls = []
+            if tool_calls_data:
+                logger.info(f"[CHAT MANAGER] ✅ Tool calls received from LLM manager: {len(tool_calls_data)}")
+                for tc in tool_calls_data:
+                    try:
+                        # OpenAI format: {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
+                        function_data = tc.get("function", {})
+                        arguments_str = function_data.get("arguments", "{}")
+                        # Arguments come as JSON string from OpenAI
+                        try:
+                            arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        
+                        parsed_tool_calls.append({
+                            "id": tc.get("id"),
+                            "type": tc.get("type", "function"),
+                            "function": {
+                                "name": function_data.get("name"),
+                                "arguments": arguments_str  # Keep as string for OpenAI format
+                            }
+                        })
+                    except (KeyError, AttributeError) as e:
+                        logger.warning(f"Failed to parse tool call: {e}")
+                        continue
+            
+            logger.info(f"Parsed tool calls: {len(parsed_tool_calls)}")
+            for i, tc in enumerate(parsed_tool_calls):
+                logger.info(f"  Tool call {i+1}: {tc.get('function', {}).get('name')} (id: {tc.get('id')})")
+            
+            # Handle tool calls if present
+            initial_content = assistant_content
+            tool_execution_results = []  # Initialize to avoid UnboundLocalError
+            
+            if parsed_tool_calls and self.tool_manager:
+                logger.info(f"[CHAT MANAGER] 🔧 Executing {len(parsed_tool_calls)} tool call(s)...")
+                for i, tc in enumerate(parsed_tool_calls):
+                    args_str = tc.get('function', {}).get('arguments', '{}')
+                    try:
+                        args_dict = json.loads(args_str) if isinstance(args_str, str) else args_str
+                        logger.info(f"[CHAT MANAGER]   Tool call {i+1}: {tc.get('function', {}).get('name', 'unknown')}")
+                        logger.info(f"[CHAT MANAGER]     Arguments (raw): {args_str}")
+                        logger.info(f"[CHAT MANAGER]     Arguments (parsed): {json.dumps(args_dict, indent=6)}")
+                    except:
+                        logger.info(f"[CHAT MANAGER]   Tool call {i+1}: {tc.get('function', {}).get('name', 'unknown')} with args: {args_str}")
+                # Execute tools
+                logger.info(f"[CHAT MANAGER] Calling tool_manager.execute_tools with {len(parsed_tool_calls)} tool call(s)")
+                tool_execution_results = await self.tool_manager.execute_tools(
+                    tool_calls=parsed_tool_calls,
+                    conversation_id=conversation_id
                 )
                 
-                if response.status_code != 200:
-                    raise RuntimeError(f"LLM request failed: {response.text}")
+                logger.info(f"[CHAT MANAGER] ✅ Tool execution completed - received {len(tool_execution_results) if tool_execution_results else 0} result(s)")
+                if tool_execution_results:
+                    for i, result in enumerate(tool_execution_results):
+                        logger.info(f"[CHAT MANAGER]   Result {i+1}: {result.get('name')} - success={result.get('success')}, error={result.get('error')}")
+            elif parsed_tool_calls and not self.tool_manager:
+                logger.warning(f"[CHAT MANAGER] ⚠️  Tool calls detected but tool_manager is not available!")
+                tool_execution_results = []  # Ensure it's initialized
+            else:
+                # No tool calls
+                logger.info(f"[CHAT MANAGER] No tool calls in response")
+                tool_execution_results = []  # Ensure it's initialized
+            
+            # Validate tool execution results (only if we have tool calls and results)
+            if parsed_tool_calls:
+                if tool_execution_results is None:
+                    logger.warning("tool_manager.execute_tools returned None, skipping tool results")
+                    tool_execution_results = []
+                if not isinstance(tool_execution_results, list):
+                    logger.warning(f"tool_manager.execute_tools returned invalid type: {type(tool_execution_results)}, skipping tool results")
+                    tool_execution_results = []
                 
-                response_data = response.json()
-                choice = response_data.get("choices", [{}])[0]
-                message_obj = choice.get("message", {})
-                assistant_content = message_obj.get("content", "")
-                tool_calls_data = message_obj.get("tool_calls")
+                # Format tool results for LLM
+                tool_results = []
+                for i, res in enumerate(tool_execution_results):
+                    if res is None:
+                        logger.warning(f"Skipping None result at index {i} in tool_execution_results")
+                        continue
+                    if not isinstance(res, dict):
+                        logger.warning(f"Skipping invalid result type at index {i}: {type(res)}")
+                        continue
+                    
+                    tool_name = res.get("name", "unknown")
+                    success = res.get("success", False)
+                    error = res.get("error")
+                    result_data = res.get("result")
+                    
+                    logger.info(f"  Tool result {i+1} ({tool_name}): success={success}, error={error is not None}")
+                    if error:
+                        logger.warning(f"    Error: {error}")
+                    if result_data:
+                        logger.debug(f"    Result: {str(result_data)[:200]}...")
+                    
+                    tool_results.append({
+                        "id": res.get("id"),
+                        "name": tool_name,
+                        "result": result_data if success else f"Error: {error}",
+                        "success": success,
+                        "error": error,
+                        "arguments": res.get("arguments", {})  # Include original arguments
+                    })
                 
-                # Parse tool calls
-                parsed_tool_calls = []
-                if tool_calls_data:
-                    for tc in tool_calls_data:
-                        parsed_tool_calls.append({
-                            "name": tc.get("function", {}).get("name"),
-                            "arguments": json.loads(tc.get("function", {}).get("arguments", "{}")),
-                            "id": tc.get("id")
-                        })
+                logger.info(f"Formatted {len(tool_results)} tool result(s) for LLM follow-up")
                 
-                # Handle tool calls if present
-                initial_content = assistant_content  # Preserve initial response content
-                if parsed_tool_calls and self.tool_manager:
-                    tool_results = await self.tool_manager.execute_tools(
-                        parsed_tool_calls,
-                        conversation_id=conversation_id
+                # CRITICAL: Before making follow-up call, we need to add the assistant message with tool_calls to history
+                # This ensures the history is correct for the follow-up call
+                assistant_msg_with_tool_calls = {
+                    "role": "assistant",
+                    "content": initial_content if initial_content else None,
+                    "tool_calls": parsed_tool_calls,  # Store in OpenAI format
+                    "timestamp": get_timestamp()
+                }
+                # Add to history temporarily for follow-up call
+                history_with_tool_calls = history + [assistant_msg_with_tool_calls]
+                
+                # Make follow-up call with tool results
+                logger.info("Making follow-up LLM call with tool results...")
+                logger.debug(f"Follow-up history length: {len(history_with_tool_calls)}, last message role: {history_with_tool_calls[-1].get('role') if history_with_tool_calls else 'none'}")
+                follow_up_response = None
+                follow_up_content = ""
+                try:
+                    follow_up_response = await llm_manager.generate_response(
+                        message=message,
+                        history=history_with_tool_calls,
+                        context=context,
+                        tool_results=tool_results,
+                        stream=False
                     )
-                    # Continue conversation with tool results
-                    # Add the assistant's initial message (with tool calls) to conversation history
-                    assistant_msg_with_tools = {
-                        "role": "assistant",
-                        "content": initial_content if initial_content else None,
-                        "tool_calls": message_obj.get("tool_calls", [])
-                    }
-                    messages.append(assistant_msg_with_tools)
+                    logger.info(f"Follow-up response received: {follow_up_response is not None}")
                     
-                    # Add tool results to messages
-                    for res in tool_results:
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": res.get("id", "unknown"),
-                            "content": str(res.get("result", ""))
-                        })
-                    
-                    # Make second request with tool results
-                    response2 = await client.post(
-                        f"{gateway_url}/v1/chat/completions",
-                        json={
-                            "model": llm_manager.current_model_name or "current_model",
-                            "messages": messages,
-                            "temperature": sampler_settings.temperature,
-                            "top_p": sampler_settings.top_p,
-                            "max_tokens": sampler_settings.max_tokens,
-                            "frequency_penalty": sampler_settings.repeat_penalty,
-                            "stream": False
-                        },
-                        headers={
-                            "X-Conversation-ID": conversation_id
-                        }
-                    )
-                    
-                    if response2.status_code == 200:
-                        response_data2 = response2.json()
-                        choice2 = response_data2.get("choices", [{}])[0]
-                        message_obj2 = choice2.get("message", {})
-                        follow_up_content = message_obj2.get("content", "")
+                    # Validate follow-up response
+                    if follow_up_response is None:
+                        logger.warning("Follow-up LLM generate_response returned None, generating fallback response")
+                        raise Exception("Follow-up response is None")
+                    elif not isinstance(follow_up_response, dict):
+                        logger.warning(f"Follow-up LLM generate_response returned invalid type: {type(follow_up_response)}, generating fallback response")
+                        raise Exception(f"Follow-up response is invalid type: {type(follow_up_response)}")
+                    else:
+                        follow_up_content = follow_up_response.get("response", "")
+                        logger.info(f"Follow-up content length: {len(follow_up_content)}")
                         
-                        # Combine initial content with follow-up content
-                        # If both exist, combine them naturally
-                        if initial_content and follow_up_content:
-                            # Combine: initial response + follow-up (which incorporates tool results)
-                            assistant_content = f"{initial_content}\n\n{follow_up_content}".strip()
-                        elif follow_up_content:
-                            # Only follow-up exists (common case)
-                            assistant_content = follow_up_content
-                        elif initial_content:
-                            # Only initial content exists (model responded but tools executed)
-                            assistant_content = initial_content
-                        else:
-                            # No content at all
-                            assistant_content = ""
-                        
-                        parsed_tool_calls = []  # Clear after handling
+                        # If follow-up content is empty, generate a fallback
+                        if not follow_up_content:
+                            raise Exception("Follow-up content is empty")
+                except Exception as e:
+                    logger.error(f"Follow-up LLM call failed: {e}", exc_info=True)
+                    # Generate a simple response based on tool results
+                    tool_names = [r.get("name", "tool") for r in tool_execution_results if r.get("success")]
+                    if tool_names:
+                        follow_up_content = f"I have successfully executed the {', '.join(tool_names)} tool(s)."
+                    else:
+                        follow_up_content = "I attempted to execute the requested tool(s)."
                 
-                # Store assistant response
+                # Combine initial content with follow-up
+                if initial_content and follow_up_content:
+                    assistant_content = f"{initial_content}\n\n{follow_up_content}".strip()
+                elif follow_up_content:
+                    assistant_content = follow_up_content
+                elif initial_content:
+                    assistant_content = initial_content
+                else:
+                    # Final fallback
+                    tool_names = [r.get("name", "tool") for r in tool_execution_results if r.get("success")]
+                    assistant_content = f"I have successfully executed the {', '.join(tool_names)} tool(s)." if tool_names else "Tool execution completed."
+                
+                # Format tool calls with execution results for frontend display
+                tool_calls_with_results = []
+                for i, tool_call in enumerate(parsed_tool_calls):
+                    tool_result = tool_execution_results[i] if i < len(tool_execution_results) else None
+                    function_data = tool_call.get("function", {})
+                    # Parse arguments for display
+                    arguments_str = function_data.get("arguments", "{}")
+                    try:
+                        arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
+                    except json.JSONDecodeError:
+                        arguments = {}
+                    
+                    tool_calls_with_results.append({
+                        "id": tool_call.get("id"),
+                        "name": function_data.get("name"),
+                        "arguments": arguments,
+                        "success": tool_result.get("success", False) if tool_result else False,
+                        "result": tool_result.get("result") if tool_result else None,
+                        "error": tool_result.get("error") if tool_result else None
+                    })
+                
+                # Store assistant response with tool calls in OpenAI format
+                # CRITICAL: Store parsed_tool_calls (OpenAI format) not tool_calls_with_results (custom format)
                 assistant_msg = {
                     "role": "assistant",
                     "content": assistant_content,
+                    "tool_calls": parsed_tool_calls,  # Store in OpenAI format for history
                     "timestamp": get_timestamp()
                 }
                 self.conversations[conversation_id].append(assistant_msg)
                 
-                # Note: Vector store saving is handled by the proxy endpoint
-                # But we still store in memory for local cache
+                # Save to vector store and memory
                 conv_name = self._conversation_names.get(conversation_id)
                 await self.memory_store.store_conversation(
                     conversation_id=conversation_id,
@@ -307,49 +396,60 @@ class ChatManager:
                 return {
                     "response": assistant_content,
                     "conversation_id": conversation_id,
-                    "context_used": context.get("retrieved_messages", []),
-                    "tool_calls": parsed_tool_calls
+                    "context_used": context.get("retrieved_messages", []) if context else [],
+                    "tool_calls": tool_calls_with_results
                 }
-        except httpx.ConnectError:
-            raise RuntimeError("LLM service not available")
+            
+            # No tool calls - store assistant response and return
+            assistant_msg = {
+                "role": "assistant",
+                "content": assistant_content,
+                "timestamp": get_timestamp()
+            }
+            self.conversations[conversation_id].append(assistant_msg)
+            
+            # Save to vector store and memory
+            conv_name = self._conversation_names.get(conversation_id)
+            await self.memory_store.store_conversation(
+                conversation_id=conversation_id,
+                messages=[user_msg, assistant_msg],
+                name=conv_name
+            )
+            
+            # Format tool calls for response (convert to simple format)
+            formatted_tool_calls = []
+            for tc in parsed_tool_calls:
+                function_data = tc.get("function", {})
+                arguments_str = function_data.get("arguments", "{}")
+                try:
+                    arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
+                except json.JSONDecodeError:
+                    arguments = {}
+                formatted_tool_calls.append({
+                    "id": tc.get("id"),
+                    "name": function_data.get("name"),
+                    "arguments": arguments
+                })
+            
+            return {
+                "response": assistant_content,
+                "conversation_id": conversation_id,
+                "context_used": context.get("retrieved_messages", []) if context else [],
+                "tool_calls": formatted_tool_calls
+            }
+        except RuntimeError as e:
+            logger.error(f"LLM error: {e}")
+            raise RuntimeError("LLM service not available. Please ensure the LLM service is running.") from e
+        except httpx.TimeoutException as e:
+            logger.error(f"LLM request timed out: {e}")
+            raise RuntimeError("LLM request timed out. The model may be processing a large request.") from e
+        except httpx.HTTPStatusError as e:
+            logger.error(f"LLM service returned error status {e.response.status_code}: {e.response.text}")
+            raise RuntimeError(f"LLM service error: {e.response.status_code} - {e.response.text}") from e
         except Exception as e:
-            logger.error(f"Error calling LLM proxy: {e}", exc_info=True)
+            logger.error(f"Error calling LLM service: {e}", exc_info=True)
             raise RuntimeError(f"LLM request failed: {str(e)}") from e
     
-    def _build_messages(
-        self,
-        message: str,
-        history: List[Dict[str, Any]],
-        context: Optional[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Build message list for OpenAI API."""
-        messages = []
-        
-        # Get system prompt from LLM manager
-        llm_manager = self.service_manager.llm_manager
-        system_content = llm_manager._build_system_prompt()
-        
-        # Add context to system prompt
-        if context and context.get("retrieved_messages"):
-            context_str = "\n\nRelevant context from past conversations:\n" + "\n".join(
-                f"- {msg}" for msg in context["retrieved_messages"][:5]
-            )
-            system_content += context_str
-        
-        messages.append({"role": "system", "content": system_content})
-        
-        # History
-        if history:
-            for msg in history[-10:]:  # Limit history
-                messages.append({
-                    "role": msg.get("role", "user"),
-                    "content": msg.get("content", "")
-                })
-        
-        # Current message
-        messages.append({"role": "user", "content": message})
-        
-        return messages
     
     async def get_conversation(self, conversation_id: str) -> Optional[List[Dict[str, Any]]]:
         """Get conversation by ID."""

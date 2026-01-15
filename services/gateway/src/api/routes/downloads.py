@@ -16,7 +16,7 @@ router = APIRouter(tags=["downloads"])
 @router.get("/api/models/search")
 async def search_models(
     query: str = Query(..., description="Search query"),
-    limit: int = Query(50, ge=1, le=100, description="Maximum results")
+    limit: int = Query(10, ge=1, le=100, description="Maximum results")
 ):
     """Search for models on HuggingFace (independent of LLM service)."""
     try:
@@ -27,39 +27,49 @@ async def search_models(
             limit=limit
         )
         return results
+    except RuntimeError as e:
+        # Network errors are already wrapped in RuntimeError with user-friendly messages
+        error_msg = str(e)
+        if "Network error" in error_msg or "Unable to connect" in error_msg:
+            raise HTTPException(
+                status_code=503,
+                detail=error_msg
+            ) from e
+        raise HTTPException(status_code=500, detail=f"Search failed: {error_msg}") from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}") from e
+        error_msg = str(e)
+        # Check for network-related errors
+        if "Network is unreachable" in error_msg or "Connection" in error_msg or "MaxRetryError" in error_msg:
+            raise HTTPException(
+                status_code=503,
+                detail="Network error: Unable to connect to HuggingFace. Please check your internet connection and try again."
+            ) from e
+        raise HTTPException(status_code=500, detail=f"Search failed: {error_msg}") from e
 
 
 @router.get("/api/models/files")
 async def get_model_files_by_query(repo_id: str = Query(..., description="HuggingFace repository ID")):
     """Get list of files in a HuggingFace model repository (independent of LLM service)."""
-    logger.info("get_model_files called with repo_id: %s", repo_id)
-    
+    # Removed verbose logging - this endpoint is called frequently
     try:
         from ...services.llm.downloader import ModelDownloader
         downloader = ModelDownloader()
         
         decoded_repo_id = unquote(repo_id)
-        logger.info("Decoded repo_id: %s", decoded_repo_id)
         
         if not decoded_repo_id or not decoded_repo_id.strip():
-            logger.warning("Empty repo_id after decoding")
             raise HTTPException(
                 status_code=400,
                 detail="Repository ID cannot be empty"
             )
         
         if '/' not in decoded_repo_id:
-            logger.warning("Invalid repo_id format (no slash): %s", decoded_repo_id)
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid repository ID format: '{decoded_repo_id}'. Expected format: 'username/model-name'"
             )
         
-        logger.info("Calling downloader.get_model_files with: %s", decoded_repo_id)
         files = await downloader.get_model_files(repo_id=decoded_repo_id)
-        logger.info("Successfully retrieved %d files", len(files) if files else 0)
         return files
     except HTTPException:
         raise
@@ -80,10 +90,10 @@ async def get_model_files_by_query(repo_id: str = Query(..., description="Huggin
 @router.get("/api/models/{model_id:path}/files")
 async def get_model_files_by_path(model_id: str):
     """Get list of GGUF files for a specific model repository (independent of LLM service)."""
+    # Removed verbose logging - this endpoint is called frequently
     try:
         from ...services.llm.downloader import ModelDownloader
         downloader = ModelDownloader()
-        logger.info(f"Fetching model files for: {model_id}")
         files = await downloader.get_model_files(model_id)
         return {"files": files}
     except ValueError as e:
@@ -150,7 +160,59 @@ async def list_downloads():
     try:
         manager = get_download_manager(settings.models_dir, settings.data_dir)
         
-        active = [d.to_dict() for d in manager.get_active_downloads()]
+        # Get active downloads from memory
+        active_downloads = manager.get_active_downloads()
+        logger.debug(f"[API DOWNLOADS] Found {len(active_downloads)} active downloads in memory")
+        for d in active_downloads:
+            logger.debug(f"[API DOWNLOADS] In-memory: {d.id} - {d.filename}, progress={d.progress:.1f}%, bytes={d.bytes_downloaded}/{d.total_bytes}, speed={d.speed_bps/1024/1024:.2f} MB/s")
+        
+        # Also check file store for any active downloads that might have been persisted
+        file_active = await manager.history_store.get_active_downloads()
+        logger.debug(f"[API DOWNLOADS] Found {len(file_active)} active downloads in file store")
+        
+        # Merge in-memory and file-based active downloads
+        # In-memory downloads take precedence as they have the latest progress
+        active_dict = {d.id: d for d in active_downloads}
+        logger.debug(f"[API DOWNLOADS] In-memory downloads take precedence: {len(active_dict)} downloads")
+        
+        for file_download in file_active:
+            download_id = file_download.get("id")
+            if download_id and download_id not in active_dict:
+                # Only reconstruct from file if not in memory (might be from previous session)
+                from ...services.llm.download_models import Download, DownloadStatus
+                try:
+                    # Check if this is actually still active (not completed/failed/cancelled)
+                    file_status = file_download.get("status", "pending")
+                    if file_status not in ["pending", "downloading"]:
+                        logger.debug(f"[API DOWNLOADS] Skipping file download {download_id} - status is {file_status}")
+                        continue
+                    
+                    download = Download(
+                        id=file_download.get("id", ""),
+                        repo_id=file_download.get("repo_id", ""),
+                        filename=file_download.get("filename", ""),
+                        status=DownloadStatus(file_status),
+                        progress=file_download.get("progress", 0.0),
+                        bytes_downloaded=file_download.get("bytes_downloaded", 0),
+                        total_bytes=file_download.get("total_bytes", 0),
+                        speed_bps=file_download.get("speed_bps", 0.0),
+                        error=file_download.get("error"),
+                        model_path=file_download.get("model_path"),
+                    )
+                    if file_download.get("started_at"):
+                        download.started_at = datetime.fromisoformat(file_download["started_at"])
+                    if file_download.get("completed_at"):
+                        download.completed_at = datetime.fromisoformat(file_download["completed_at"])
+                    active_dict[download_id] = download
+                    logger.debug(f"[API DOWNLOADS] Reconstructed from file: {download_id} - {download.filename}, progress={download.progress:.1f}%")
+                except Exception as e:
+                    logger.debug(f"Error reconstructing download from file: {e}")
+        
+        active = [d.to_dict() for d in active_dict.values()]
+        logger.info(f"[API DOWNLOADS] Returning {len(active)} active downloads")
+        for d_dict in active:
+            logger.debug(f"[API DOWNLOADS] Returning: {d_dict.get('id')} - progress={d_dict.get('progress', 0):.1f}%, bytes={d_dict.get('bytes_downloaded', 0)}/{d_dict.get('total_bytes', 0)}, speed_mbps={d_dict.get('speed_mbps', 0):.2f}, eta={d_dict.get('eta_seconds')}")
+        
         history = await manager.get_download_history(limit=20)
         
         return {
@@ -277,7 +339,7 @@ async def discover_models(force_refresh: bool = Query(False, description="Re-dis
         raise HTTPException(status_code=500, detail=f"Discovery failed: {str(e)}") from e
 
 
-@router.post("/api/models/{model_id}/discover")
+@router.post("/api/models/{model_id:path}/discover")
 async def discover_single_model(model_id: str):
     """Discover/rediscover a specific model and find its HuggingFace repository."""
     from ...services.llm.discovery import ModelDiscovery
@@ -304,7 +366,7 @@ async def discover_single_model(model_id: str):
         raise HTTPException(status_code=500, detail=f"Discovery failed: {str(e)}") from e
 
 
-@router.get("/api/models/{model_id}/metadata")
+@router.get("/api/models/{model_id:path}/metadata")
 async def get_model_metadata(model_id: str):
     """Get discovered metadata for a model."""
     from ...services.llm.discovery import ModelDiscovery
@@ -378,8 +440,7 @@ async def set_model_metadata(model_id: str, request: Request):
         with open(metadata_file, 'w', encoding='utf-8') as f:
             json.dump(new_metadata, f, indent=2, ensure_ascii=False)
         
-        logger.info(f"Saved metadata for model: {model_id}")
-        
+        # Removed verbose logging - only log errors
         return {
             "status": "success",
             "message": f"Metadata updated for {model_id}",
@@ -425,7 +486,7 @@ async def link_and_organize_model(
         raise HTTPException(status_code=500, detail=f"Failed to link model: {str(e)}") from e
 
 
-@router.put("/api/models/{model_id}/repo")
+@router.put("/api/models/{model_id:path}/repo")
 async def set_model_repo(model_id: str, repo_id: str = Query(..., description="HuggingFace repository ID")):
     """Manually set the HuggingFace repository for a model and fetch its metadata."""
     from ...services.llm.discovery import ModelDiscovery

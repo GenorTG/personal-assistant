@@ -5,6 +5,11 @@ import { Volume2, CheckCircle, XCircle, Loader, Settings } from "lucide-react";
 import { api } from "@/lib/api";
 import { useServiceStatus } from "@/contexts/ServiceStatusContext";
 import { useToast } from "@/contexts/ToastContext";
+import VoiceCloningPanel from "./VoiceCloningPanel";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 
 export default function TTSSettings() {
   const { statuses } = useServiceStatus();
@@ -13,7 +18,10 @@ export default function TTSSettings() {
   const [currentBackend, setCurrentBackend] = useState<any>(null);
   const [voices, setVoices] = useState<any[]>([]);
   const [options, setOptions] = useState<any>({});
-  const [models, setModels] = useState<string[]>([]);
+  const [models] = useState<string[]>([]);
+  const [availableModels, setAvailableModels] = useState<any[]>([]);
+  const [currentModel, setCurrentModel] = useState<string>("");
+  const [, setCustomVoices] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedBackend, setSelectedBackend] = useState<string>("");
   const [updating, setUpdating] = useState(false);
@@ -22,13 +30,13 @@ export default function TTSSettings() {
 
   useEffect(() => {
     loadTTSInfo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Get backend health from global context
-  const backendHealth: Record<string, any> = {
-    piper: statuses?.tts?.piper || { status: 'offline' },
-    chatterbox: statuses?.tts?.chatterbox || { status: 'offline' },
-    kokoro: statuses?.tts?.kokoro || { status: 'offline' },
+  // Get backend health from global context - use only ServiceStatusContext
+  const getBackendStatus = (backendName: string): 'ready' | 'offline' | 'error' => {
+    const status = statuses?.tts?.[backendName as keyof typeof statuses.tts];
+    return status?.status || 'offline';
   };
 
   const loadTTSInfo = async () => {
@@ -42,13 +50,23 @@ export default function TTSSettings() {
       const current =
         settingsData.current_backend_info ||
         backendsData.find((b: any) => b.is_current);
-      if (current) {
+      if (current && current.name) {
         setCurrentBackend(current);
         setSelectedBackend(current.name || settingsData.current_backend);
         await loadBackendDetails(current.name || settingsData.current_backend);
+      } else if (settingsData.current_backend) {
+        // Try to load details for the current backend even if info is missing
+        setSelectedBackend(settingsData.current_backend);
+        await loadBackendDetails(settingsData.current_backend);
       }
     } catch (error) {
       console.error("Error loading TTS info:", error);
+      // Set default backends if error occurs
+      setBackends([
+        { name: "piper", status: "error", is_current: false },
+        { name: "kokoro", status: "error", is_current: false },
+        { name: "chatterbox", status: "error", is_current: false }
+      ]);
     } finally {
       setLoading(false);
     }
@@ -62,13 +80,40 @@ export default function TTSSettings() {
       const voicesData = await api.getTTSVoices(backendName) as any;
       setVoices(voicesData.voices || []);
 
-      // Load models if available (Coqui)
-      if (backendName === "coqui") {
+      // Load models if available (Piper, Coqui)
+      if (backendName === "piper" || backendName === "coqui") {
         try {
           const modelsData = await api.getTTSModels(backendName) as any;
-          setModels(modelsData.models || []);
+          const modelsList = modelsData.models || [];
+          setAvailableModels(modelsList);
+          
+          // Get current model from status
+          if (backendName === "piper") {
+            try {
+              const status = await api.getTTSBackendInfo(backendName) as any;
+              if (status.model_status) {
+                const modelPath = status.model_status.model_path;
+                if (modelPath) {
+                  const modelName = modelPath.split('/').pop()?.replace('.onnx', '') || '';
+                  setCurrentModel(modelName);
+                }
+              }
+            } catch (e) {
+              console.error("Error getting current model:", e);
+            }
+          }
         } catch (e) {
           console.error("Error loading models:", e);
+        }
+      }
+
+      // Load custom voices for Chatterbox
+      if (backendName === "chatterbox") {
+        try {
+          const customVoicesData = await api.getCustomVoices(backendName) as any;
+          setCustomVoices(customVoicesData.voices || []);
+        } catch (e) {
+          console.error("Error loading custom voices:", e);
         }
       }
     } catch (error) {
@@ -192,6 +237,8 @@ export default function TTSSettings() {
         saveOptions(options);
       }, 500);
     }
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedBackend, saveOptions]);
   
   // Cleanup timeout on unmount
@@ -247,21 +294,19 @@ export default function TTSSettings() {
           <label className="block text-sm font-medium mb-2">TTS Backend</label>
           <div className="space-y-2">
             {backends.map((backend: any) => {
-              const health = backendHealth[backend.name];
-              const isGlobalReady = health?.status === 'ready';
-              const isService = health?.type === 'tts';
-              const needsService = ['piper', 'chatterbox', 'kokoro'].includes(backend.name);
+              // Use ServiceStatusContext as source of truth
+              const serviceStatus = getBackendStatus(backend.name);
+              const isServiceReady = serviceStatus === 'ready';
               
-              // Prioritize global status for service-based backends
-              // If the service is running (global status), consider the backend ready
-              // This fixes the issue where the backend might have a stale error state
-              const effectiveStatus = (needsService && isGlobalReady) ? "ready" : backend.status;
-              const effectiveError = (needsService && isGlobalReady) ? null : backend.error_message;
+              // For service-based backends, use service status; otherwise use backend status
+              const needsService = ['piper', 'chatterbox', 'kokoro'].includes(backend.name);
+              const effectiveStatus = needsService ? (isServiceReady ? "ready" : "error") : backend.status;
+              const effectiveError = needsService && !isServiceReady ? `Service ${serviceStatus}` : backend.error_message;
               
               return (
                 <div
                   key={backend.name}
-                  className={`p-3 border rounded-lg cursor-pointer transition-colors ${
+                  className={`p-3 border rounded cursor-pointer transition-colors ${
                     backend.is_current
                       ? "border-blue-500 bg-blue-50"
                       : "border-gray-200 hover:border-gray-300"
@@ -280,51 +325,24 @@ export default function TTSSettings() {
                         </span>
                       )}
                       
-                      {/* Service Health Indicator */}
+                      {/* Service Status Indicator - only show for service-based backends */}
                       {needsService && (
-                        isGlobalReady ? (
-                          <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded flex items-center gap-1">
-                            <CheckCircle size={12} />
-                            Service Running
-                          </span>
-                        ) : (
-                          <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded flex items-center gap-1">
-                            <XCircle size={12} />
-                            Service Offline
-                          </span>
-                        )
-                      )}
-                      
-                      {/* OpenAI external API indicator */}
-                      {backend.name === 'openai' && health?.is_external && (
-                        isGlobalReady ? (
-                          <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded flex items-center gap-1">
-                            <CheckCircle size={12} />
-                            API Connected {health.authenticated && '🔑'}
-                          </span>
-                        ) : health?.needs_configuration ? (
-                          <span className="text-xs bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded flex items-center gap-1">
-                            <Settings size={12} />
-                            Not Configured
-                          </span>
-                        ) : isGlobalReady === false ? (
-                          <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded flex items-center gap-1">
-                            <XCircle size={12} />
-                            API Offline
-                          </span>
-                        ) : (
-                          <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded flex items-center gap-1">
-                            <Loader size={12} className="animate-spin" />
-                            Testing API...
-                          </span>
-                        )
-                      )}
-                      
-                      {/* Local backend indicator */}
-                      {!needsService && isService === false && !health?.is_external && (
-                        <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded">
-                          Local
-                        </span>
+                        <Badge 
+                          variant={isServiceReady ? 'default' : 'destructive'}
+                          className="text-xs flex items-center gap-1"
+                        >
+                          {isServiceReady ? (
+                            <>
+                              <CheckCircle size={12} />
+                              Service Ready
+                            </>
+                          ) : (
+                            <>
+                              <XCircle size={12} />
+                              Service Offline
+                            </>
+                          )}
+                        </Badge>
                       )}
                     </div>
                     <div className="text-xs text-gray-500">
@@ -337,19 +355,13 @@ export default function TTSSettings() {
                   </div>
                   
                   {/* Warning if service is offline but backend is current */}
-                  {needsService && backend.is_current && !isGlobalReady && (
+                  {needsService && backend.is_current && !isServiceReady && (
                     <p className="text-xs text-orange-600 mt-2 flex items-center gap-1">
                       ⚠️ Service is not running. TTS generation will fail. Start the {backend.name} service to use this backend.
                     </p>
                   )}
                   
-                  {/* Service error details */}
-                  {health?.error && !effectiveError && (
-                    <p className="text-xs text-gray-500 mt-1">
-                      {health.error}
-                    </p>
-                  )}
-                  
+                  {/* Error message */}
                   {effectiveError && (
                     <p className="text-xs text-red-500 mt-1">
                       {effectiveError}
@@ -389,29 +401,38 @@ export default function TTSSettings() {
                   {updating ? "Refreshing..." : "🔄 Refresh"}
                 </button>
               </div>
-              {voices.length > 0 ? (
-                <select
-                  value={getOptionValue("voice") || ""}
-                  onChange={(e) => updateOptionValue("voice", e.target.value)}
-                  className="input w-full"
+              <div className={cn("hidden", voices.length > 0 && "block")}>
+                <Select
+                  value={getOptionValue("voice") || "default"}
+                  onValueChange={(value) => updateOptionValue("voice", value === "default" ? "" : value)}
                 >
-                  <option value="">Default</option>
-                  {voices.map((voice: any) => (
-                    <option key={voice.id} value={voice.id}>
-                      {voice.name} {voice.language ? `(${voice.language})` : ""}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <div className="text-sm text-gray-500 py-2">
-                  No voices available. Click "Refresh" to reload voices.
-                </div>
-              )}
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Default" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">Default</SelectItem>
+                    {voices.map((voice: any) => {
+                      if (!voice) return null;
+                      const voiceId = voice.id || 'unknown';
+                      const voiceName = voice.name || voice.id || 'Unknown';
+                      const language = voice.language || '';
+                      return (
+                        <SelectItem key={voiceId} value={voiceId}>
+                          {voiceName} {language ? `(${language})` : ""}
+                        </SelectItem>
+                      );
+                    })}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className={cn("hidden text-sm text-muted-foreground py-2", voices.length === 0 && "block")}>
+                No voices available. Click "Refresh" to reload voices.
+              </div>
             </div>
 
             {/* Backend-specific Options */}
-            {currentBackend.name === "chatterbox" && (
-              <div className="space-y-3 p-3 bg-gray-50 rounded-lg">
+            {currentBackend?.name === "chatterbox" && (
+              <div className="space-y-3 p-3 bg-gray-50 rounded">
                 <div className="flex items-center gap-2 mb-2">
                   <Settings size={16} />
                   <span className="text-sm font-medium">
@@ -419,39 +440,14 @@ export default function TTSSettings() {
                   </span>
                 </div>
                 
-                {/* Voice Upload Section */}
+                {/* Voice Cloning Section */}
                 <div className="border-b border-gray-200 pb-3 mb-3">
-                  <label className="block text-sm font-medium mb-2">Upload Custom Voice</label>
-                  <div className="flex flex-col gap-2">
-                    <input
-                      type="file"
-                      accept=".wav,.mp3,.ogg,.flac"
-                      onChange={async (e) => {
-                        const file = e.target.files?.[0];
-                        if (!file) return;
-                        
-                        try {
-                          setUpdating(true);
-                          const name = file.name.replace(/\.[^/.]+$/, "");
-                          await api.uploadVoice(file, name);
-                          showSuccess(`Voice '${name}' uploaded successfully!`);
-                          // Reload voices
-                          await loadBackendDetails("chatterbox");
-                        } catch (error: any) {
-                          console.error("Error uploading voice:", error);
-                          showError(`Upload failed: ${error.message}`);
-                        } finally {
-                          setUpdating(false);
-                          // Reset input
-                          e.target.value = "";
-                        }
-                      }}
-                      className="text-sm w-full"
-                    />
-                    <p className="text-xs text-gray-500">
-                      Upload a short audio sample (wav/mp3). It will be converted to 48kHz mono for Chatterbox.
-                    </p>
-                  </div>
+                  <VoiceCloningPanel
+                    backendName="chatterbox"
+                    onVoiceUploaded={async () => {
+                      await loadBackendDetails("chatterbox");
+                    }}
+                  />
                 </div>
 
                 {options.speed && (
@@ -552,7 +548,7 @@ export default function TTSSettings() {
                     <label className="block text-sm font-medium mb-1">
                       Seed
                     </label>
-                    <input
+                    <Input
                       type="number"
                       min={options.seed?.min ?? undefined}
                       max={options.seed?.max ?? undefined}
@@ -565,7 +561,7 @@ export default function TTSSettings() {
                         );
                       }}
                       placeholder="Random (leave empty)"
-                      className="input w-full"
+                      className="w-full"
                     />
                     <p className="text-xs text-gray-500 mt-1">
                       Random seed for reproducible generation (leave empty for
@@ -576,12 +572,62 @@ export default function TTSSettings() {
               </div>
             )}
 
-            {currentBackend.name === "piper" && (
-              <div className="space-y-3 p-3 bg-gray-50 rounded-lg">
+            {currentBackend?.name === "piper" && (
+              <div className="space-y-3 p-3 bg-gray-50 rounded">
                 <div className="flex items-center gap-2 mb-2">
                   <Settings size={16} />
                   <span className="text-sm font-medium">Piper Options</span>
                 </div>
+                
+                {/* Model Selection */}
+                {availableModels.length > 0 && (
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Voice Model</label>
+                    <Select
+                      value={currentModel || undefined}
+                      onValueChange={async (modelId) => {
+                        if (!modelId) return;
+                        
+                        try {
+                          setUpdating(true);
+                          await api.switchTTSModel("piper", modelId);
+                          setCurrentModel(modelId);
+                          showSuccess(`Switched to model: ${modelId}`);
+                          await loadBackendDetails("piper");
+                        } catch (error: any) {
+                          console.error("Error switching model:", error);
+                          showError(`Failed to switch model: ${error.message}`);
+                        } finally {
+                          setUpdating(false);
+                        }
+                      }}
+                      disabled={updating}
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue placeholder="Select model..." />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {availableModels.map((model: any) => {
+                          if (!model) return null;
+                          const modelId = model.id || model.name || 'unknown';
+                          const modelName = model.name || model.id || 'Unknown';
+                          const language = model.language || '';
+                          return (
+                            <SelectItem key={modelId} value={modelId}>
+                              {modelName} {language ? `(${language})` : ""}
+                            </SelectItem>
+                          );
+                        })}
+                      </SelectContent>
+                    </Select>
+                    {currentModel && (
+                      <p className="text-xs text-gray-500 mt-1">
+                        Current: {currentModel}
+                      </p>
+                    )}
+                  </div>
+                )}
+                
                 {options.speed && (
                   <div>
                     <label className="block text-sm font-medium mb-1">
@@ -598,13 +644,16 @@ export default function TTSSettings() {
                       }
                       className="w-full"
                     />
+                    <p className="text-xs text-gray-500 mt-1">
+                      Speech speed multiplier (0.5-2.0)
+                    </p>
                   </div>
                 )}
               </div>
             )}
 
-            {currentBackend.name === "kokoro" && (
-              <div className="space-y-3 p-3 bg-gray-50 rounded-lg">
+            {currentBackend?.name === "kokoro" && (
+              <div className="space-y-3 p-3 bg-gray-50 rounded">
                 <div className="flex items-center gap-2 mb-2">
                   <Settings size={16} />
                   <span className="text-sm font-medium">Kokoro Options</span>
@@ -625,71 +674,45 @@ export default function TTSSettings() {
                       }
                       className="w-full"
                     />
+                    <p className="text-xs text-gray-500 mt-1">
+                      Speech speed multiplier (0.5-2.0)
+                    </p>
                   </div>
                 )}
-                {options.temperature && (
+                {options.lang && (
                   <div>
-                    <label className="block text-sm font-medium mb-1">
-                      Temperature:{" "}
-                      {getOptionValue("temperature")?.toFixed(2) || "0.70"}
-                    </label>
-                    <input
-                      type="range"
-                      min={options.temperature?.min || 0.0}
-                      max={options.temperature?.max || 1.0}
-                      step={options.temperature?.step || 0.1}
-                      value={getOptionValue("temperature") || 0.7}
-                      onChange={(e) =>
-                        updateOptionValue(
-                          "temperature",
-                          parseFloat(e.target.value)
-                        )
-                      }
-                      className="w-full"
-                    />
-                  </div>
-                )}
-                {options.top_p && (
-                  <div>
-                    <label className="block text-sm font-medium mb-1">
-                      Top P: {getOptionValue("top_p")?.toFixed(2) || "0.90"}
-                    </label>
-                    <input
-                      type="range"
-                      min={options.top_p?.min || 0.0}
-                      max={options.top_p?.max || 1.0}
-                      step={options.top_p?.step || 0.05}
-                      value={getOptionValue("top_p") || 0.9}
-                      onChange={(e) =>
-                        updateOptionValue("top_p", parseFloat(e.target.value))
-                      }
-                      className="w-full"
-                    />
-                  </div>
-                )}
-                {options.top_k && (
-                  <div>
-                    <label className="block text-sm font-medium mb-1">
-                      Top K: {getOptionValue("top_k") || "50"}
-                    </label>
-                    <input
-                      type="range"
-                      min={options.top_k?.min || 1}
-                      max={options.top_k?.max || 100}
-                      step={options.top_k?.step || 1}
-                      value={getOptionValue("top_k") || 50}
-                      onChange={(e) =>
-                        updateOptionValue("top_k", parseInt(e.target.value))
-                      }
-                      className="w-full"
-                    />
+                    <label className="block text-sm font-medium mb-1">Language</label>
+                    <Select
+                      value={getOptionValue("lang") || "en-us"}
+                      onValueChange={(value) => updateOptionValue("lang", value)}
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="en-us">English (US)</SelectItem>
+                        <SelectItem value="en-gb">English (GB)</SelectItem>
+                        <SelectItem value="es">Spanish</SelectItem>
+                        <SelectItem value="fr">French</SelectItem>
+                        <SelectItem value="de">German</SelectItem>
+                        <SelectItem value="it">Italian</SelectItem>
+                        <SelectItem value="pt">Portuguese</SelectItem>
+                        <SelectItem value="ru">Russian</SelectItem>
+                        <SelectItem value="ja">Japanese</SelectItem>
+                        <SelectItem value="zh">Chinese</SelectItem>
+                        <SelectItem value="ko">Korean</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Language code for synthesis
+                    </p>
                   </div>
                 )}
               </div>
             )}
 
-            {currentBackend.name === "coqui" && (
-              <div className="space-y-3 p-3 bg-gray-50 rounded-lg">
+            {currentBackend?.name === "coqui" && (
+              <div className="space-y-3 p-3 bg-gray-50 rounded">
                 <div className="flex items-center gap-2 mb-2">
                   <Settings size={16} />
                   <span className="text-sm font-medium">Coqui Options</span>
@@ -699,23 +722,27 @@ export default function TTSSettings() {
                     <label className="block text-sm font-medium mb-1">
                       Model
                     </label>
-                    <select
+                    <Select
                       value={
                         getOptionValue("model_name") ||
                         options.model_name?.value ||
                         ""
                       }
-                      onChange={(e) =>
-                        updateOptionValue("model_name", e.target.value)
+                      onValueChange={(value) =>
+                        updateOptionValue("model_name", value)
                       }
-                      className="input w-full"
                     >
-                      {models.map((model) => (
-                        <option key={model} value={model}>
-                          {model}
-                        </option>
-                      ))}
-                    </select>
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {models.map((model) => (
+                          <SelectItem key={model} value={model}>
+                            {model}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                     <p className="text-xs text-gray-500 mt-1">
                       Changing model requires reinitialization
                     </p>
@@ -741,8 +768,8 @@ export default function TTSSettings() {
               </div>
             )}
 
-            {currentBackend.name === "pyttsx3" && (
-              <div className="space-y-3 p-3 bg-gray-50 rounded-lg">
+            {currentBackend?.name === "pyttsx3" && (
+              <div className="space-y-3 p-3 bg-gray-50 rounded">
                 <div className="flex items-center gap-2 mb-2">
                   <Settings size={16} />
                   <span className="text-sm font-medium">

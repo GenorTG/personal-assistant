@@ -27,6 +27,13 @@ export interface SamplerSettingsData {
   
   // Output
   max_tokens: number;
+  
+  // Stop strings (array of strings, supports template variables {{user}} and {{char}})
+  stop?: string[];
+  
+  // Smooth Sampling - quadratic/cubic probability distribution transformation
+  smoothing_factor?: number;
+  smoothing_curve?: number;  // Float >= 1.0
 }
 
 export const DEFAULT_SETTINGS: SamplerSettingsData = {
@@ -43,6 +50,9 @@ export const DEFAULT_SETTINGS: SamplerSettingsData = {
   mirostat_tau: 5.0,
   mirostat_eta: 0.1,
   max_tokens: 512,
+  stop: ["\n*{{user}}", "\n{{user}}", "{{user}}:", "User:"],
+  smoothing_factor: 0.0,
+  smoothing_curve: 1.0,
 };
 
 interface SamplerSettingsContextType {
@@ -72,7 +82,7 @@ export function SamplerSettingsProvider({ children }: { children: ReactNode }) {
           'repeat_penalty', 'presence_penalty', 'frequency_penalty',
           'typical_p', 'tfs_z',
           'mirostat_mode', 'mirostat_tau', 'mirostat_eta',
-          'max_tokens'
+          'max_tokens', 'stop'
         ];
         
       for (const field of fields) {
@@ -81,14 +91,18 @@ export function SamplerSettingsProvider({ children }: { children: ReactNode }) {
         }
       }
       
-      setSettings(prev => ({ ...prev, ...loaded }));
-      setIsLoading(false);
+      // Sync settings from backend - this is intentional
+      // Use setTimeout to defer setState and avoid synchronous setState in effect
+      setTimeout(() => {
+        setSettings(prev => ({ ...prev, ...loaded }));
+        setIsLoading(false);
+      }, 0);
     } else if (!appSettings) {
       // Settings not loaded yet, keep loading state
-      setIsLoading(true);
+      setTimeout(() => setIsLoading(true), 0);
     } else {
       // Settings loaded but no sampler settings, use defaults
-      setIsLoading(false);
+      setTimeout(() => setIsLoading(false), 0);
     }
   }, [appSettings]);
 

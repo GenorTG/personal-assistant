@@ -1,8 +1,12 @@
 """Conversation management routes."""
+# Standard library
 import logging
 from typing import List, Optional
+
+# Third-party
 from fastapi import APIRouter, HTTPException, Request
 
+# Local
 from ..schemas import ConversationHistory
 from ...services.service_manager import service_manager
 
@@ -25,6 +29,21 @@ async def create_conversation():
         conversation_id = await service_manager.chat_manager.create_conversation()
         name = await service_manager.chat_manager.get_conversation_name(conversation_id)
         logger.info(f"Created conversation: {conversation_id} ({name})")
+        
+        # Broadcast WebSocket event
+        try:
+            from ...services.websocket_manager import get_websocket_manager
+            ws_manager = get_websocket_manager()
+            await ws_manager.broadcast_conversation_created({
+                "conversation_id": conversation_id,
+                "name": name,
+                "status": "created"
+            })
+            await ws_manager.broadcast_conversations_list_changed()
+            # Debug info will be broadcast by conversations_list_changed handler
+        except Exception as e:
+            logger.debug(f"Failed to broadcast conversation created event: {e}")
+        
         return {
             "conversation_id": conversation_id,
             "name": name,
@@ -102,7 +121,8 @@ async def get_conversation(conversation_id: str):
         )
     
     try:
-        messages = await service_manager.memory_store.get_conversation(conversation_id)
+        # CRITICAL: Always get ALL messages - never limit conversation history
+        messages = await service_manager.memory_store.get_conversation(conversation_id, limit=None)
         if messages is None:
             logger.warning(f"Conversation {conversation_id} not found")
             raise HTTPException(
@@ -116,10 +136,11 @@ async def get_conversation(conversation_id: str):
         chat_messages = [
             {
                 "role": msg.get("role", "unknown"),
-                "content": msg.get("content", ""),
+                "content": msg.get("content") or "",  # Ensure content is never None
                 "timestamp": msg.get("timestamp")
             }
             for msg in messages
+            if msg.get("content") is not None or msg.get("role")  # Filter out completely empty messages
         ]
         
         name = conv_metadata.get("name") if conv_metadata else None
@@ -203,6 +224,18 @@ async def rename_conversation(conversation_id: str, request: Request):
         if not success:
             raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found")
         
+        # Broadcast WebSocket event
+        try:
+            from ...services.websocket_manager import get_websocket_manager
+            ws_manager = get_websocket_manager()
+            await ws_manager.broadcast_conversation_updated({
+                "conversation_id": conversation_id,
+                "name": new_name
+            })
+            await ws_manager.broadcast_conversations_list_changed()
+        except Exception as e:
+            logger.debug(f"Failed to broadcast conversation updated event: {e}")
+        
         return {
             "status": "success",
             "conversation_id": conversation_id,
@@ -240,6 +273,19 @@ async def pin_conversation(conversation_id: str, request: Request):
             )
         
         action = "pinned" if pinned else "unpinned"
+        
+        # Broadcast WebSocket event
+        try:
+            from ...services.websocket_manager import get_websocket_manager
+            ws_manager = get_websocket_manager()
+            await ws_manager.broadcast_conversation_updated({
+                "conversation_id": conversation_id,
+                "pinned": pinned
+            })
+            await ws_manager.broadcast_conversations_list_changed()
+        except Exception as e:
+            logger.debug(f"Failed to broadcast conversation updated event: {e}")
+        
         return {
             "status": "success",
             "message": f"Conversation {conversation_id} {action}",
@@ -254,29 +300,6 @@ async def pin_conversation(conversation_id: str, request: Request):
             status_code=500,
             detail=f"Failed to pin conversation: {str(e)}"
         ) from e
-
-
-@router.delete("/api/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str):
-    """Delete a conversation."""
-    if not service_manager.chat_manager:
-        raise HTTPException(
-            status_code=503,
-            detail="Chat service not initialized"
-        )
-    
-    deleted = await service_manager.chat_manager.delete_conversation(conversation_id)
-    
-    if deleted:
-        return {
-            "status": "success",
-            "message": f"Conversation {conversation_id} deleted"
-        }
-    else:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Conversation {conversation_id} not found"
-        )
 
 
 @router.delete("/api/conversations/all")
@@ -318,35 +341,75 @@ async def delete_all_conversations():
         
         logger.info(f"Starting deletion of {len(conversation_ids)} conversations...")
         
+        # Delete files and index entries
         for conv_id in conversation_ids:
             try:
                 logger.debug(f"Deleting conversation {conv_id}...")
                 
+                # Delete from file store (file + index entry)
                 success = await file_store.delete_conversation(conv_id)
                 if success:
                     deleted_count += 1
-                    
-                    try:
-                        await service_manager.memory_store.vector_store.delete_conversation(conv_id)
-                        logger.debug(f"Successfully deleted conversation {conv_id} from vector store")
-                    except Exception as e:
-                        logger.warning(f"Error deleting conversation {conv_id} from vector store: {e}")
-                    
-                    if service_manager.chat_manager:
-                        if conv_id in service_manager.chat_manager.conversations:
-                            del service_manager.chat_manager.conversations[conv_id]
-                        if conv_id in service_manager.chat_manager._conversation_names:
-                            del service_manager.chat_manager._conversation_names[conv_id]
+                    logger.debug(f"Successfully deleted conversation {conv_id} from file store")
                 else:
-                    logger.warning(f"Failed to delete conversation {conv_id}")
+                    logger.warning(f"Failed to delete conversation {conv_id} from file store")
+                
+                # Delete from vector store
+                try:
+                    await service_manager.memory_store.vector_store.delete_conversation(conv_id)
+                    logger.debug(f"Successfully deleted conversation {conv_id} from vector store")
+                except Exception as e:
+                    logger.warning(f"Error deleting conversation {conv_id} from vector store: {e}")
+                
+                # Remove from in-memory chat manager cache
+                if service_manager.chat_manager:
+                    if conv_id in service_manager.chat_manager.conversations:
+                        del service_manager.chat_manager.conversations[conv_id]
+                    if conv_id in service_manager.chat_manager._conversation_names:
+                        del service_manager.chat_manager._conversation_names[conv_id]
+                
+                # Broadcast individual deletion events
+                try:
+                    from ...services.websocket_manager import get_websocket_manager
+                    ws_manager = get_websocket_manager()
+                    await ws_manager.broadcast_conversation_deleted(conv_id)
+                except Exception as e:
+                    logger.debug(f"Failed to broadcast conversation deleted event: {e}")
             except Exception as e:
                 logger.error(f"Error deleting conversation {conv_id}: {e}", exc_info=True)
         
-        pinned_count = len(stored_conversations) - len(conversation_ids)
-        logger.info(f"Deleted {deleted_count} out of {len(conversation_ids)} conversations")
+        # Clear file store index cache to force fresh reload
+        file_store.clear_index_cache()
         
+        # Verify deletion by checking files directly
+        conversations_dir = file_store.conversations_dir
+        remaining_files = []
+        if conversations_dir.exists():
+            for conv_file in conversations_dir.glob("*.json"):
+                if conv_file.name != "index.json":
+                    conv_id_from_file = conv_file.stem
+                    # Only count as remaining if it's not in our deleted list (shouldn't happen)
+                    # or if it's pinned (which we didn't delete)
+                    if conv_id_from_file not in conversation_ids:
+                        remaining_files.append(conv_id_from_file)
+        
+        logger.info(f"Deleted {deleted_count} conversations. Remaining files: {len(remaining_files)}")
+        
+        pinned_count = len(stored_conversations) - len(conversation_ids)
+        
+        # Reload conversations list to get accurate count
         remaining_conversations = await service_manager.memory_store.list_conversations()
         remaining_unpinned = [c for c in remaining_conversations if not c.get("pinned", False)]
+        
+        logger.info(f"After deletion: {len(remaining_conversations)} total conversations ({len(remaining_unpinned)} unpinned)")
+        
+        # Broadcast that conversations list changed
+        try:
+            from ...services.websocket_manager import get_websocket_manager
+            ws_manager = get_websocket_manager()
+            await ws_manager.broadcast_conversations_list_changed()
+        except Exception as e:
+            logger.debug(f"Failed to broadcast conversations list changed event: {e}")
         
         return {
             "status": "success",
@@ -362,6 +425,39 @@ async def delete_all_conversations():
             status_code=500,
             detail=f"Failed to delete all conversations: {str(e)}"
         ) from e
+
+
+@router.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """Delete a conversation."""
+    if not service_manager.chat_manager:
+        raise HTTPException(
+            status_code=503,
+            detail="Chat service not initialized"
+        )
+    
+    deleted = await service_manager.chat_manager.delete_conversation(conversation_id)
+    
+    if deleted:
+        # Broadcast WebSocket event
+        try:
+            from ...services.websocket_manager import get_websocket_manager
+            ws_manager = get_websocket_manager()
+            await ws_manager.broadcast_conversation_deleted(conversation_id)
+            await ws_manager.broadcast_conversations_list_changed()
+            # Debug info will be broadcast by conversations_list_changed handler
+        except Exception as e:
+            logger.debug(f"Failed to broadcast conversation deleted event: {e}")
+        
+        return {
+            "status": "success",
+            "message": f"Conversation {conversation_id} deleted"
+        }
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Conversation {conversation_id} not found"
+        )
 
 
 @router.post("/api/conversations/cleanup")

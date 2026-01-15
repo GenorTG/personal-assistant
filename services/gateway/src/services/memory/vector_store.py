@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 import os
 import logging
+from collections import defaultdict
 
 # Disable ChromaDB telemetry before importing
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -19,23 +20,42 @@ from ...config.settings import settings
 
 
 class VectorStore:
-    """Vector store using ChromaDB or FAISS."""
+    """Vector store using ChromaDB.
     
-    def __init__(self):
+    Supports user-specific collections: each user profile has its own collection
+    to keep vector memory separate between users.
+    """
+    
+    def __init__(self, user_profile_id: Optional[str] = None):
         logger = logging.getLogger(__name__)
-        logger.info("      Initializing vector store (type: %s)...", settings.vector_store_type)
+        logger.info("      Initializing vector store (type: %s, user: %s)...", 
+                   settings.vector_store_type, user_profile_id or "default")
         self.store_type = settings.vector_store_type
+        self.user_profile_id = user_profile_id or "default"
         # Lazy initialization - don't load embedding model until needed
         # This prevents blocking during startup
         self.embedder: Optional[EmbeddingModel] = None
         self.collection: Optional[Any] = None
         self.client: Optional[Any] = None
+        self._collections_cache: Dict[str, Any] = {}  # Cache collections per user
         logger.info("      Calling _initialize_store()...")
         self._initialize_store()
         logger.info("      Initialization complete (embedding model will load on first use)")
     
+    def _get_collection_name(self, user_profile_id: Optional[str] = None) -> str:
+        """Get collection name for a user profile.
+        
+        Args:
+            user_profile_id: User profile ID, or None to use current user
+        
+        Returns:
+            Collection name
+        """
+        profile_id = user_profile_id or self.user_profile_id
+        return f"conversations_user_{profile_id}"
+    
     def _initialize_store(self):
-        """Initialize vector store (ChromaDB or FAISS)."""
+        """Initialize vector store (ChromaDB)."""
         logger = logging.getLogger(__name__)
         if self.store_type == "chromadb":
             try:
@@ -49,27 +69,64 @@ class VectorStore:
                     )
                 )
                 logger.info("      ChromaDB client created, getting/creating collection...")
-                # Get or create collection for conversations
+                # Get or create collection for current user
+                collection_name = self._get_collection_name()
                 self.collection = self.client.get_or_create_collection(
-                    name="conversations",
-                    metadata={"description": "Conversation messages and context"}
+                    name=collection_name,
+                    metadata={"description": f"Conversation messages and context for user {self.user_profile_id}"}
                 )
-                logger.info("      ChromaDB collection ready")
+                self._collections_cache[self.user_profile_id] = self.collection
+                logger.info("      ChromaDB collection ready for user: %s", self.user_profile_id)
             except Exception as e:
                 logger.error("      Error initializing ChromaDB: %s", e, exc_info=True)
                 self.collection = None
                 self.client = None
         elif self.store_type == "faiss":
-            # TODO: Initialize FAISS (fallback option)
-            # FAISS requires manual persistence handling
-            pass
+            # FAISS support not implemented - using ChromaDB only
+            logger.warning("FAISS store type requested but not implemented, using ChromaDB")
+            self.store_type = "chromadb"
+            # Re-initialize with ChromaDB
+            self._initialize_chromadb()
+    
+    def _get_collection(self, user_profile_id: Optional[str] = None) -> Optional[Any]:
+        """Get collection for a specific user profile.
+        
+        Args:
+            user_profile_id: User profile ID, or None to use current user
+        
+        Returns:
+            ChromaDB collection or None
+        """
+        if not self.client:
+            return None
+        
+        profile_id = user_profile_id or self.user_profile_id
+        
+        # Check cache first
+        if profile_id in self._collections_cache:
+            return self._collections_cache[profile_id]
+        
+        # Get or create collection for this user
+        try:
+            collection_name = self._get_collection_name(profile_id)
+            collection = self.client.get_or_create_collection(
+                name=collection_name,
+                metadata={"description": f"Conversation messages and context for user {profile_id}"}
+            )
+            self._collections_cache[profile_id] = collection
+            return collection
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error getting collection for user {profile_id}: {e}", exc_info=True)
+            return None
     
     async def add_message(
         self,
         conversation_id: str,
         message: str,
         role: str,
-        timestamp: datetime
+        timestamp: datetime,
+        user_profile_id: Optional[str] = None
     ):
         """Add a message to the vector store.
         
@@ -78,6 +135,7 @@ class VectorStore:
             message: Message text content
             role: Message role (user/assistant/system)
             timestamp: Message timestamp
+            user_profile_id: User profile ID (uses current user if None)
         """
         if not message or not message.strip():
             return  # Skip empty messages
@@ -91,14 +149,17 @@ class VectorStore:
         # Generate embedding
         embedding = await self.embedder.encode(message)
         
+        # Get user-specific collection
+        collection = self._get_collection(user_profile_id)
+        
         # Store in vector database
-        if self.store_type == "chromadb" and self.collection:
+        if self.store_type == "chromadb" and collection:
             try:
                 # Create unique ID for this message
                 message_id = f"{conversation_id}_{timestamp.isoformat()}_{hash(message) % 1000000}"
                 
                 # Add to ChromaDB
-                self.collection.add(
+                collection.add(
                     embeddings=[embedding.tolist()],
                     documents=[message],
                     ids=[message_id],
@@ -111,15 +172,17 @@ class VectorStore:
             except Exception as e:
                 print(f"Error adding message to vector store: {e}")
         elif self.store_type == "faiss":
-            # TODO: Add to FAISS
+            # FAISS not implemented - should not reach here
+            raise NotImplementedError("FAISS store type is not implemented")
             pass
     
-    async def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    async def search(self, query: str, top_k: int = 5, user_profile_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Search for similar messages.
         
         Args:
             query: Search query text
             top_k: Number of results to return
+            user_profile_id: User profile ID (uses current user if None)
         
         Returns:
             List of dictionaries with text, score, and metadata
@@ -136,10 +199,13 @@ class VectorStore:
         
         query_embedding = await self.embedder.encode(query)
         
+        # Get user-specific collection
+        collection = self._get_collection(user_profile_id)
+        
         # Search in vector database
-        if self.store_type == "chromadb" and self.collection:
+        if self.store_type == "chromadb" and collection:
             try:
-                results = self.collection.query(
+                results = collection.query(
                     query_embeddings=[query_embedding.tolist()],
                     n_results=top_k,
                     include=["documents", "metadatas", "distances"]
@@ -169,47 +235,114 @@ class VectorStore:
                 print(f"Error searching vector store: {e}")
                 return []
         elif self.store_type == "faiss":
-            # TODO: Search FAISS
+            # FAISS not implemented - should not reach here
+            raise NotImplementedError("FAISS store type is not implemented")
             return []
         
         return []
     
-    async def delete_conversation(self, conversation_id: str) -> bool:
+    async def delete_conversation(self, conversation_id: str, user_profile_id: Optional[str] = None) -> bool:
         """Delete all messages for a conversation.
         
         Args:
             conversation_id: Conversation ID to delete
+            user_profile_id: User profile ID (uses current user if None)
         
         Returns:
             True if deletion was successful, False otherwise
         """
-        if self.store_type == "chromadb" and self.collection:
+        collection = self._get_collection(user_profile_id)
+        if self.store_type == "chromadb" and collection:
             try:
                 # Get all messages for this conversation
-                results = self.collection.get(
+                results = collection.get(
                     where={"conversation_id": conversation_id}
                 )
                 
                 if results["ids"]:
                     # Delete by IDs
-                    self.collection.delete(ids=results["ids"])
+                    collection.delete(ids=results["ids"])
+                    logger = logging.getLogger(__name__)
+                    logger.info(f"Deleted {len(results['ids'])} messages from vector store for conversation {conversation_id}")
                 
                 return True
             except Exception as e:
-                print(f"Error deleting conversation from vector store: {e}")
+                logger = logging.getLogger(__name__)
+                logger.error(f"Error deleting conversation from vector store: {e}", exc_info=True)
                 return False
         
         return False
     
-    def get_collection_count(self) -> int:
+    async def delete_messages_after_index(
+        self, 
+        conversation_id: str, 
+        message_index: int,
+        user_profile_id: Optional[str] = None
+    ) -> bool:
+        """Delete messages from vector store that are after a certain index.
+        
+        Args:
+            conversation_id: Conversation ID
+            message_index: Index of the last message to keep (inclusive)
+            user_profile_id: User profile ID (uses current user if None)
+        
+        Returns:
+            True if deletion was successful, False otherwise
+        """
+        collection = self._get_collection(user_profile_id)
+        if self.store_type == "chromadb" and collection:
+            try:
+                logger = logging.getLogger(__name__)
+                # Get all messages for this conversation from vector store
+                results = collection.get(
+                    where={"conversation_id": conversation_id},
+                    include=["metadatas"]
+                )
+                
+                ids_to_delete = []
+                if results["ids"] and results["metadatas"]:
+                    # Sort messages by timestamp to ensure correct indexing
+                    messages_with_index = []
+                    for i, msg_id in enumerate(results["ids"]):
+                        metadata = results["metadatas"][i]
+                        try:
+                            timestamp = datetime.fromisoformat(metadata["timestamp"].replace("Z", "+00:00"))
+                            messages_with_index.append((timestamp, msg_id))
+                        except (ValueError, KeyError):
+                            # Fallback if timestamp is missing or invalid
+                            messages_with_index.append((datetime.min, msg_id)) # Use min datetime to put at start
+                    
+                    messages_with_index.sort(key=lambda x: x[0])
+                    
+                    # Collect IDs to delete (messages after the specified index)
+                    for i in range(message_index + 1, len(messages_with_index)):
+                        ids_to_delete.append(messages_with_index[i][1])
+                
+                if ids_to_delete:
+                    collection.delete(ids=ids_to_delete)
+                    logger.info(f"Deleted {len(ids_to_delete)} messages from vector store after index {message_index} for conversation {conversation_id}")
+                
+                return True
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Error deleting messages from vector store: {e}", exc_info=True)
+                return False
+        
+        return False
+    
+    def get_collection_count(self, user_profile_id: Optional[str] = None) -> int:
         """Get the number of items in the collection.
+        
+        Args:
+            user_profile_id: User profile ID (uses current user if None)
         
         Returns:
             Number of items in collection, or 0 if unavailable
         """
-        if self.store_type == "chromadb" and self.collection:
+        collection = self._get_collection(user_profile_id)
+        if self.store_type == "chromadb" and collection:
             try:
-                return self.collection.count()
+                return collection.count()
             except Exception:
                 return 0
         return 0

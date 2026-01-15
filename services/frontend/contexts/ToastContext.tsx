@@ -102,7 +102,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
       {children}
       
       {/* Toast Container */}
-      <div className="fixed top-4 right-4 z-[100] flex flex-col gap-2 pointer-events-none">
+      <div className="fixed top-4 right-4 z-[10000] flex flex-col gap-2 pointer-events-none">
         {toasts.map((toast) => (
           <ToastNotification key={toast.id} toast={toast} onRemove={removeToast} />
         ))}
@@ -111,11 +111,11 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
       {/* Confirm Dialog */}
       {confirmDialog && (
         <div 
-          className="fixed inset-0 z-[101] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 pointer-events-auto"
+          className="fixed inset-0 z-[9998] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 pointer-events-auto"
           onClick={handleCancel}
         >
           <div 
-            className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6 pointer-events-auto"
+            className="bg-white rounded shadow-2xl max-w-md w-full p-6 pointer-events-auto"
             onClick={(e) => e.stopPropagation()}
           >
             <h3 className="text-lg font-semibold text-gray-900 mb-4">Confirm Action</h3>
@@ -123,13 +123,13 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
             <div className="flex gap-3 justify-end">
               <button
                 onClick={handleCancel}
-                className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition-colors"
+                className="px-4 py-2 border border-gray-300 rounded text-gray-700 hover:bg-gray-50 transition-colors"
               >
                 Cancel
               </button>
               <button
                 onClick={handleConfirm}
-                className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors"
+                className="px-4 py-2 bg-primary-600 text-white rounded hover:bg-primary-700 transition-colors"
               >
                 Confirm
               </button>
@@ -165,13 +165,13 @@ function ToastNotification({ toast, onRemove }: { toast: Toast; onRemove: (id: s
   const getBgColor = () => {
     switch (toast.type) {
       case 'success':
-        return 'bg-green-50 border-green-200';
+        return 'bg-green-100 border-green-300 backdrop-blur-sm';
       case 'error':
-        return 'bg-red-50 border-red-200';
+        return 'bg-red-100 border-red-300 backdrop-blur-sm';
       case 'warning':
-        return 'bg-amber-50 border-amber-200';
+        return 'bg-amber-100 border-amber-300 backdrop-blur-sm';
       case 'info':
-        return 'bg-blue-50 border-blue-200';
+        return 'bg-blue-100 border-blue-300 backdrop-blur-sm';
     }
   };
 
@@ -179,11 +179,13 @@ function ToastNotification({ toast, onRemove }: { toast: Toast; onRemove: (id: s
     <div
       className={`
         ${getBgColor()}
-        border rounded-lg shadow-lg p-4 flex items-start gap-3 min-w-[300px] max-w-[500px]
+        border-2 rounded shadow-2xl p-4 flex items-start gap-3 min-w-[300px] max-w-[500px]
         pointer-events-auto
         transition-all duration-300
+        bg-opacity-95
         ${isExiting ? 'opacity-0 translate-x-full' : 'opacity-100 translate-x-0'}
       `}
+      style={{ zIndex: 10000 }}
     >
       <div className="flex-shrink-0 mt-0.5">
         {getIcon()}

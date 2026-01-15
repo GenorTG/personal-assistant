@@ -14,15 +14,16 @@ interface ResizableSidebarProps {
 }
 
 export default function ResizableSidebar({
-  children,
+  children: _children,
   initialWidth = 384, // 96 * 4 = 384px (w-96)
   minWidth = 200,
   maxWidth = 800,
   side = 'right',
-  className = '',
-  style = {},
+  className: _className = '',
+  style: _style = {},
   onWidthChange,
 }: ResizableSidebarProps) {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [width, setWidth] = useState(initialWidth);
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
@@ -67,16 +68,17 @@ export default function ResizableSidebar({
         document.body.style.userSelect = '';
       };
     }
+    return undefined;
   }, [isResizing, handleMouseMove, handleMouseUp]);
 
   return (
     <div
       ref={sidebarRef}
-      className={className}
+      className={_className}
       style={{
-        width: `${width}px`,
+        width: `${width}px`, // width is used here
         position: 'relative',
-        ...style,
+        ..._style,
       }}
     >
       {/* Resize handle */}
@@ -89,7 +91,7 @@ export default function ResizableSidebar({
           cursor: 'col-resize',
         }}
       />
-      {children}
+      {_children}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   X,
   Download,
@@ -12,6 +12,7 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { formatNumber, formatFileSize, formatDateShort } from "@/lib/utils";
+import { api } from "@/lib/api";
 
 interface RepoDetailsModalProps {
   modelId: string;
@@ -49,46 +50,15 @@ export default function RepoDetailsModal({
   const [error, setError] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<string>("");
 
-  useEffect(() => {
-    loadModelData();
-
-    // Close on Escape key
-    const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handleEscape);
-    return () => window.removeEventListener("keydown", handleEscape);
-  }, [modelId]);
-
-  const loadModelData = async () => {
+  const loadModelData = useCallback(async () => {
     setLoading(true);
     setError(null);
 
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
     try {
-      const [detailsRes, filesRes] = await Promise.all([
-        fetch(`${API_BASE}/api/models/${encodeURIComponent(modelId)}/details`),
-        fetch(`${API_BASE}/api/models/${encodeURIComponent(modelId)}/files`),
+      const [detailsData, filesData] = await Promise.all([
+        api.getModelDetails(modelId),
+        api.getModelFiles(modelId),
       ]);
-
-      if (!detailsRes.ok) {
-        const errorData = await detailsRes.json().catch(() => ({}));
-        throw new Error(
-          errorData.detail ||
-            `Failed to fetch model details: ${detailsRes.statusText}`
-        );
-      }
-      if (!filesRes.ok) {
-        const errorData = await filesRes.json().catch(() => ({}));
-        throw new Error(
-          errorData.detail ||
-            `Failed to fetch model files: ${filesRes.statusText}`
-        );
-      }
-
-      const detailsData = await detailsRes.json();
-      const filesData = await filesRes.json();
 
       setDetails(detailsData);
       const fileList = Array.isArray(filesData)
@@ -111,7 +81,18 @@ export default function RepoDetailsModal({
     } finally {
       setLoading(false);
     }
-  };
+  }, [modelId]);
+
+  useEffect(() => {
+    loadModelData();
+
+    // Close on Escape key
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [modelId, onClose, loadModelData]);
 
   const handleDownloadFile = () => {
     if (selectedFile) {
@@ -152,7 +133,8 @@ export default function RepoDetailsModal({
         onMouseUp={handleBackdropMouseUp}
       >
         <div
-          className="bg-white rounded-2xl p-8 max-w-2xl w-full mx-4 shadow-2xl"
+          className="bg-white rounded p-8 max-w-2xl w-full mx-4 shadow-2xl overflow-x-hidden"
+          style={{ maxWidth: 'min(95vw, 42rem)', width: 'min(95vw, 42rem)' }}
           onMouseDown={handleContentMouseDown}
           onClick={(e) => e.stopPropagation()}
         >
@@ -162,14 +144,14 @@ export default function RepoDetailsModal({
             </h2>
             <button
               onClick={onClose}
-              className="p-2 rounded-lg hover:bg-gray-100 transition-colors"
+              className="p-2 rounded hover:bg-gray-100 transition-colors"
               title="Close (Esc)"
             >
               <X size={24} className="text-gray-500" />
             </button>
           </div>
           <div className="flex justify-center items-center py-12">
-            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600"></div>
+            <div className="animate-spin rounded h-12 w-12 border-b-2 border-primary-600"></div>
           </div>
         </div>
       </div>
@@ -184,18 +166,19 @@ export default function RepoDetailsModal({
         onMouseDown={handleBackdropMouseDown}
         onMouseUp={handleBackdropMouseUp}
       >
-        <div
-          className="bg-white rounded-2xl p-8 max-w-2xl w-full mx-4 shadow-2xl"
-          onMouseDown={handleContentMouseDown}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="flex justify-between items-start mb-6">
+      <div
+        className="bg-white rounded p-8 max-w-2xl w-full mx-4 shadow-2xl overflow-x-hidden"
+        style={{ maxWidth: 'min(95vw, 42rem)', width: 'min(95vw, 42rem)' }}
+        onMouseDown={handleContentMouseDown}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex justify-between items-start mb-6">
             <h2 className="text-2xl font-bold text-red-600">
               Error Loading Model
             </h2>
             <button
               onClick={onClose}
-              className="p-2 rounded-lg hover:bg-gray-100 transition-colors"
+              className="p-2 rounded hover:bg-gray-100 transition-colors"
               title="Close (Esc)"
             >
               <X size={24} className="text-gray-500" />
@@ -207,7 +190,7 @@ export default function RepoDetailsModal({
           <div className="flex justify-end">
             <button
               onClick={onClose}
-              className="px-6 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg font-medium transition-colors"
+              className="px-6 py-2 bg-gray-100 hover:bg-gray-200 rounded font-medium transition-colors"
             >
               Close
             </button>
@@ -226,7 +209,8 @@ export default function RepoDetailsModal({
       onMouseUp={handleBackdropMouseUp}
     >
       <div
-        className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[85vh] flex flex-col"
+        className="bg-white rounded shadow-2xl max-w-3xl w-full max-h-[85vh] flex flex-col overflow-x-hidden"
+        style={{ maxWidth: 'min(95vw, 48rem)', width: 'min(95vw, 48rem)' }}
         onMouseDown={handleContentMouseDown}
         onClick={(e) => e.stopPropagation()}
       >
@@ -243,7 +227,7 @@ export default function RepoDetailsModal({
                   <span>{details.author}</span>
                 </div>
                 {details.architecture && details.architecture !== "Unknown" && (
-                  <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-primary-100 text-primary-800">
+                  <span className="px-2 py-0.5 rounded text-xs font-medium bg-primary-100 text-primary-800">
                     {details.architecture}
                   </span>
                 )}
@@ -251,7 +235,7 @@ export default function RepoDetailsModal({
             </div>
             <button
               onClick={onClose}
-              className="p-2 rounded-lg hover:bg-gray-100 transition-colors flex-shrink-0"
+              className="p-2 rounded hover:bg-gray-100 transition-colors flex-shrink-0"
               title="Close (Esc)"
             >
               <X size={24} className="text-gray-500" />
@@ -286,7 +270,7 @@ export default function RepoDetailsModal({
               <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide mb-2">
                 Description
               </h3>
-              <div className="bg-gray-50 rounded-lg p-4 max-h-48 overflow-y-auto">
+              <div className="bg-gray-50 rounded p-4 max-h-48 overflow-y-auto">
                 <p className="text-gray-700 text-sm whitespace-pre-wrap leading-relaxed">
                   {details.description}
                 </p>
@@ -304,13 +288,13 @@ export default function RepoDetailsModal({
                 {details.tags.slice(0, 12).map((tag) => (
                   <span
                     key={tag}
-                    className="px-2 py-1 rounded-md text-xs bg-gray-100 text-gray-600"
+                    className="px-2 py-1 rounded text-xs bg-gray-100 text-gray-600"
                   >
                     {tag}
                   </span>
                 ))}
                 {details.tags.length > 12 && (
-                  <span className="px-2 py-1 rounded-md text-xs bg-gray-50 text-gray-400">
+                  <span className="px-2 py-1 rounded text-xs bg-gray-50 text-gray-400">
                     +{details.tags.length - 12} more
                   </span>
                 )}
@@ -329,7 +313,7 @@ export default function RepoDetailsModal({
                 <select
                   value={selectedFile}
                   onChange={(e) => setSelectedFile(e.target.value)}
-                  className="w-full p-3 pr-10 border border-gray-300 rounded-lg bg-white text-gray-900 font-medium appearance-none cursor-pointer hover:border-primary-400 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all"
+                  className="w-full p-3 pr-10 border border-gray-300 rounded bg-white text-gray-900 font-medium appearance-none cursor-pointer hover:border-primary-400 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all"
                 >
                   {files.map((file) => {
                     const sizeDisplay =
@@ -358,14 +342,14 @@ export default function RepoDetailsModal({
                 />
               </div>
             ) : (
-              <div className="text-center py-6 text-gray-500 bg-gray-50 rounded-lg">
+              <div className="text-center py-6 text-gray-500 bg-gray-50 rounded">
                 <HardDrive size={32} className="mx-auto mb-2 opacity-30" />
                 <p>No GGUF files found in this repository</p>
               </div>
             )}
 
             {selectedFileInfo && (
-              <div className="mt-3 p-3 bg-primary-50 rounded-lg border border-primary-100">
+              <div className="mt-3 p-3 bg-primary-50 rounded border border-primary-100">
                 <p
                   className="text-sm text-primary-800 font-medium truncate"
                   title={selectedFile}
@@ -408,14 +392,14 @@ export default function RepoDetailsModal({
             <div className="flex gap-3">
               <button
                 onClick={onClose}
-                className="px-6 py-2.5 bg-white border border-gray-300 rounded-lg font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+                className="px-6 py-2.5 bg-white border border-gray-300 rounded font-medium text-gray-700 hover:bg-gray-50 transition-colors"
               >
                 Cancel
               </button>
               <button
                 onClick={handleDownloadFile}
                 disabled={!selectedFile}
-                className="flex items-center gap-2 px-6 py-2.5 bg-primary-600 text-white rounded-lg font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
+                className="flex items-center gap-2 px-6 py-2.5 bg-red-500 text-white rounded font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
               >
                 <Download size={18} />
                 Download Selected

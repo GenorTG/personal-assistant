@@ -13,15 +13,25 @@ from .app_settings_store import (
     FileUserProfileStore,
     FileSamplerSettingsStore
 )
+from .vector_memory_settings import (
+    should_save_vector_memory,
+    should_read_vector_memory,
+    get_vector_memory_settings as get_vector_memory_settings_impl,
+    set_vector_memory_settings as set_vector_memory_settings_impl,
+    apply_global_settings_to_all_conversations,
+    get_conversation_vector_memory_settings as get_conversation_vector_memory_settings_impl,
+    set_conversation_vector_memory_settings as set_conversation_vector_memory_settings_impl
+)
+from .conversation_ops import store_conversation_with_vector
 from ...config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryStore:
     """Persistent memory storage with fast file-based storage and vector search."""
     
     def __init__(self):
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info("      Creating FileConversationStore (fast JSON file storage)...")
         self.file_store = FileConversationStore(settings.memory_dir)
         logger.info("      FileConversationStore created")
@@ -41,6 +51,18 @@ class MemoryStore:
         self.sampler_settings_store = FileSamplerSettingsStore(settings.memory_dir)
         logger.info("      App settings stores created")
     
+    async def _get_current_user_profile_id(self) -> Optional[str]:
+        """Get the current active user profile ID.
+        
+        Returns:
+            User profile ID or None if no profile is set
+        """
+        try:
+            return await self.user_profile_store.get_current_user_profile_id()
+        except Exception as e:
+            logger.warning(f"Error getting current user profile ID: {e}")
+            return None
+    
     async def initialize(self):
         """Initialize memory store resources."""
         # Clean up old SQLite data (we use file store now)
@@ -48,8 +70,6 @@ class MemoryStore:
         
     async def _cleanup_old_data(self):
         """Remove old SQLite database files - we use file store only now."""
-        logger = logging.getLogger(__name__)
-        
         try:
             # Delete old conversations.db if it exists (we use file store now)
             old_conv_db = settings.memory_dir / "conversations.db"
@@ -70,11 +90,6 @@ class MemoryStore:
                     logger.warning(f"Could not delete old database: {e}")
         except Exception as e:
             logger.warning(f"Error cleaning up old data: {e}")
-
-    async def _initialize_db(self):
-        """Legacy method - no longer needed (we use file store now)."""
-        # Database is no longer used - all data in file store
-        pass
     
     async def store_conversation(
         self,
@@ -91,49 +106,16 @@ class MemoryStore:
             messages: List of message dictionaries with 'role', 'content', and optionally 'timestamp'
             name: Optional conversation name to set
         """
-        # Get existing metadata to preserve created_at and pinned status
-        # Load from index to get metadata
-        index = await self.file_store._load_index()
-        existing_meta = index.get("conversations", {}).get(conversation_id, {})
-        
-        # Preserve name if not provided
-        final_name = name if name else existing_meta.get("name")
-        
-        # Store in file store (primary storage - fast and simple)
-        metadata = {
-            "created_at": existing_meta.get("created_at") or datetime.utcnow().isoformat(),
-            "pinned": existing_meta.get("pinned", False)
-        }
-        await self.file_store.save_conversation(
+        user_profile_id = await self._get_current_user_profile_id()
+        await store_conversation_with_vector(
+            file_store=self.file_store,
+            vector_store=self.vector_store,
             conversation_id=conversation_id,
             messages=messages,
-            name=final_name,
-            metadata=metadata
+            name=name,
+            should_save_vector_func=lambda cid: self._should_save_vector_memory(cid),
+            user_profile_id=user_profile_id
         )
-        
-        # Check if vector memory saving is enabled for this conversation
-        save_enabled = await self._should_save_vector_memory(conversation_id)
-        
-        # Store in vector store (for semantic search) only if enabled
-        if save_enabled:
-            for message in messages:
-                message_content = message.get("content", "")
-                if message_content and message_content.strip():
-                    message_timestamp = message.get("timestamp")
-                    if isinstance(message_timestamp, str):
-                        try:
-                            message_timestamp = datetime.fromisoformat(message_timestamp.replace("Z", "+00:00"))
-                        except (ValueError, AttributeError):
-                            message_timestamp = datetime.utcnow()
-                    elif not isinstance(message_timestamp, datetime):
-                        message_timestamp = datetime.utcnow()
-                    
-                    await self.vector_store.add_message(
-                        conversation_id=conversation_id,
-                        message=message_content,
-                        role=message.get("role", "user"),
-                        timestamp=message_timestamp
-                    )
     
     async def retrieve_context(
         self,
@@ -164,10 +146,12 @@ class MemoryStore:
                 "metadata": {}
             }
         
+        user_profile_id = await self._get_current_user_profile_id()
         return await self.retriever.retrieve_context(
             query=query,
             top_k=top_k,
-            exclude_conversation_id=exclude_conversation_id
+            exclude_conversation_id=exclude_conversation_id,
+            user_profile_id=user_profile_id
         )
     
     async def get_conversation(
@@ -217,7 +201,6 @@ class MemoryStore:
         Returns:
             Dictionary with counts of deleted items
         """
-        logger = logging.getLogger(__name__)
         results = {
             "conversations_deleted": 0,
             "settings_cleared": False,
@@ -234,19 +217,29 @@ class MemoryStore:
                 await self.settings_store.delete_setting(key)
             results["settings_cleared"] = True
             
-            # Clear vector store
+            # Clear vector store (clear all user collections)
             try:
-                if self.vector_store.collection and self.vector_store.store_type == "chromadb":
-                    # ChromaDB: Get all IDs and delete them
+                if self.vector_store.client and self.vector_store.store_type == "chromadb":
+                    # ChromaDB: Delete all collections (each user has their own collection)
                     try:
-                        # Get all results (this might be slow for large stores, but necessary for reset)
-                        all_results = self.vector_store.collection.get()
-                        if all_results and "ids" in all_results and all_results["ids"]:
-                            self.vector_store.collection.delete(ids=all_results["ids"])
-                            logger.info(f"Deleted {len(all_results['ids'])} entries from vector store")
-                            results["vector_store_cleared"] = True
-                        else:
-                            results["vector_store_cleared"] = True  # Already empty
+                        # Get all collections and delete them
+                        collections = self.vector_store.client.list_collections()
+                        deleted_count = 0
+                        for coll in collections:
+                            try:
+                                count = coll.count()
+                                self.vector_store.client.delete_collection(name=coll.name)
+                                deleted_count += count
+                                logger.info(f"Deleted collection {coll.name} with {count} entries")
+                            except Exception as e:
+                                logger.warning(f"Could not delete collection {coll.name}: {e}")
+                        
+                        # Clear cache
+                        self.vector_store._collections_cache.clear()
+                        self.vector_store.collection = None
+                        
+                        logger.info(f"Deleted {deleted_count} total entries from vector store across all users")
+                        results["vector_store_cleared"] = True
                     except Exception as e:
                         logger.warning(f"Could not clear vector store entries: {e}")
                         results["vector_store_cleared"] = False
@@ -273,7 +266,8 @@ class MemoryStore:
         """
         try:
             # Delete from vector store
-            await self.vector_store.delete_conversation(conversation_id)
+            user_profile_id = await self._get_current_user_profile_id()
+            await self.vector_store.delete_conversation(conversation_id, user_profile_id=user_profile_id)
             
             # Delete from file store (primary storage)
             return await self.file_store.delete_conversation(conversation_id)
@@ -340,6 +334,102 @@ class MemoryStore:
             total += conv.get("message_count", 0)
         return total
 
+    async def update_message(
+        self,
+        conversation_id: str,
+        message_index: int,
+        new_content: str,
+        role: Optional[str] = None
+    ) -> bool:
+        """Update a message in a conversation and update vector store.
+        
+        Args:
+            conversation_id: Conversation ID
+            message_index: Index of message to update
+            new_content: New message content
+            role: Optional role to update
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Get the conversation to find the old message
+            messages = await self.file_store.get_conversation(conversation_id)
+            if not messages or message_index >= len(messages):
+                return False
+            
+            old_message = messages[message_index]
+            old_content = old_message.get("content", "")
+            old_timestamp = old_message.get("timestamp")
+            
+            # Update in file store
+            success = await self.file_store.update_message(
+                conversation_id=conversation_id,
+                message_index=message_index,
+                new_content=new_content,
+                role=role
+            )
+            
+            if not success:
+                return False
+            
+            # Update vector store: delete old entry and add new one
+            if old_content and old_timestamp:
+                # Parse timestamp
+                if isinstance(old_timestamp, str):
+                    try:
+                        old_timestamp_dt = datetime.fromisoformat(old_timestamp.replace("Z", "+00:00"))
+                    except (ValueError, AttributeError):
+                        old_timestamp_dt = datetime.utcnow()
+                elif not isinstance(old_timestamp, datetime):
+                    old_timestamp_dt = datetime.utcnow()
+                else:
+                    old_timestamp_dt = old_timestamp
+                
+                # Find and delete old vector entry
+                user_profile_id = await self._get_current_user_profile_id()
+                collection = self.vector_store._get_collection(user_profile_id)
+                if collection and self.vector_store.store_type == "chromadb":
+                    try:
+                        # Get all messages for this conversation
+                        results = collection.get(
+                            where={"conversation_id": conversation_id},
+                            include=["documents", "metadatas"]
+                        )
+                        
+                        # Find matching entry by content
+                        for i, doc in enumerate(results.get("documents", [])):
+                            if doc == old_content:
+                                # Check timestamp if available
+                                meta = results.get("metadatas", [])[i] if i < len(results.get("metadatas", [])) else {}
+                                stored_timestamp = meta.get("timestamp", "")
+                                
+                                # Delete if content matches (and optionally timestamp)
+                                if not stored_timestamp or stored_timestamp.startswith(old_timestamp_dt.isoformat()[:19]):
+                                    collection.delete(ids=[results["ids"][i]])
+                                    logger.info(f"Deleted old vector entry for updated message in conversation {conversation_id}")
+                                    break
+                    except Exception as e:
+                        logger.warning(f"Error deleting old vector entry: {e}")
+            
+            # Add new vector entry
+            if new_content and new_content.strip():
+                new_timestamp = datetime.utcnow()
+                user_profile_id = await self._get_current_user_profile_id()
+                await self.vector_store.add_message(
+                    conversation_id=conversation_id,
+                    message=new_content,
+                    role=role or old_message.get("role", "user"),
+                    timestamp=new_timestamp,
+                    user_profile_id=user_profile_id
+                )
+                logger.info(f"Added updated message to vector store for conversation {conversation_id}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error updating message: {e}", exc_info=True)
+            return False
+    
     async def get_last_entry_timestamp(self) -> Optional[str]:
         """Get timestamp of last entry across all conversations.
         
@@ -411,156 +501,44 @@ class MemoryStore:
         await self.settings_store.set_setting(key, value, encrypted=encrypted)
     
     async def _should_save_vector_memory(self, conversation_id: str) -> bool:
-        """Check if vector memory saving is enabled for a conversation.
-        
-        Checks per-conversation settings first (from file store), then falls back to global settings.
-        """
-        # Check per-conversation settings from file store
-        conv_file = self.file_store.conversations_dir / f"{conversation_id}.json"
-        if conv_file.exists():
-            try:
-                import aiofiles
-                import json
-                async with aiofiles.open(conv_file, 'r', encoding='utf-8') as f:
-                    content = await f.read()
-                    data = json.loads(content)
-                    vector_memory = data.get("vector_memory", {})
-                    if vector_memory.get("custom", False):
-                        save_enabled = vector_memory.get("save_enabled")
-                        if save_enabled is not None:
-                            return save_enabled
-            except Exception:
-                pass  # Fall through to global settings
-        
-        # Fall back to global settings
-        global_enabled = await self.get_setting("vector_memory_enabled", "true")
-        if global_enabled != "true":
-            return False
-        
-        global_save = await self.get_setting("vector_memory_save_enabled", "true")
-        return global_save == "true"
+        """Check if vector memory saving is enabled for a conversation."""
+        return await should_save_vector_memory(
+            conversation_id,
+            self.file_store.conversations_dir,
+            self.get_setting
+        )
     
     async def _should_read_vector_memory(self, conversation_id: Optional[str]) -> bool:
-        """Check if vector memory reading is enabled for a conversation.
-        
-        Checks per-conversation settings first (from file store), then falls back to global settings.
-        """
-        if conversation_id:
-            # Check per-conversation settings from file store
-            conv_file = self.file_store.conversations_dir / f"{conversation_id}.json"
-            if conv_file.exists():
-                try:
-                    import aiofiles
-                    import json
-                    async with aiofiles.open(conv_file, 'r', encoding='utf-8') as f:
-                        content = await f.read()
-                        data = json.loads(content)
-                        vector_memory = data.get("vector_memory", {})
-                        if vector_memory.get("custom", False):
-                            read_enabled = vector_memory.get("read_enabled")
-                            if read_enabled is not None:
-                                return read_enabled
-                except Exception:
-                    pass  # Fall through to global settings
-        
-        # Fall back to global settings
-        global_enabled = await self.get_setting("vector_memory_enabled", "true")
-        if global_enabled != "true":
-            return False
-        
-        global_read = await self.get_setting("vector_memory_read_enabled", "true")
-        return global_read == "true"
+        """Check if vector memory reading is enabled for a conversation."""
+        return await should_read_vector_memory(
+            conversation_id,
+            self.file_store.conversations_dir,
+            self.get_setting
+        )
     
     async def get_vector_memory_settings(self) -> Dict[str, Any]:
         """Get global vector memory settings."""
-        return {
-            "vector_memory_enabled": await self.get_setting("vector_memory_enabled", "true") == "true",
-            "vector_memory_save_enabled": await self.get_setting("vector_memory_save_enabled", "true") == "true",
-            "vector_memory_read_enabled": await self.get_setting("vector_memory_read_enabled", "true") == "true",
-            "vector_memory_apply_to_all": await self.get_setting("vector_memory_apply_to_all", "false") == "true"
-        }
+        return await get_vector_memory_settings_impl(self.get_setting)
     
     async def set_vector_memory_settings(self, settings: Dict[str, Any]):
         """Set global vector memory settings."""
-        for key, value in settings.items():
-            await self.set_setting(key, "true" if value else "false")
-        
-        # If apply_to_all is True, update all conversations
-        if settings.get("vector_memory_apply_to_all", False):
-            await self._apply_global_settings_to_all_conversations(settings)
-    
-    async def _apply_global_settings_to_all_conversations(self, settings: Dict[str, Any]):
-        """Apply global vector memory settings to all conversations (update file store)."""
-        import aiofiles
-        import json
-        
-        conversations = await self.file_store.list_conversations()
-        updated_count = 0
-        
-        for conv_data in conversations:
-            conv_id = conv_data["conversation_id"]
-            conv_file = self.file_store.conversations_dir / f"{conv_id}.json"
-            
-            if not conv_file.exists():
-                continue
-            
-            try:
-                # Read conversation file
-                async with aiofiles.open(conv_file, 'r', encoding='utf-8') as f:
-                    content = await f.read()
-                    data = json.loads(content)
-                
-                # Update vector memory settings
-                if "vector_memory" not in data:
-                    data["vector_memory"] = {}
-                
-                data["vector_memory"]["custom"] = False  # Reset to use global
-                data["vector_memory"]["save_enabled"] = None
-                data["vector_memory"]["read_enabled"] = None
-                data["updated_at"] = datetime.utcnow().isoformat()
-                
-                # Write back
-                async with aiofiles.open(conv_file, 'w', encoding='utf-8') as f:
-                    await f.write(json.dumps(data, indent=2, default=str))
-                
-                updated_count += 1
-            except Exception as e:
-                logger = logging.getLogger(__name__)
-                logger.error(f"Error updating conversation {conv_id}: {e}")
-        
-        logger = logging.getLogger(__name__)
-        logger.info(f"Applied global vector memory settings to {updated_count} conversations")
+        await set_vector_memory_settings_impl(
+            settings,
+            self.set_setting,
+            self.file_store,
+            lambda s: apply_global_settings_to_all_conversations(
+                s,
+                self.file_store.conversations_dir,
+                self.file_store.list_conversations
+            )
+        )
     
     async def get_conversation_vector_memory_settings(self, conversation_id: str) -> Dict[str, Any]:
         """Get per-conversation vector memory settings from file store."""
-        import aiofiles
-        import json
-        
-        conv_file = self.file_store.conversations_dir / f"{conversation_id}.json"
-        
-        if not conv_file.exists():
-                    return {
-                "custom": False,
-                "save_enabled": None,
-                "read_enabled": None
-            }
-        
-        try:
-            async with aiofiles.open(conv_file, 'r', encoding='utf-8') as f:
-                content = await f.read()
-                data = json.loads(content)
-                vector_memory = data.get("vector_memory", {})
-                return {
-                    "custom": vector_memory.get("custom", False),
-                    "save_enabled": vector_memory.get("save_enabled"),
-                    "read_enabled": vector_memory.get("read_enabled")
-                }
-        except Exception:
-            return {
-                "custom": False,
-                "save_enabled": None,
-                "read_enabled": None
-            }
+        return await get_conversation_vector_memory_settings_impl(
+            conversation_id,
+            self.file_store.conversations_dir
+        )
     
     async def set_conversation_vector_memory_settings(
         self, 
@@ -568,40 +546,11 @@ class MemoryStore:
         settings: Dict[str, Any]
     ):
         """Set per-conversation vector memory settings in file store."""
-        import aiofiles
-        import json
-        
-        conv_file = self.file_store.conversations_dir / f"{conversation_id}.json"
-        
-        if not conv_file.exists():
-            raise ValueError(f"Conversation {conversation_id} not found")
-        
-        custom = settings.get("custom", False)
-        save_enabled = settings.get("save_enabled", True) if custom else None
-        read_enabled = settings.get("read_enabled", True) if custom else None
-        
-        try:
-            # Read conversation file
-            async with aiofiles.open(conv_file, 'r', encoding='utf-8') as f:
-                content = await f.read()
-                data = json.loads(content)
-            
-            # Update vector memory settings
-            if "vector_memory" not in data:
-                data["vector_memory"] = {}
-            
-            data["vector_memory"]["custom"] = custom
-            data["vector_memory"]["save_enabled"] = save_enabled
-            data["vector_memory"]["read_enabled"] = read_enabled
-            data["updated_at"] = datetime.utcnow().isoformat()
-            
-            # Write back
-            async with aiofiles.open(conv_file, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(data, indent=2, default=str))
-        except Exception as e:
-            logger = logging.getLogger(__name__)
-            logger.error(f"Error setting vector memory settings for {conversation_id}: {e}")
-            raise
+        await set_conversation_vector_memory_settings_impl(
+            conversation_id,
+            settings,
+            self.file_store.conversations_dir
+        )
     
     # System prompt methods
     async def get_system_prompt(self, prompt_id: Optional[str] = None) -> Optional[Dict[str, Any]]:

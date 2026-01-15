@@ -26,15 +26,26 @@ class TTSManager:
     
     def _initialize_backends(self):
         """Initialize all available TTS backends."""
-        # Register available backends
-        self.backends = {
-            "chatterbox": ChatterboxBackend(),
-            "kokoro": KokoroBackend(),
-            "piper": PiperBackend(),
-            "coqui": CoquiBackend(),
-            "pyttsx3": Pyttsx3Backend(),
-            "openai": OpenAITTSBackend()
+        # Register available backends (with error handling for each)
+        self.backends = {}
+        
+        # Try to initialize each backend, skip if it fails
+        backend_classes = {
+            "chatterbox": ChatterboxBackend,
+            "kokoro": KokoroBackend,
+            "piper": PiperBackend,
+            "coqui": CoquiBackend,
+            "pyttsx3": Pyttsx3Backend,
+            "openai": OpenAITTSBackend
         }
+        
+        for name, backend_class in backend_classes.items():
+            try:
+                self.backends[name] = backend_class()
+                logger.debug(f"TTS backend '{name}' initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize TTS backend '{name}': {e}")
+                # Continue with other backends even if one fails
         
         # Set default backend from settings
         default_provider = settings.tts_provider.lower()
@@ -134,9 +145,20 @@ class TTSManager:
         """
         backends_info = []
         for name, backend in self.backends.items():
-            info = backend.get_status()
-            info["is_current"] = (name == self.current_backend_name)
-            backends_info.append(info)
+            try:
+                info = backend.get_status()
+                info["is_current"] = (name == self.current_backend_name)
+                backends_info.append(info)
+            except Exception as e:
+                logger.error(f"Error getting status for backend '{name}': {e}", exc_info=True)
+                # Return error status for this backend
+                backends_info.append({
+                    "name": name,
+                    "status": "error",
+                    "is_ready": False,
+                    "is_current": (name == self.current_backend_name),
+                    "error_message": str(e)
+                })
         return backends_info
     
     def get_backend(self, backend_name: Optional[str] = None) -> Optional[TTSBackend]:
@@ -165,16 +187,36 @@ class TTSManager:
         if not backend:
             return None
         
-        info = backend.get_status()
-        
-        # Handle async get_available_voices
-        if asyncio.iscoroutinefunction(backend.get_available_voices):
-            info["voices"] = await backend.get_available_voices()
-        else:
-            info["voices"] = backend.get_available_voices()
+        try:
+            info = backend.get_status()
             
-        info["options"] = backend.get_options()
-        return info
+            # Handle async get_available_voices
+            try:
+                if asyncio.iscoroutinefunction(backend.get_available_voices):
+                    info["voices"] = await backend.get_available_voices()
+                else:
+                    info["voices"] = backend.get_available_voices()
+            except Exception as e:
+                logger.warning(f"Error getting voices for backend '{backend_name}': {e}")
+                info["voices"] = []
+            
+            try:
+                info["options"] = backend.get_options()
+            except Exception as e:
+                logger.warning(f"Error getting options for backend '{backend_name}': {e}")
+                info["options"] = {}
+            
+            return info
+        except Exception as e:
+            logger.error(f"Error getting backend info for '{backend_name}': {e}", exc_info=True)
+            return {
+                "name": backend_name or "unknown",
+                "status": "error",
+                "is_ready": False,
+                "error_message": str(e),
+                "voices": [],
+                "options": {}
+            }
     
     async def initialize_backend(self, backend_name: str) -> bool:
         """Initialize a specific backend.

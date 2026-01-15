@@ -1,2 +1,0 @@
-"""Tool service source package."""
-

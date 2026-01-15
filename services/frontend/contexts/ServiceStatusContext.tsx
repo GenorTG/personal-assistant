@@ -1,7 +1,8 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import { api } from '@/lib/api';
+import { useWebSocketEvent } from '@/contexts/WebSocketContext';
 
 interface ServiceStatus {
   status: 'ready' | 'offline' | 'error';
@@ -24,6 +25,17 @@ interface AllServicesStatus {
   last_poll?: string;
 }
 
+/**
+ * Service Architecture Notes:
+ * - STT: Integrated into gateway (native faster-whisper) - always available
+ * - Piper TTS: Integrated into gateway (native piper-tts) - always available
+ * - Kokoro TTS: Integrated into gateway (native kokoro-onnx) - always available
+ * - Chatterbox TTS: Optional HTTP service (port 4123) - separate process
+ * - LLM: Integrated into gateway (native llama-cpp-python) - always available
+ * - Memory: Integrated into gateway (native ChromaDB) - always available
+ * - Tools: Integrated into gateway (native ToolManager) - always available
+ */
+
 interface ServiceStatusContextValue {
   statuses: AllServicesStatus | null;
   loading: boolean;
@@ -33,93 +45,39 @@ interface ServiceStatusContextValue {
 
 const ServiceStatusContext = createContext<ServiceStatusContextValue | undefined>(undefined);
 
-// Smart polling intervals
-const STABLE_INTERVAL = 30000; // 30 seconds when all services are ready
-const UNSTABLE_INTERVAL = 10000; // 10 seconds when services are unstable
-
 export function ServiceStatusProvider({ children }: { children: ReactNode }) {
   const [statuses, setStatuses] = useState<AllServicesStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
-  const stableCountRef = useRef(0); // Track consecutive stable checks
 
   const fetchStatuses = useCallback(async () => {
     try {
+      // API client will automatically use WebSocket if available, fallback to HTTP
       const data = await api.getServicesStatus();
       setStatuses(data);
       setError(null);
-      
-      // Check if all services are ready
-      const allReady = data && 
-        data.stt?.status === 'ready' &&
-        data.llm?.status === 'ready' &&
-        (data.tts?.piper?.status === 'ready' || 
-         data.tts?.chatterbox?.status === 'ready' || 
-         data.tts?.kokoro?.status === 'ready');
-      
-      if (allReady) {
-        stableCountRef.current += 1;
-      } else {
-        stableCountRef.current = 0;
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch service statuses');
       console.error('Error fetching service statuses:', err);
-      stableCountRef.current = 0;
     } finally {
       setLoading(false);
     }
   }, []);
 
-  // Setup adaptive polling
-  const setupPolling = useCallback(() => {
-    // Clear existing interval
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
+  // Subscribe to WebSocket events for real-time updates
+  useWebSocketEvent('service_status_changed', (payload) => {
+    if (payload) {
+      setStatuses(payload);
+      setError(null);
+      setLoading(false);
     }
+  });
 
-    // Determine current interval based on stability
-    // Consider stable after 3 consecutive successful checks with all services ready
-    const isStable = stableCountRef.current >= 3;
-    const currentInterval = isStable ? STABLE_INTERVAL : UNSTABLE_INTERVAL;
-
-    // Set up new interval with adaptive timing
-    intervalRef.current = setInterval(() => {
-      fetchStatuses();
-      // Re-evaluate interval after each check
-      setupPolling();
-    }, currentInterval);
-  }, [fetchStatuses]);
-
+  // Event-driven: Only fetch on mount, then rely on WebSocket events
   useEffect(() => {
-    // Initial fetch
+    // Initial fetch only
     fetchStatuses();
-    setupPolling();
-
-    // Handle page visibility (pause when tab is hidden)
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        // Tab is hidden - pause polling
-        if (intervalRef.current) {
-          clearInterval(intervalRef.current);
-          intervalRef.current = null;
-        }
-      } else {
-        // Tab is visible - resume polling
-        fetchStatuses();
-        setupPolling();
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }, [fetchStatuses, setupPolling]);
+  }, [fetchStatuses]);
 
   return (
     <ServiceStatusContext.Provider 

@@ -5,6 +5,11 @@ import { Providers } from '@/components/Providers';
 export const metadata: Metadata = {
   title: 'Personal AI Assistant',
   description: 'Your personal AI assistant',
+  icons: {
+    icon: '/icon.svg',
+    shortcut: '/icon.svg',
+    apple: '/icon.svg',
+  },
 };
 
 export default function RootLayout({

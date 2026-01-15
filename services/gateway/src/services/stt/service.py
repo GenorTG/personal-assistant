@@ -1,5 +1,5 @@
 """Speech-to-Text service."""
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 from pathlib import Path
 import os
 import json
@@ -7,6 +7,7 @@ import urllib.request
 import zipfile
 import shutil
 import logging
+import psutil
 from ...config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,64 @@ class STTService:
         self.model = None
         self.vosk_model_path: Optional[Path] = None
         self._initialized = False
+        self._current_model_size: Optional[str] = None
+        self._baseline_memory_mb: Optional[float] = None
+        self._download_status: Dict[str, Dict[str, Any]] = {}
+
+    def get_download_status(self, model_size: str) -> Dict[str, Any]:
+        """Get status for a requested model download."""
+        return self._download_status.get(
+            model_size,
+            {
+                "status": "not_found",
+                "model_id": model_size,
+                "downloaded": False,
+            },
+        )
+
+    def download_model_size(self, model_size: str) -> None:
+        """
+        Trigger an on-demand download of a faster-whisper model by initializing it once.
+        This does NOT switch the currently loaded model; it only warms the cache.
+        """
+        # Mark queued immediately
+        self._download_status[model_size] = {
+            "status": "queued",
+            "model_id": model_size,
+            "downloaded": False,
+            "message": "Queued download",
+        }
+
+        import threading
+
+        def _run():
+            try:
+                self._download_status[model_size] = {
+                    "status": "downloading",
+                    "model_id": model_size,
+                    "downloaded": False,
+                    "message": "Downloading model (initializing once to populate cache)...",
+                }
+                from faster_whisper import WhisperModel
+
+                # Use CPU+int8 for the download warmup to reduce GPU impact
+                _ = WhisperModel(model_size, device="cpu", compute_type="int8")
+                # If constructor returns, the model is available in cache
+                self._download_status[model_size] = {
+                    "status": "ready",
+                    "model_id": model_size,
+                    "downloaded": True,
+                    "message": "Model downloaded and cached",
+                }
+            except Exception as e:
+                self._download_status[model_size] = {
+                    "status": "error",
+                    "model_id": model_size,
+                    "downloaded": False,
+                    "error": str(e),
+                }
+
+        threading.Thread(target=_run, daemon=True).start()
     
     def _initialize_model(self):
         """Initialize STT model (auto-downloads on first use)."""
@@ -30,14 +89,17 @@ class STTService:
             logger.info(f"Initializing STT model (provider: {self.provider})...")
             if self.provider == "faster-whisper":
                 self._initialize_faster_whisper()
+                self._initialized = True
+                logger.info("STT model initialized successfully")
             elif self.provider == "vosk":
                 self._initialize_vosk()
+                self._initialized = True
+                logger.info("STT model initialized successfully")
             else:
                 raise ValueError(f"Unknown STT provider: {self.provider}")
-            self._initialized = True
-            logger.info("STT model initialized successfully")
         except Exception as e:
-            logger.error(f"Failed to initialize STT model: {e}")
+            logger.error(f"Failed to initialize STT model: {e}", exc_info=True)
+            self._initialized = False
             raise
     
     def _initialize_faster_whisper(self):
@@ -50,13 +112,19 @@ class STTService:
             model_size = settings.stt_model_size
             logger.info(f"Initializing faster-whisper model: {model_size}")
             
+            # Auto-detect device and compute type
+            device, compute_type = self._detect_device_and_compute_type()
+            logger.info(f"Using device: {device}, compute_type: {compute_type}")
+            
             # Initialize model - this will auto-download if not cached
+            # Model is kept in memory for fast subsequent calls
             self.model = WhisperModel(
                 model_size,
-                device="cpu",
-                compute_type="int8"  # Use int8 for faster inference
+                device=device,
+                compute_type=compute_type
             )
-            logger.info("faster-whisper model initialized successfully")
+            self._current_model_size = model_size
+            logger.info(f"faster-whisper model initialized successfully on {device}")
         except ImportError:
             raise RuntimeError(
                 "faster-whisper not installed. Install with: pip install faster-whisper"
@@ -64,6 +132,25 @@ class STTService:
         except Exception as e:
             logger.error(f"Failed to initialize faster-whisper: {e}")
             raise
+    
+    def _detect_device_and_compute_type(self) -> tuple[str, str]:
+        """Detect best device and compute type for faster-whisper."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # CUDA available - use GPU
+                device = "cuda"
+                # Try float16 for speed, fallback to int8 if not supported
+                compute_type = "float16"
+                logger.info(f"CUDA detected: {torch.cuda.get_device_name(0)}")
+                return device, compute_type
+        except ImportError:
+            pass
+        
+        # Fallback to CPU
+        device = "cpu"
+        compute_type = "int8"  # int8 is faster on CPU
+        return device, compute_type
     
     def _initialize_vosk(self):
         """Initialize Vosk model (auto-downloads if needed)."""
@@ -77,6 +164,7 @@ class STTService:
             # Initialize Vosk model
             self.model = vosk.Model(str(model_path))
             self.vosk_model_path = model_path
+            self._current_model_size = "vosk-en-us-0.22"
             logger.info("Vosk model initialized successfully")
         except ImportError:
             raise RuntimeError(
@@ -142,6 +230,8 @@ class STTService:
         """
         Transcribe audio file to text.
         
+        Model is preloaded and kept in memory for fast inference.
+        
         Args:
             audio_path: Path to audio file
             language: Optional language code (e.g., 'en', 'es')
@@ -149,6 +239,7 @@ class STTService:
         Returns:
             Tuple of (transcribed_text, detected_language)
         """
+        # Ensure model is initialized (should be preloaded on startup)
         if not self.model:
             self._initialize_model()
         
@@ -292,3 +383,108 @@ class STTService:
             # Clean up temp file
             if tmp_path.exists():
                 tmp_path.unlink()
+    
+    def unload_model(self) -> bool:
+        """Unload current model from memory."""
+        try:
+            if self.model:
+                # Clear model reference
+                self.model = None
+                self._initialized = False
+                self._current_model_size = None
+                logger.info("STT model unloaded from memory")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error unloading STT model: {e}")
+            return False
+    
+    def switch_model_size(self, model_size: str) -> bool:
+        """Switch Whisper model size (only for faster-whisper)."""
+        if self.provider != "faster-whisper":
+            logger.warning("Model switching only supported for faster-whisper")
+            return False
+        
+        try:
+            # Unload current model
+            self.unload_model()
+            
+            # Update settings
+            from ...config.settings import settings
+            settings.stt_model_size = model_size
+            
+            # Reinitialize with new size
+            self._initialize_faster_whisper()
+            logger.info(f"Switched STT model to: {model_size}")
+            return True
+        except Exception as e:
+            logger.error(f"Error switching STT model size: {e}")
+            return False
+    
+    def get_model_status(self) -> Dict[str, Any]:
+        """Get current model status and information."""
+        status = {
+            "loaded": self._initialized and self.model is not None,
+            "provider": self.provider,
+            "model_size": self._current_model_size,
+            "initialized": self._initialized
+        }
+        
+        if self.provider == "faster-whisper" and self._current_model_size:
+            # Model size estimates (approximate)
+            size_estimates = {
+                "tiny": {"size_mb": 39, "memory_mb": 150},
+                "base": {"size_mb": 74, "memory_mb": 250},
+                "small": {"size_mb": 244, "memory_mb": 500},
+                "medium": {"size_mb": 769, "memory_mb": 1200},
+                "large": {"size_mb": 1550, "memory_mb": 2500},
+                "large-v2": {"size_mb": 1550, "memory_mb": 2500},
+                "large-v3": {"size_mb": 1550, "memory_mb": 2500},
+            }
+            if self._current_model_size in size_estimates:
+                status.update(size_estimates[self._current_model_size])
+        elif self.provider == "vosk":
+            status.update({
+                "size_mb": 50,  # Approximate
+                "memory_mb": 100  # Approximate
+            })
+        
+        return status
+    
+    def get_memory_usage(self) -> Dict[str, Any]:
+        """Get memory usage for STT service."""
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / (1024 * 1024)
+            
+            # Estimate model memory (rough estimate)
+            model_memory_mb = 0
+            if self._initialized and self.model:
+                if self.provider == "faster-whisper" and self._current_model_size:
+                    size_estimates = {
+                        "tiny": 150,
+                        "base": 250,
+                        "small": 500,
+                        "medium": 1200,
+                        "large": 2500,
+                        "large-v2": 2500,
+                        "large-v3": 2500,
+                    }
+                    model_memory_mb = size_estimates.get(self._current_model_size, 0)
+                elif self.provider == "vosk":
+                    model_memory_mb = 100
+            
+            return {
+                "total_memory_mb": round(memory_mb, 2),
+                "model_memory_mb": round(model_memory_mb, 2),
+                "base_memory_mb": round(memory_mb - model_memory_mb, 2) if model_memory_mb > 0 else round(memory_mb, 2)
+            }
+        except Exception as e:
+            logger.error(f"Error getting STT memory usage: {e}")
+            return {
+                "total_memory_mb": 0,
+                "model_memory_mb": 0,
+                "base_memory_mb": 0,
+                "error": str(e)
+            }

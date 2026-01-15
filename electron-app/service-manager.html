@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Personal Assistant - Service Manager</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5rem;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .services-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .service-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }
+        
+        .service-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .service-name {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+        
+        .status-badge {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status-running {
+            background: #10b981;
+            color: white;
+        }
+        
+        .status-stopped {
+            background: #6b7280;
+            color: white;
+        }
+        
+        .status-unknown {
+            background: #f59e0b;
+            color: white;
+        }
+        
+        .service-info {
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+            opacity: 0.9;
+        }
+        
+        .service-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            flex: 1;
+            min-width: 100px;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .btn-start {
+            background: #10b981;
+            color: white;
+        }
+        
+        .btn-stop {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .btn-restart {
+            background: #3b82f6;
+            color: white;
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .open-app-btn {
+            display: block;
+            width: 100%;
+            max-width: 400px;
+            margin: 30px auto;
+            padding: 15px 30px;
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: 2px solid white;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .open-app-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: scale(1.05);
+        }
+        
+        .open-app-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top: 2px solid white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Personal Assistant</h1>
+        <div class="services-grid" id="servicesGrid"></div>
+        <button class="open-app-btn" id="openAppBtn" disabled>
+            <span id="openAppText">Waiting for Frontend...</span>
+        </button>
+    </div>
+
+    <script>
+        const services = [];
+        let refreshInterval = null;
+        
+        const SERVICE_NAMES = {
+            gateway: 'Gateway',
+            frontend: 'Frontend',
+            chatterbox: 'Chatterbox TTS',
+        };
+        
+        function getServiceDisplayName(serviceName) {
+            return SERVICE_NAMES[serviceName] || serviceName;
+        }
+
+        async function loadServices() {
+            try {
+                const serviceNames = await window.electronAPI.listServices();
+                services.length = 0;
+                
+                for (const serviceName of serviceNames) {
+                    const status = await window.electronAPI.getServiceStatus(serviceName);
+                    services.push({ name: serviceName, ...status });
+                }
+                
+                renderServices();
+                checkFrontendReady();
+            } catch (error) {
+                console.error('Error loading services:', error);
+            }
+        }
+
+        function renderServices() {
+            const grid = document.getElementById('servicesGrid');
+            grid.innerHTML = services.map(service => {
+                const statusClass = `status-${service.status}`;
+                const isRunning = service.status === 'running';
+                
+                return `
+                    <div class="service-card">
+                        <div class="service-header">
+                            <div class="service-name">${service.name || service.name}</div>
+                            <span class="status-badge ${statusClass}">${service.status}</span>
+                        </div>
+                        <div class="service-info">
+                            Port: ${service.port || 'N/A'}
+                            ${service.pid ? ` • PID: ${service.pid}` : ''}
+                        </div>
+                        <div class="service-actions">
+                            ${!isRunning ? `
+                                <button class="btn-start" onclick="startService('${service.name}')">
+                                    ▶ Start
+                                </button>
+                            ` : `
+                                <button class="btn-stop" onclick="stopService('${service.name}')">
+                                    ⏹ Stop
+                                </button>
+                                <button class="btn-restart" onclick="restartService('${service.name}')">
+                                    🔄 Restart
+                                </button>
+                            `}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function startService(serviceName) {
+            try {
+                const result = await window.electronAPI.startService(serviceName, false);
+                if (result.success) {
+                    setTimeout(loadServices, 1000);
+                } else {
+                    alert(`Failed to start ${serviceName}: ${result.error}`);
+                }
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+            }
+        }
+
+        async function stopService(serviceName) {
+            try {
+                const result = await window.electronAPI.stopService(serviceName);
+                if (result.success) {
+                    setTimeout(loadServices, 1000);
+                } else {
+                    alert(`Failed to stop ${serviceName}: ${result.error}`);
+                }
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+            }
+        }
+
+        async function restartService(serviceName) {
+            try {
+                const result = await window.electronAPI.restartService(serviceName, false);
+                if (result.success) {
+                    setTimeout(loadServices, 2000);
+                } else {
+                    alert(`Failed to restart ${serviceName}: ${result.error}`);
+                }
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+            }
+        }
+
+        async function checkFrontendReady() {
+            try {
+                const response = await fetch('http://localhost:8002');
+                if (response.ok || response.status === 404) {
+                    const btn = document.getElementById('openAppBtn');
+                    const text = document.getElementById('openAppText');
+                    btn.disabled = false;
+                    text.textContent = 'Open Personal Assistant';
+                    btn.onclick = () => {
+                        window.location.href = 'http://localhost:8002';
+                    };
+                }
+            } catch (error) {
+                // Frontend not ready yet
+            }
+        }
+
+        // Initial load
+        loadServices();
+        
+        // Refresh every 2 seconds
+        refreshInterval = setInterval(loadServices, 2000);
+        
+        // Check frontend every 3 seconds
+        setInterval(checkFrontendReady, 3000);
+    </script>
+</body>
+</html>

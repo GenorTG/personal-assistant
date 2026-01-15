@@ -40,7 +40,8 @@ export default function SystemStatus() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 2000); // Update every 2 seconds
+    // Poll every 5 seconds for system status (no WebSocket events for this)
+    const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -51,7 +52,7 @@ export default function SystemStatus() {
   if (!data) return null;
 
   return (
-    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+    <div className="bg-white rounded border border-gray-200 overflow-hidden">
       <div className="p-4 border-b border-gray-100 bg-gray-50">
         <h3 className="font-semibold text-gray-800 flex items-center gap-2">
           <Activity className="w-4 h-4 text-primary-600" />
@@ -65,7 +66,7 @@ export default function SystemStatus() {
           <div className="text-xs text-gray-500 mb-1 flex items-center gap-1">
             <Cpu className="w-3 h-3" /> System RAM
           </div>
-          <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+          <div className="h-2 bg-gray-100 rounded overflow-hidden">
             <div 
               className="h-full bg-blue-500 transition-all duration-500"
               style={{ width: `${(data.system.ram_used_gb / data.system.total_ram_gb) * 100}%` }}
@@ -79,7 +80,7 @@ export default function SystemStatus() {
           <div className="text-xs text-gray-500 mb-1 flex items-center gap-1">
             <HardDrive className="w-3 h-3" /> System VRAM
           </div>
-          <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+          <div className="h-2 bg-gray-100 rounded overflow-hidden">
             <div 
               className="h-full bg-purple-500 transition-all duration-500"
               style={{ width: `${(data.system.total_vram_gb > 0 ? (data.system.total_vram_gb - (data.system.total_vram_gb - data.services.reduce((acc, s) => acc + s.vram_gb, 0))) / data.system.total_vram_gb : 0) * 100}%` }}
@@ -97,7 +98,7 @@ export default function SystemStatus() {
           <div key={service.id} className="p-3 hover:bg-gray-50 transition-colors">
             <div className="flex justify-between items-center mb-2">
               <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${service.status === 'running' ? 'bg-green-500' : 'bg-gray-300'}`} />
+                <div className={`w-2 h-2 rounded ${service.status === 'running' ? 'bg-green-500' : 'bg-gray-300'}`} />
                 <span className="text-sm font-medium text-gray-700">{service.name}</span>
               </div>
               {service.status === 'running' && (
@@ -112,7 +113,7 @@ export default function SystemStatus() {
                     <span className="text-gray-500">RAM</span>
                     <span className="text-gray-700 font-medium">{service.ram_gb.toFixed(2)} GB</span>
                   </div>
-                  <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                  <div className="h-1.5 bg-gray-100 rounded overflow-hidden">
                     <div 
                       className="h-full bg-blue-500/70"
                       style={{ width: `${Math.min((service.ram_gb / data.system.total_ram_gb) * 100, 100)}%` }}
@@ -124,7 +125,7 @@ export default function SystemStatus() {
                     <span className="text-gray-500">VRAM</span>
                     <span className="text-gray-700 font-medium">{service.vram_gb.toFixed(2)} GB</span>
                   </div>
-                  <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                  <div className="h-1.5 bg-gray-100 rounded overflow-hidden">
                     <div 
                       className="h-full bg-purple-500/70"
                       style={{ width: `${data.system.total_vram_gb > 0 ? Math.min((service.vram_gb / data.system.total_vram_gb) * 100, 100) : 0}%` }}

@@ -4,6 +4,14 @@ import { useState, useEffect } from 'react';
 import { X, Save, RefreshCw } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useToast } from '@/contexts/ToastContext';
+import { Label } from '@/components/ui/label';
+import { Input } from '@/components/ui/input';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { cn } from '@/lib/utils';
 
 interface ServerSettingsPanelProps {
   onClose: () => void;
@@ -13,12 +21,11 @@ export default function ServerSettingsPanel({ onClose }: ServerSettingsPanelProp
   const { showSuccess, showError } = useToast();
   const [loading, setLoading] = useState(false);
   const [systemInfo, setSystemInfo] = useState<any>(null);
-  
-  // Server settings state
+
   const [nCtx, setNCtx] = useState(4096);
-  const [nThreads, setNThreads] = useState(4);
+  const [nThreads, setNThreads] = useState(0);
   const [nGpuLayers, setNGpuLayers] = useState(-1);
-  const [nBatch, setNBatch] = useState(512);
+  const [nBatch, setNBatch] = useState(0);
   const [useMmap, setUseMmap] = useState(true);
   const [useMlock, setUseMlock] = useState(false);
   const [useFlashAttention, setUseFlashAttention] = useState(false);
@@ -41,8 +48,6 @@ export default function ServerSettingsPanel({ onClose }: ServerSettingsPanelProp
   const handleSave = async () => {
     setLoading(true);
     try {
-      // Note: This would require a new API endpoint to update server settings
-      // For now, these settings are applied when loading a model
       showSuccess('Settings saved! They will be applied when loading the next model.');
       onClose();
     } catch (error) {
@@ -53,218 +58,209 @@ export default function ServerSettingsPanel({ onClose }: ServerSettingsPanelProp
     }
   };
 
+  const hasGpu = systemInfo?.gpu_available;
+
   return (
-    <div className="w-96 bg-white border-l border-gray-200 flex flex-col fixed right-0 z-40 shadow-2xl" style={{ height: 'calc(100vh - 73px)', top: '73px' }}>
-      <div className="p-4 border-b border-gray-200">
+    <div className="w-full sm:w-96 bg-background border-l border-border flex flex-col fixed right-0 z-40 shadow-2xl h-full">
+      <div className="p-4 border-b border-border flex-shrink-0">
         <div className="flex justify-between items-center mb-2">
           <h2 className="text-xl font-bold">Server Settings</h2>
-          <button onClick={onClose} className="btn-icon text-gray-600">
+          <Button variant="ghost" size="icon" onClick={onClose} className="h-8 w-8">
             <X size={20} />
-          </button>
+          </Button>
         </div>
-        
-        {/* System Info */}
-        {systemInfo && (
-          <div className="mt-2 p-2 rounded bg-gray-50 border border-gray-200">
-            <div className="text-xs font-semibold text-gray-600 mb-1">System Info:</div>
-            <div className="text-xs text-gray-700">
-              <div>GPU: {systemInfo.gpu_available ? '✓ Available' : '✗ Not Available'}</div>
-              {systemInfo.gpu_name && <div>Device: {systemInfo.gpu_name}</div>}
-              {systemInfo.vram_total && <div>VRAM: {systemInfo.vram_total} GB</div>}
+
+        <Card className={cn("hidden mt-2", systemInfo && "block")}>
+          <CardContent className="p-2">
+            <div className="text-xs font-semibold text-muted-foreground mb-1">System Info:</div>
+            <div className="text-xs space-y-1">
+              <div>GPU: {hasGpu ? '✓ Available' : '✗ Not Available'}</div>
+              <div className={cn("hidden", systemInfo?.gpu_name && "block")}>
+                Device: {systemInfo.gpu_name}
+              </div>
+              <div className={cn("hidden", systemInfo?.vram_total && "block")}>
+                VRAM: {systemInfo.vram_total} GB
+              </div>
             </div>
-          </div>
-        )}
+          </CardContent>
+        </Card>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {/* Context Settings */}
-        <div className="space-y-3">
-          <h3 className="font-semibold text-sm text-gray-700">Context & Processing</h3>
-          
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Context Size (n_ctx)
-            </label>
-            <input
-              type="number"
-              min="512"
-              max="32768"
-              step="512"
-              value={nCtx}
-              onChange={(e) => setNCtx(parseInt(e.target.value) || 4096)}
-              className="input w-full"
-              disabled={loading}
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Maximum context window size (higher = more VRAM)
-            </p>
-          </div>
+      <ScrollArea className="flex-1 min-h-0">
+        <div className="p-4 space-y-6">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">Context & Processing</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div>
+                <Label className="block text-sm font-medium mb-1">Context Size (n_ctx)</Label>
+                <Input
+                  type="number"
+                  min="512"
+                  max="32768"
+                  step="512"
+                  value={nCtx}
+                  onChange={(e) => setNCtx(parseInt(e.target.value) || 4096)}
+                  disabled={loading}
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Maximum context window size (higher = more VRAM)
+                </p>
+              </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Batch Size (n_batch)
-            </label>
-            <input
-              type="number"
-              min="128"
-              max="4096"
-              step="128"
-              value={nBatch}
-              onChange={(e) => setNBatch(parseInt(e.target.value) || 512)}
-              className="input w-full"
-              disabled={loading}
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Batch size for prompt processing
-            </p>
-          </div>
+              <div>
+                <Label className="block text-sm font-medium mb-1">Batch Size (n_batch)</Label>
+                <Input
+                  type="number"
+                  min="0"
+                  max="4096"
+                  step="128"
+                  value={nBatch}
+                  onChange={(e) => setNBatch(parseInt(e.target.value) || 0)}
+                  disabled={loading}
+                  placeholder="0 = use model defaults"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  {nBatch === 0 ? "Using model defaults" : "Batch size for prompt processing"}
+                </p>
+              </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              CPU Threads (n_threads)
-            </label>
-            <input
-              type="number"
-              min="1"
-              max="64"
-              value={nThreads}
-              onChange={(e) => setNThreads(parseInt(e.target.value) || 4)}
-              className="input w-full"
-              disabled={loading}
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Number of CPU threads to use
-            </p>
-          </div>
+              <div>
+                <Label className="block text-sm font-medium mb-1">CPU Threads (n_threads)</Label>
+                <Input
+                  type="number"
+                  min="0"
+                  max="64"
+                  value={nThreads}
+                  onChange={(e) => setNThreads(parseInt(e.target.value) || 0)}
+                  disabled={loading}
+                  placeholder="0 = use model defaults"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  {nThreads === 0 ? "Using model defaults" : "Number of CPU threads to use"}
+                </p>
+              </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              GPU Layers (n_gpu_layers)
-            </label>
-            <input
-              type="number"
-              min="-1"
-              max="100"
-              value={nGpuLayers}
-              onChange={(e) => setNGpuLayers(parseInt(e.target.value) || -1)}
-              className="input w-full"
-              disabled={loading}
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Layers to offload to GPU (-1 = all layers)
-            </p>
-          </div>
+              <div>
+                <Label className="block text-sm font-medium mb-1">GPU Layers (n_gpu_layers)</Label>
+                <Input
+                  type="number"
+                  min="-1"
+                  max="100"
+                  value={nGpuLayers}
+                  onChange={(e) => setNGpuLayers(parseInt(e.target.value) || -1)}
+                  disabled={loading}
+                />
+                <p className="text-xs text-muted-foreground mt-1">Layers to offload to GPU (-1 = all layers)</p>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">KV Cache Quantization</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <Label className="block text-sm font-medium mb-1">Cache Type K</Label>
+                  <Select value={cacheTypeK} onValueChange={setCacheTypeK} disabled={loading}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="f16">f16 (Default)</SelectItem>
+                      <SelectItem value="q8_0">q8_0 (Less VRAM)</SelectItem>
+                      <SelectItem value="q4_0">q4_0 (Least VRAM)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label className="block text-sm font-medium mb-1">Cache Type V</Label>
+                  <Select value={cacheTypeV} onValueChange={setCacheTypeV} disabled={loading}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="f16">f16 (Default)</SelectItem>
+                      <SelectItem value="q8_0">q8_0 (Less VRAM)</SelectItem>
+                      <SelectItem value="q4_0">q4_0 (Least VRAM)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground mt-2">
+                Quantizing KV cache reduces VRAM usage but may slightly impact quality.
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">Memory & Performance</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="useMmap"
+                  checked={useMmap}
+                  onCheckedChange={(checked) => setUseMmap(checked === true)}
+                  disabled={loading}
+                />
+                <Label htmlFor="useMmap" className="text-sm font-medium cursor-pointer">
+                  Use Memory Mapping (mmap)
+                </Label>
+              </div>
+              <p className="text-xs text-muted-foreground ml-6">
+                Memory map the model file for faster loading and lower memory usage
+              </p>
+
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="useMlock"
+                  checked={useMlock}
+                  onCheckedChange={(checked) => setUseMlock(checked === true)}
+                  disabled={loading}
+                />
+                <Label htmlFor="useMlock" className="text-sm font-medium cursor-pointer">
+                  Lock Memory (mlock)
+                </Label>
+              </div>
+              <p className="text-xs text-muted-foreground ml-6">
+                Lock model memory in RAM to prevent swapping (may require root)
+              </p>
+
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="useFlashAttention"
+                  checked={useFlashAttention}
+                  onCheckedChange={(checked) => setUseFlashAttention(checked === true)}
+                  disabled={loading}
+                />
+                <Label htmlFor="useFlashAttention" className="text-sm font-medium cursor-pointer">
+                  Flash Attention
+                </Label>
+              </div>
+              <p className="text-xs text-muted-foreground ml-6">
+                Enable flash attention for faster inference (if supported by model)
+              </p>
+            </CardContent>
+          </Card>
         </div>
+      </ScrollArea>
 
-        {/* KV Cache Settings */}
-        <div className="space-y-3">
-          <h3 className="font-semibold text-sm text-gray-700">KV Cache Quantization</h3>
-          
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Cache Type K
-              </label>
-              <select
-                value={cacheTypeK}
-                onChange={(e) => setCacheTypeK(e.target.value)}
-                className="input w-full"
-                disabled={loading}
-              >
-                <option value="f16">f16 (Default)</option>
-                <option value="q8_0">q8_0 (Less VRAM)</option>
-                <option value="q4_0">q4_0 (Least VRAM)</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Cache Type V
-              </label>
-              <select
-                value={cacheTypeV}
-                onChange={(e) => setCacheTypeV(e.target.value)}
-                className="input w-full"
-                disabled={loading}
-              >
-                <option value="f16">f16 (Default)</option>
-                <option value="q8_0">q8_0 (Less VRAM)</option>
-                <option value="q4_0">q4_0 (Least VRAM)</option>
-              </select>
-            </div>
-          </div>
-          <p className="text-xs text-gray-500">
-            Quantizing KV cache reduces VRAM usage but may slightly impact quality.
-          </p>
-        </div>
-
-        {/* Memory & Performance */}
-        <div className="space-y-3">
-          <h3 className="font-semibold text-sm text-gray-700">Memory & Performance</h3>
-          
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={useMmap}
-              onChange={(e) => setUseMmap(e.target.checked)}
-              className="rounded"
-              disabled={loading}
-            />
-            <span className="text-sm font-medium text-gray-700">Use Memory Mapping (mmap)</span>
-          </label>
-          <p className="text-xs text-gray-500 ml-6">
-            Memory map the model file for faster loading and lower memory usage
-          </p>
-
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={useMlock}
-              onChange={(e) => setUseMlock(e.target.checked)}
-              className="rounded"
-              disabled={loading}
-            />
-            <span className="text-sm font-medium text-gray-700">Lock Memory (mlock)</span>
-          </label>
-          <p className="text-xs text-gray-500 ml-6">
-            Lock model memory in RAM to prevent swapping (may require root)
-          </p>
-
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={useFlashAttention}
-              onChange={(e) => setUseFlashAttention(e.target.checked)}
-              className="rounded"
-              disabled={loading}
-            />
-            <span className="text-sm font-medium text-gray-700">Flash Attention</span>
-          </label>
-          <p className="text-xs text-gray-500 ml-6">
-            Enable flash attention for faster inference (if supported by model)
-          </p>
-        </div>
-      </div>
-
-      {/* Footer Actions */}
-      <div className="p-4 border-t border-gray-200">
+      <div className="p-4 border-t border-border flex-shrink-0">
         <div className="flex gap-2">
-          <button
-            onClick={handleSave}
-            className="btn-primary flex-1 flex items-center justify-center gap-2"
-            disabled={loading}
-          >
+          <Button onClick={handleSave} disabled={loading} className="flex-1 flex items-center justify-center gap-2">
             <Save size={16} />
             Save Settings
-          </button>
-          <button
-            onClick={loadSystemInfo}
-            className="btn-icon text-gray-600"
-            disabled={loading}
-          >
+          </Button>
+          <Button variant="ghost" size="icon" onClick={loadSystemInfo} disabled={loading}>
             <RefreshCw size={16} />
-          </button>
+          </Button>
         </div>
-        <p className="text-xs text-gray-500 mt-2 text-center">
+        <p className="text-xs text-muted-foreground mt-2 text-center">
           Settings will be applied when loading the next model
         </p>
       </div>

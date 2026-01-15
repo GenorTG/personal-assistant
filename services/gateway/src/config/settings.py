@@ -18,19 +18,27 @@ class Settings(BaseSettings):
     
     # Paths
     # settings.py is at: services/gateway/src/config/settings.py
-    # Need to go up 5 levels to reach project root: config -> src -> gateway -> services -> root
+    # Need to go up 5 levels to reach project root: config -> src -> gateway -> services -> <project root>
     base_dir: Path = Path(__file__).parent.parent.parent.parent.parent
+    # Data is stored under `data/` at project root (migrated from services/data/)
     data_dir: Path = base_dir / "data"
     models_dir: Path = data_dir / "models"
+    # Voice model assets (TTS models, voice packs, etc.)
+    voice_models_dir: Path = data_dir / "voice_models"
     memory_dir: Path = data_dir / "memory"
     vector_store_dir: Path = data_dir / "vector_store"
     db_path: Path = data_dir / "assistant.db"  # Shared database
     
     # LLM Settings
     default_llm_model: Optional[str] = None
-    llm_context_size: int = 4096
+    llm_context_size: int = 8192  # Increased from 4096 to ensure tools aren't truncated
     llm_n_threads: int = 4
     llm_n_gpu_layers: int = 0  # 0 = CPU only, set > 0 for GPU (auto-detected if available)
+    
+    # Request Logging Settings
+    enable_request_logging: bool = True
+    max_logs_per_request: int = 1000
+    include_debug_logs: bool = True
     
     # Sampler Settings
     temperature: float = 0.7
@@ -39,7 +47,7 @@ class Settings(BaseSettings):
     repeat_penalty: float = 1.1
     
     # Service URLs
-    llm_service_url: str = "http://127.0.0.1:8001"  # llama-cpp-python server
+    llm_service_url: str = "http://127.0.0.1:8001"  # OpenAI-compatible LLM server (started automatically when model loads)
     whisper_service_url: str = "http://localhost:8003"
     piper_service_url: str = "http://localhost:8004"
     chatterbox_service_url: str = "http://localhost:4123"  # Chatterbox TTS
@@ -69,7 +77,13 @@ class Settings(BaseSettings):
     default_system_prompt: str = """You are a helpful, friendly, and knowledgeable AI assistant. 
 You have access to your conversation history and can remember important information from past conversations.
 You can use tools to perform actions when needed.
-Be conversational, helpful, and accurate in your responses."""
+Be conversational, helpful, and accurate in your responses.
+
+When using tools:
+- Only claim to have performed actions if you actually called a tool
+- Never make up results from tool calls - only report what tools actually return
+- If a tool call fails, report the error honestly
+- Always be truthful about what actions were taken"""
     
     class Config:
         env_file = ".env"
@@ -83,5 +97,6 @@ settings = Settings()
 # Ensure data directories exist
 settings.data_dir.mkdir(parents=True, exist_ok=True)
 settings.models_dir.mkdir(parents=True, exist_ok=True)
+settings.voice_models_dir.mkdir(parents=True, exist_ok=True)
 settings.memory_dir.mkdir(parents=True, exist_ok=True)
 settings.vector_store_dir.mkdir(parents=True, exist_ok=True)

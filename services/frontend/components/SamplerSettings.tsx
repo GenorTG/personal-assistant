@@ -95,7 +95,7 @@ export default function SamplerSettings({ onSettingsChange }: Props) {
             <button
               key={preset}
               onClick={() => handlePreset(preset as keyof typeof PRESETS)}
-              className="px-3 py-1.5 text-sm rounded-lg border border-gray-300 hover:border-primary-400 hover:bg-primary-50 transition-colors capitalize"
+              className="px-3 py-1.5 text-sm rounded border border-gray-300 hover:border-primary-400 hover:bg-primary-50 transition-colors capitalize"
             >
               {preset}
             </button>
@@ -337,7 +337,7 @@ export default function SamplerSettings({ onSettingsChange }: Props) {
                   <button
                     key={mode}
                     onClick={() => handleChange('mirostat_mode', mode)}
-                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                    className={`px-4 py-2 rounded text-sm font-medium transition-colors ${
                       settings.mirostat_mode === mode
                         ? 'bg-primary-600 text-white'
                         : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
@@ -390,6 +390,110 @@ export default function SamplerSettings({ onSettingsChange }: Props) {
               </>
             )}
           </div>
+
+          {/* Smooth Sampling */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
+                <Settings2 size={16} />
+                Smooth Sampling
+              </h3>
+              {(settings.smoothing_factor || 0) > 0 ? (
+                <span className="text-xs px-2 py-1 bg-blue-100 text-blue-700 rounded font-medium">
+                  Enabled
+                </span>
+              ) : (
+                <span className="text-xs px-2 py-1 bg-gray-100 text-gray-600 rounded font-medium">
+                  Disabled
+                </span>
+              )}
+            </div>
+            
+            {(settings.smoothing_factor || 0) > 0 && (
+              <div className="bg-yellow-50 border border-yellow-200 rounded p-3">
+                <p className="text-xs text-yellow-800">
+                  <strong>Note:</strong> This is an approximation via temperature/top_p adjustments. 
+                  If results are poor, set Smoothing Factor to 0.0 to disable. 
+                  In SillyTavern/oobabooga, 0.23 typically produces excellent results.
+                </p>
+              </div>
+            )}
+            
+            <div>
+              <label className="text-sm text-gray-600 block mb-2">
+                Smoothing Factor: {((settings.smoothing_factor || 0) * 100).toFixed(0)}%
+                {(settings.smoothing_factor || 0) === 0 && (
+                  <span className="ml-2 text-gray-400 text-xs">(Disabled)</span>
+                )}
+              </label>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={settings.smoothing_factor || 0}
+                onChange={(e) => {
+                  const value = parseFloat(e.target.value);
+                  updateSettings({ smoothing_factor: value });
+                  onSettingsChange?.({ ...settings, smoothing_factor: value });
+                }}
+                className={`w-full ${(settings.smoothing_factor || 0) === 0 ? 'accent-gray-400' : 'accent-primary-600'}`}
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Allows quadratic/cubic transformations to adjust the distribution. Lower values will be more creative, usually between 0.2-0.3 is the sweetspot (assuming curve = 1.0). 
+                <strong className="text-gray-700"> Set to 0.0 to disable.</strong>
+              </p>
+            </div>
+            <div>
+              <label className="text-sm text-gray-600 block mb-2">
+                Smoothing Curve: {((settings.smoothing_curve || 1.0) * 10).toFixed(1)} ({(settings.smoothing_curve || 1.0).toFixed(2)})
+              </label>
+              <input
+                type="range"
+                min={1.0}
+                max={3.0}
+                step={0.1}
+                value={settings.smoothing_curve || 1.0}
+                onChange={(e) => {
+                  const value = parseFloat(e.target.value);
+                  updateSettings({ smoothing_curve: value });
+                  onSettingsChange?.({ ...settings, smoothing_curve: value });
+                }}
+                className={`w-full ${(settings.smoothing_factor || 0) === 0 ? 'accent-gray-400 opacity-50' : 'accent-primary-600'}`}
+                disabled={(settings.smoothing_factor || 0) === 0}
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Higher values make the curve steeper, which punishes low probability choices more aggressively. 1.0 = equivalent to only using smoothing factor.
+              </p>
+            </div>
+          </div>
+
+          {/* Stop Strings */}
+          <div className="space-y-4">
+            <h3 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
+              <Settings2 size={16} />
+              Stop Strings
+            </h3>
+            <div>
+              <label className="text-sm text-gray-600 block mb-2">
+                Stop Sequences (one per line, supports {'{{user}}'} and {'{{char}}'} template variables)
+              </label>
+              <textarea
+                value={(settings.stop || []).join('\n')}
+                onChange={(e) => {
+                  const lines = e.target.value.split('\n').filter(line => line.trim() !== '');
+                  updateSettings({ stop: lines.length > 0 ? lines : undefined });
+                  onSettingsChange?.({ ...settings, stop: lines.length > 0 ? lines : undefined });
+                }}
+                placeholder={`Example:\n*{{user}}\n{{user}}\n{{user}}:`}
+                className="w-full min-h-[100px] px-3 py-2 text-sm border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent font-mono"
+                rows={4}
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Generation will stop when any of these sequences are encountered. Use {'{{user}}'} and {'{{char}}'} for template variables.
+              </p>
+            </div>
+          </div>
         </div>
       )}
 
@@ -405,7 +509,7 @@ export default function SamplerSettings({ onSettingsChange }: Props) {
         <button
           onClick={handleSave}
           disabled={saving}
-          className="flex items-center gap-2 px-5 py-2 bg-primary-600 text-white rounded-lg font-medium hover:bg-primary-700 disabled:opacity-50 transition-colors"
+          className="flex items-center gap-2 px-5 py-2 bg-primary-600 text-white rounded font-medium hover:bg-primary-700 disabled:opacity-50 transition-colors"
         >
           <Save size={16} />
           {saving ? 'Saving...' : 'Save Settings'}

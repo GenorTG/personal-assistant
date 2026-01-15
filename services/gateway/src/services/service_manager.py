@@ -6,209 +6,18 @@ from ..config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-class RemoteModelDownloader:
-    def __init__(self, base_url: str):
-        self.base_url = base_url
-        self.models_dir = None # Not available locally
-
-    async def search_models(self, query: str, limit: int = 20):
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{self.base_url}/api/models/search", params={"query": query, "limit": limit})
-            if resp.status_code == 200:
-                return resp.json()
-            return []
-
-    async def download_model(self, repo_id: str, filename: Optional[str] = None):
-        async with httpx.AsyncClient(timeout=None) as client: # No timeout for download
-            params = {"repo_id": repo_id}
-            if filename: params["filename"] = filename
-            resp = await client.post(f"{self.base_url}/api/models/download", params=params)
-            if resp.status_code == 200:
-                return resp.json().get("path")
-            raise RuntimeError(f"Download failed: {resp.text}")
-
-    def list_downloaded_models(self):
-        # Synchronous wrapper for async call - this is tricky in sync context
-        # For now, we'll return empty list or need to make this async in routes
-        # But routes.py calls this synchronously in list_models
-        # We might need to change routes.py to await this, or use a sync client here
-        # Let's use sync client for list_downloaded_models as it's called synchronously
-        import httpx
-        try:
-            with httpx.Client(timeout=5.0) as client:
-                resp = client.get(f"{self.base_url}/api/models")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    from pathlib import Path
-                    return [Path(m["path"]) for m in data]
-                else:
-                    logger.warning(f"LLM service /api/models returned status {resp.status_code}")
-                    return []
-        except httpx.ConnectError as e:
-            logger.warning(f"LLM service not accessible: {e}")
-            return []
-        except httpx.TimeoutException:
-            logger.warning(f"LLM service /api/models request timed out")
-            return []
-        except Exception as e:
-            logger.error(f"Error fetching models from LLM service: {e}")
-            return []
-
-    def get_model_info(self, model_path):
-        # Mock info for now as remote extraction is complex
-        return {
-            "name": str(model_path),
-            "size_gb": 0,
-            "size_mb": 0,
-            "quantization": "unknown"
-        }
-        
-    def delete_model(self, model_id: str):
-        import httpx
-        with httpx.Client() as client:
-            resp = client.delete(f"{self.base_url}/api/models/{model_id}")
-            return resp.status_code == 200
-
-    async def get_model_files(self, repo_id: str):
-        # This usually calls HuggingFace API directly, so we can implement it locally
-        # or proxy it. Implementing locally is easier if we have huggingface_hub
-        try:
-            from huggingface_hub import HfApi
-            api = HfApi()
-            files = api.list_repo_files(repo_id=repo_id)
-            return [f for f in files if f.endswith(".gguf")]
-        except Exception as e:
-            logger.error(f"Error listing files: {e}")
-            return []
-
-
-class RemoteLLMManager:
-    """Mimics LLMManager but calls remote service."""
-    def __init__(self, base_url: str):
-        self.base_url = base_url
-        self.client = httpx.AsyncClient(base_url=base_url, timeout=120.0)
-        self.current_model_name = None
-        self.loader = type('MockLoader', (), {'_gpu_layers': -1, '_n_ctx': 4096})()
-        self.downloader = RemoteModelDownloader(base_url)
-        self.default_load_options = {
-            "n_gpu_layers": -1,
-            "n_ctx": 4096,
-            "use_flash_attention": False
-        }
-        self.model_configs = {}
-        self._load_model_configs()
-        
-    def _load_model_configs(self):
-        try:
-            config_path = settings.data_dir / "model_configs.json"
-            if config_path.exists():
-                import json
-                with open(config_path, 'r') as f:
-                    self.model_configs = json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load model configs: {e}")
-            self.model_configs = {}
-
-    def _save_model_configs(self):
-        try:
-            config_path = settings.data_dir / "model_configs.json"
-            import json
-            with open(config_path, 'w') as f:
-                json.dump(self.model_configs, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save model configs: {e}")
-
-    def get_model_config(self, model_id: str) -> Dict[str, Any]:
-        return self.model_configs.get(model_id, {})
-
-    def save_model_config(self, model_id: str, config: Dict[str, Any]):
-        self.model_configs[model_id] = config
-        self._save_model_configs()
-
-    async def is_model_loaded(self) -> bool:
-        try:
-            resp = await self.client.get("/v1/models")
-            if resp.status_code == 200:
-                data = resp.json().get("data", [])
-                if data:
-                    self.current_model_name = data[0]["id"]
-                    return True
-            return False
-        except:
-            return False
-            
-    def get_current_model_path(self) -> Optional[str]:
-        return self.current_model_name
-        
-    def get_settings(self) -> Dict[str, Any]:
-        return {
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "top_k": 40,
-            "repeat_penalty": 1.1
-        }
-        
-    def update_settings(self, settings: Dict[str, Any]):
-        pass
-        
-    def get_system_prompt(self) -> str:
-        return ""
-        
-    def get_character_card(self):
-        return None
-        
-    def get_user_profile(self):
-        return None
-        
-    def update_character_card(self, card):
-        pass
-        
-    def update_user_profile(self, profile):
-        pass
-        
-    def get_default_load_options(self) -> Dict[str, Any]:
-        return self.default_load_options
-        
-    def update_default_load_options(self, options: Dict[str, Any]):
-        self.default_load_options.update(options)
-    
-    async def load_model(self, model_path, **kwargs):
-        # 1. Start with global defaults
-        load_params = self.default_load_options.copy()
-        
-        # 2. Apply per-model config if exists
-        # Extract model ID from path (filename)
-        from pathlib import Path
-        model_id = Path(model_path).name
-        if model_id in self.model_configs:
-            load_params.update(self.model_configs[model_id])
-            
-        # 3. Apply request overrides (kwargs)
-        load_params.update(kwargs)
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            payload = {"model_path": model_path, **load_params}
-            resp = await client.post(f"{self.base_url}/api/models/load", json=payload)
-            return resp.status_code == 200
-
-    async def unload_model(self):
-        async with httpx.AsyncClient() as client:
-            await client.post(f"{self.base_url}/api/models/unload")
-
-
 class ServiceManager:
     """Manages connections to microservices."""
     
     def __init__(self):
-        self.llm_service_url = "http://127.0.0.1:8001"
-        self.speech_service_url = "http://localhost:8003"
-        self.tts_service_url = "http://localhost:8880"
+        # Service URLs (for optional external services if needed)
+        self.llm_service_url = "http://127.0.0.1:8001"  # OpenAI-compatible LLM server (started automatically when model loads)
+        # STT and TTS are now integrated natively, no HTTP URLs needed
         
-        # Use local LLMManager instead of RemoteLLMManager
-        # The LLM server is managed locally and proxied through gateway
+        # Use LLM service's LLMManager directly (merged from LLM service)
         from .llm.manager import LLMManager
         self.llm_manager = LLMManager()
-        self.llm_service_manager = None  # Will be initialized after memory_store
+        self.llm_service_manager = None  # No longer needed - using direct manager
         self.chat_manager = None
         self.memory_store = None
         self.tool_manager = None # Renamed from tool_registry
@@ -232,46 +41,96 @@ class ServiceManager:
         if self.llm_manager:
             await self.llm_manager.load_settings_from_file_stores(self.memory_store)
         
-        # Initialize LLM Service Manager
-        from .llm.service_manager import LLMServiceManager
-        self.llm_service_manager = LLMServiceManager()
+        # LLM Service Manager no longer needed - using direct manager
+        self.llm_service_manager = None
         
-        # Initialize Tool Manager with Tool Service client
-        from .tools.client import ToolServiceClient
-        tool_service_client = ToolServiceClient()
-        self.tool_manager = ToolManager(tool_service_client)
+        # Initialize Tool Manager directly (merged from tools service)
+        from .tools.manager import ToolManager
+        self.tool_manager = ToolManager(memory_store=self.memory_store)
+        await self.tool_manager.initialize()
+        logger.info("Tool manager initialized (direct import, no HTTP)")
         
-        # Check if Tool service is available
-        if not await tool_service_client.is_available():
-            logger.warning("Tool service not available - tool execution will be limited")
+        # Connect tool registry to LLM manager for function calling
+        # The LLM manager needs access to tool_manager to list tools when generating responses
+        if self.llm_manager and self.tool_manager:
+            # Store tool_manager reference in LLM manager for async tool listing
+            self.llm_manager.tool_manager = self.tool_manager
+            logger.info("Tool manager connected to LLM manager")
         
         # Initialize Chat Manager
         self.chat_manager = ChatManager(self, self.memory_store, self.tool_manager) # Pass tool_manager
         
-        # Initialize TTS Service
-        from .tts.service import TTSService
-        self.tts_service = TTSService()
+        # Initialize WebSocket Manager
+        from .websocket_manager import get_websocket_manager
+        self.websocket_manager = get_websocket_manager()
+        logger.info("WebSocket manager initialized")
         
-        # STT Service - Always enable RemoteSTT proxy
-        # The actual service availability is checked at runtime
-        self.stt_service = type('RemoteSTT', (), {
-            'provider': 'Whisper',
-            '_initialized': True,
-            'transcribe': self._remote_transcribe
-        })()
-        logger.info("STT Service proxy initialized (always on)")
+        # Initialize TTS Service
+        try:
+            from .tts.service import TTSService
+            self.tts_service = TTSService()
+            logger.info("TTS Service initialized successfully")
+        except ImportError as e:
+            logger.warning(f"Failed to import TTS service: {e}")
+            import traceback
+            logger.debug(f"TTS import error traceback: {traceback.format_exc()}")
+            self.tts_service = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize TTS service: {e}")
+            import traceback
+            logger.debug(f"TTS initialization error traceback: {traceback.format_exc()}")
+            self.tts_service = None
+        
+        # STT Service - Use native implementation (faster-whisper)
+        # Preload model on startup for fast inference
+        from .stt.service import STTService
+        self.stt_service = STTService()
+        # Preload STT model to keep it in memory
+        try:
+            self.stt_service._initialize_model()
+            logger.info("STT Service initialized and model preloaded (native faster-whisper)")
+        except Exception as e:
+            logger.warning(f"Failed to preload STT model: {e}. Will load on first use.")
+            # Don't fail startup if model preload fails - will load on first use
         
         # Initialize and start Service Status Manager
-        self.status_manager = ServiceStatusManager()
+        # Pass self as service_manager reference to avoid import issues
+        self.status_manager = ServiceStatusManager(service_manager=self)
         
         # Run initializations in parallel to speed up startup
         import asyncio
         
         async def init_tts():
-            # Load saved backend selection or default to pyttsx3
-            saved_backend = await self.memory_store.get_setting("tts_backend", "pyttsx3")
-            await self.tts_service.switch_backend(saved_backend)
-            logger.info(f"TTS Service initialized with backend: {saved_backend}")
+            if self.tts_service:
+                # Load saved backend selection, but never block startup on large model downloads.
+                # We default to built-in/local backends, and only download models when prompted
+                # (i.e., when the user switches to that backend or uses it).
+                saved_backend = await self.memory_store.get_setting("tts_backend", "pyttsx3")
+
+                preferred_backends = {"piper", "kokoro", "pyttsx3"}
+                selected_backend = saved_backend if saved_backend in preferred_backends else "pyttsx3"
+
+                # Never auto-select chatterbox on startup (external service)
+                if selected_backend not in preferred_backends:
+                    selected_backend = "pyttsx3"
+
+                await self.tts_service.switch_backend(selected_backend)
+
+                if selected_backend != saved_backend:
+                    await self.memory_store.set_setting("tts_backend", selected_backend)
+
+                # Try a fast init, but do NOT block startup if it takes too long.
+                try:
+                    backend_obj = self.tts_service.manager.current_backend
+                    if backend_obj:
+                        import asyncio as _asyncio
+                        await _asyncio.wait_for(backend_obj.initialize(), timeout=2.0)
+                except Exception:
+                    pass
+                
+                logger.info(f"TTS Service initialized with backend: {selected_backend or saved_backend} (models preloaded)")
+            else:
+                logger.info("TTS Service not available, skipping initialization")
             
         async def init_status():
             await self.status_manager.start()
@@ -285,41 +144,122 @@ class ServiceManager:
         
         logger.info("Gateway Services Initialized")
 
-    def enable_stt(self):
-        """Enable STT service on demand."""
-        if self.stt_service:
-            return
+    async def shutdown(self) -> None:
+        """Gracefully shut down background tasks/services."""
+        try:
+            # Stop LLM server process first
+            if self.llm_manager and hasattr(self.llm_manager, 'server_manager'):
+                try:
+                    logger.info("Stopping LLM server process...")
+                    await self.llm_manager.server_manager.stop_server()
+                    logger.info("✓ LLM server stopped")
+                except Exception as e:
+                    logger.error(f"Error stopping LLM server: {e}", exc_info=True)
             
-        self.stt_service = type('RemoteSTT', (), {
-            'provider': 'Whisper',
-            '_initialized': True,
-            'transcribe': self._remote_transcribe
-        })()
-        logger.info("STT Service enabled on demand")
-
-
-    async def _remote_transcribe(self, audio_path, language=None):
-        # Read file
-        import aiofiles
-        async with aiofiles.open(audio_path, 'rb') as f:
-            data = await f.read()
+            # Stop status manager
+            if self.status_manager:
+                try:
+                    await self.status_manager.stop()
+                except Exception:
+                    logger.debug("Failed stopping status manager", exc_info=True)
+            
+            # Cleanup any zombie processes
+            if self.llm_manager and hasattr(self.llm_manager, 'server_manager'):
+                try:
+                    await self.llm_manager.server_manager._cleanup_all_llm_processes()
+                except Exception as e:
+                    logger.debug(f"Error during process cleanup: {e}", exc_info=True)
+        finally:
+            return None
+    
+    def get_service_memory_usage(self) -> Dict[str, Any]:
+        """Get memory usage for all integrated services."""
+        import psutil
         
-        # Use longer timeout for STT as it can take time on CPU
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            files = {'file': ('audio.wav', data, 'audio/wav')}
-            resp = await client.post(f"{self.speech_service_url}/v1/audio/transcriptions", files=files)
-            if resp.status_code == 200:
-                return resp.json().get("text"), resp.json().get("language")
-            raise RuntimeError(f"STT Error: {resp.text}")
+        memory_info = {
+            "gateway": {},
+            "stt": {},
+            "tts": {},
+            "llm": {},
+            "total": {}
+        }
+        
+        try:
+            process = psutil.Process()
+            gateway_memory = process.memory_info().rss / (1024 * 1024)  # MB
+            
+            # STT memory
+            stt_memory = {"total_memory_mb": 0, "model_memory_mb": 0}
+            if self.stt_service:
+                stt_memory = self.stt_service.get_memory_usage()
+            
+            # TTS memory (aggregate all backends)
+            tts_total_memory = 0
+            tts_model_memory = 0
+            tts_backends = {}
+            if self.tts_service and self.tts_service.manager:
+                for backend_name, backend in self.tts_service.manager.backends.items():
+                    if hasattr(backend, 'get_memory_usage'):
+                        backend_memory = backend.get_memory_usage()
+                        tts_backends[backend_name] = backend_memory
+                        tts_total_memory += backend_memory.get("total_memory_mb", 0)
+                        tts_model_memory += backend_memory.get("model_memory_mb", 0)
+            
+            # LLM memory (if model loaded)
+            llm_memory = {"total_memory_mb": 0, "model_memory_mb": 0}
+            if self.llm_manager and self.llm_manager.is_model_loaded():
+                # LLM memory is tracked separately via OpenAI-compatible server
+                # For now, estimate based on gateway memory increase
+                llm_memory = {
+                    "total_memory_mb": 0,  # Tracked separately
+                    "model_memory_mb": 0,  # Tracked separately
+                    "note": "LLM memory tracked via OpenAI-compatible server process"
+                }
+            
+            # GPU memory if available
+            gpu_memory = {}
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_allocated = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
+                    gpu_reserved = torch.cuda.memory_reserved() / (1024 * 1024)  # MB
+                    gpu_memory = {
+                        "allocated_mb": round(gpu_allocated, 2),
+                        "reserved_mb": round(gpu_reserved, 2),
+                        "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+                    }
+            except ImportError:
+                pass
+            
+            memory_info.update({
+                "gateway": {
+                    "total_memory_mb": round(gateway_memory, 2)
+                },
+                "stt": stt_memory,
+                "tts": {
+                    "total_memory_mb": round(tts_total_memory, 2),
+                    "model_memory_mb": round(tts_model_memory, 2),
+                    "backends": tts_backends
+                },
+                "llm": llm_memory,
+                "total": {
+                    "total_memory_mb": round(gateway_memory, 2),
+                    "model_memory_mb": round(stt_memory.get("model_memory_mb", 0) + tts_model_memory, 2),
+                    "gpu": gpu_memory
+                }
+            })
+        except Exception as e:
+            logger.error(f"Error getting service memory usage: {e}")
+            memory_info["error"] = str(e)
+        
+        return memory_info
 
-    async def _remote_synthesize(self, text, voice=None, output_format="wav"):
-        async with httpx.AsyncClient() as client:
-            payload = {"input": text, "voice": voice}
-            # Default to Kokoro
-            resp = await client.post(f"{self.tts_service_url}/v1/audio/speech", json=payload)
-            if resp.status_code == 200:
-                return resp.content
-            raise RuntimeError(f"TTS Error: {resp.text}")
+    def enable_stt(self):
+        """Enable STT service on demand (already initialized natively)."""
+        if not self.stt_service:
+            from .stt.service import STTService
+            self.stt_service = STTService()
+            logger.info("STT Service enabled (native faster-whisper)")
 
     # Interface for ChatManager to call LLM
     async def generate_response(self, messages, settings=None, **kwargs):

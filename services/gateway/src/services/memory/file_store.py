@@ -165,6 +165,7 @@ class FileConversationStore:
         """List all conversations from index (very fast).
         
         Automatically removes stale entries (indexed but file missing).
+        Also adds orphaned files (files that exist but aren't in index).
         
         Args:
             limit: Maximum number to return
@@ -179,15 +180,55 @@ class FileConversationStore:
         # Clean up stale entries (files that don't exist)
         valid_convs = []
         stale_ids = []
+        indexed_conv_ids = set()
         for conv_data in conversations:
             conv_id = conv_data.get("conversation_id")
             if not conv_id:
                 continue
+            indexed_conv_ids.add(conv_id)
             conv_file = self.conversations_dir / f"{conv_id}.json"
             if conv_file.exists():
                 valid_convs.append(conv_data)
             else:
                 stale_ids.append(conv_id)
+        
+        # Find orphaned files (files that exist but aren't in index)
+        orphaned_files = []
+        if self.conversations_dir.exists():
+            for conv_file in self.conversations_dir.glob("*.json"):
+                if conv_file.name == "index.json":
+                    continue
+                conv_id = conv_file.stem  # Get ID from filename (without .json)
+                if conv_id not in indexed_conv_ids:
+                    orphaned_files.append(conv_id)
+        
+        # Add orphaned files to index
+        if orphaned_files:
+            logger.info(f"Found {len(orphaned_files)} orphaned conversation files, adding to index")
+            for conv_id in orphaned_files:
+                try:
+                    # Try to load the conversation to get metadata
+                    messages = await self.get_conversation(conv_id)
+                    if messages is not None:
+                        # Extract metadata from file
+                        conv_file = self.conversations_dir / f"{conv_id}.json"
+                        async with aiofiles.open(conv_file, 'r', encoding='utf-8') as f:
+                            content = await f.read()
+                            data = json.loads(content)
+                            # Add to index
+                            index["conversations"][conv_id] = {
+                                "conversation_id": conv_id,
+                                "name": data.get("name"),
+                                "created_at": data.get("created_at", datetime.utcnow().isoformat()),
+                                "updated_at": data.get("updated_at", datetime.utcnow().isoformat()),
+                                "message_count": len(messages),
+                                "pinned": False
+                            }
+                            # Also add to valid_convs
+                            valid_convs.append(index["conversations"][conv_id])
+                            logger.info(f"Added orphaned conversation {conv_id} to index")
+                except Exception as e:
+                    logger.error(f"Error adding orphaned conversation {conv_id} to index: {e}")
         
         # Remove stale entries from index
         if stale_ids:
@@ -195,6 +236,9 @@ class FileConversationStore:
             for stale_id in stale_ids:
                 if stale_id in index.get("conversations", {}):
                     del index["conversations"][stale_id]
+        
+        # Save index if we made changes
+        if stale_ids or orphaned_files:
             self._index_cache = index
             await self._save_index()
         
@@ -243,6 +287,11 @@ class FileConversationStore:
         logger.info(f"Cleared all {count} conversations")
         return count
     
+    def clear_index_cache(self):
+        """Clear the index cache to force a fresh reload on next access."""
+        self._index_cache = None
+        logger.debug("Cleared index cache")
+    
     async def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation file and remove from index."""
         conv_file = self.conversations_dir / f"{conversation_id}.json"
@@ -274,6 +323,67 @@ class FileConversationStore:
             # Return True if either file was deleted or index was updated (or both)
             # This handles cases where file might be missing but index entry exists
             return file_deleted or index_updated
+        except Exception as e:
+            logger.error(f"Error deleting conversation {conversation_id}: {e}", exc_info=True)
+            return False
+    
+    async def update_message(
+        self,
+        conversation_id: str,
+        message_index: int,
+        new_content: str,
+        role: Optional[str] = None
+    ) -> bool:
+        """Update a message in a conversation.
+        
+        Args:
+            conversation_id: Conversation ID
+            message_index: Index of message to update
+            new_content: New message content
+            role: Optional role to update
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        conv_file = self.conversations_dir / f"{conversation_id}.json"
+        
+        if not conv_file.exists():
+            return False
+        
+        try:
+            async with aiofiles.open(conv_file, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                data = json.loads(content)
+            
+            messages = data.get("messages", [])
+            if message_index >= len(messages):
+                return False
+            
+            # Update message
+            messages[message_index]["content"] = new_content
+            if role:
+                messages[message_index]["role"] = role
+            messages[message_index]["timestamp"] = datetime.utcnow().isoformat()
+            
+            # Update file
+            data["messages"] = messages
+            data["updated_at"] = datetime.utcnow().isoformat()
+            
+            async with aiofiles.open(conv_file, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(data, indent=2, ensure_ascii=False))
+            
+            # Update index
+            index = await self._load_index()
+            if conversation_id in index.get("conversations", {}):
+                index["conversations"][conversation_id]["updated_at"] = datetime.utcnow().isoformat()
+                index["conversations"][conversation_id]["message_count"] = len(messages)
+                self._index_cache = index
+                await self._save_index()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error updating message: {e}", exc_info=True)
+            return False
         except Exception as e:
             logger.error(f"Error deleting conversation {conversation_id}: {e}", exc_info=True)
             return False

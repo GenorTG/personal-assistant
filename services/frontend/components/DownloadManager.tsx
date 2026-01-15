@@ -1,8 +1,8 @@
-"use client";
+'use client';
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { useWebSocketEvent } from '@/contexts/WebSocketContext';
 import {
-  X,
   Download,
   Loader2,
   CheckCircle,
@@ -10,18 +10,31 @@ import {
   Clock,
   Trash2,
   RefreshCw,
-  ChevronDown,
-  ChevronUp,
-} from "lucide-react";
-import { api } from "@/lib/api";
-import { useToast } from "@/contexts/ToastContext";
-import { formatBytes, formatTime, formatDate } from "@/lib/utils";
+  X,
+} from 'lucide-react';
+import { api } from '@/lib/api';
+import { useToast } from '@/contexts/ToastContext';
+import { formatBytes, formatTime, formatDate } from '@/lib/utils';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent } from '@/components/ui/card';
+import { Progress } from '@/components/ui/progress';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion';
+import { cn } from '@/lib/utils';
 
 interface DownloadItem {
   id: string;
   repo_id: string;
   filename: string;
-  status: "pending" | "downloading" | "completed" | "failed" | "cancelled";
+  status: 'pending' | 'downloading' | 'completed' | 'failed' | 'cancelled';
   progress: number;
   bytes_downloaded: number;
   total_bytes: number;
@@ -59,31 +72,105 @@ export default function DownloadManager({
   });
   const [loading, setLoading] = useState(true);
   const [showHistory, setShowHistory] = useState(false);
+  const processedCompletedIds = useRef<Set<string>>(new Set());
 
   const loadDownloads = useCallback(async () => {
     try {
       const data = (await api.listDownloads()) as DownloadsResponse;
+      
+      // Debug logging
+      console.log('[DownloadManager] Received download data:', {
+        activeCount: data.active_count,
+        activeDownloads: data.active.map(d => ({
+          id: d.id,
+          filename: d.filename,
+          status: d.status,
+          progress: d.progress,
+          bytes_downloaded: d.bytes_downloaded,
+          total_bytes: d.total_bytes,
+          speed_mbps: d.speed_mbps,
+          speed_bps: d.speed_bps,
+          eta_seconds: d.eta_seconds
+        }))
+      });
+      
+      // Check if any download just completed (status changed to 'completed' and we haven't processed it yet)
+      const newlyCompleted = data.active.filter(
+        (d) => d.status === 'completed' && !processedCompletedIds.current.has(d.id)
+      );
+      
       setDownloads(data);
 
-      // Check if any downloads just completed
-      const justCompleted = data.active.some((d) => d.status === "completed");
-      if (justCompleted && onDownloadComplete) {
+      // Trigger discovery for newly completed downloads
+      if (newlyCompleted.length > 0 && onDownloadComplete) {
+        // Mark these as processed
+        newlyCompleted.forEach(d => processedCompletedIds.current.add(d.id));
         onDownloadComplete();
       }
     } catch (error) {
-      console.error("Error loading downloads:", error);
+      console.error('Error loading downloads:', error);
     } finally {
       setLoading(false);
     }
   }, [onDownloadComplete]);
 
+  // Subscribe to WebSocket events for real-time download updates
+  useWebSocketEvent('download_progress', (payload) => {
+    if (payload && isOpen) {
+      setDownloads((prev) => {
+        const active = [...(prev.active || [])];
+        const index = active.findIndex((d) => d.id === payload.download_id);
+        if (index >= 0) {
+          active[index] = { ...active[index], ...payload };
+        } else {
+          // New download
+          active.push({
+            id: payload.download_id,
+            repo_id: payload.repo_id,
+            filename: payload.filename,
+            status: payload.status,
+            progress: payload.progress,
+            bytes_downloaded: payload.bytes_downloaded,
+            total_bytes: payload.total_bytes,
+            speed_bps: payload.speed_bps,
+            speed_mbps: payload.speed_mbps,
+            eta_seconds: payload.eta_seconds,
+          });
+        }
+        return { ...prev, active, active_count: active.length };
+      });
+    }
+  });
+
+  useWebSocketEvent('download_completed', (payload) => {
+    if (payload && isOpen) {
+      setDownloads((prev) => {
+        const active = prev.active.filter((d) => d.id !== payload.download_id);
+        const history = [...(prev.history || []), {
+          id: payload.download_id,
+          repo_id: payload.repo_id,
+          filename: payload.filename,
+          status: 'completed' as const,
+          progress: 100,
+          bytes_downloaded: payload.total_bytes,
+          total_bytes: payload.total_bytes,
+          speed_bps: 0,
+          speed_mbps: 0,
+          model_path: payload.model_path,
+        }];
+        return { ...prev, active, history, active_count: active.length };
+      });
+      
+      if (onDownloadComplete) {
+        onDownloadComplete();
+      }
+    }
+  });
+
   useEffect(() => {
     if (isOpen) {
+      // Initial load only - then rely on WebSocket events
       loadDownloads();
-
-      // Poll for updates every 1 second while open
-      const interval = setInterval(loadDownloads, 1000);
-      return () => clearInterval(interval);
     }
   }, [isOpen, loadDownloads]);
 
@@ -92,7 +179,7 @@ export default function DownloadManager({
       await api.cancelDownload(downloadId);
       await loadDownloads();
     } catch (error) {
-      console.error("Error cancelling download:", error);
+      console.error('Error cancelling download:', error);
     }
   };
 
@@ -101,325 +188,256 @@ export default function DownloadManager({
       await api.retryDownload(downloadId);
       await loadDownloads();
     } catch (error) {
-      console.error("Error retrying download:", error);
+      console.error('Error retrying download:', error);
     }
   };
 
   const handleClearHistory = async () => {
-    showConfirm("Clear download history older than 7 days?", async () => {
+    showConfirm('Clear download history older than 7 days?', async () => {
       try {
         await api.clearDownloadHistory(7);
         await loadDownloads();
       } catch (error) {
-        console.error("Error clearing history:", error);
+        console.error('Error clearing history:', error);
       }
     });
   };
 
   const getStatusIcon = (status: string) => {
     switch (status) {
-      case "pending":
+      case 'pending':
         return <Clock size={16} className="text-yellow-500" />;
-      case "downloading":
+      case 'downloading':
         return <Loader2 size={16} className="text-blue-500 animate-spin" />;
-      case "completed":
+      case 'completed':
         return <CheckCircle size={16} className="text-green-500" />;
-      case "failed":
+      case 'failed':
         return <XCircle size={16} className="text-red-500" />;
-      case "cancelled":
-        return <XCircle size={16} className="text-gray-400" />;
+      case 'cancelled':
+        return <XCircle size={16} className="text-muted-foreground" />;
       default:
-        return <Clock size={16} className="text-gray-400" />;
+        return <Clock size={16} className="text-muted-foreground" />;
     }
   };
 
-  const getStatusColor = (status: string): string => {
-    switch (status) {
-      case "pending":
-        return "bg-yellow-50 border-yellow-200";
-      case "downloading":
-        return "bg-blue-50 border-blue-200";
-      case "completed":
-        return "bg-green-50 border-green-200";
-      case "failed":
-        return "bg-red-50 border-red-200";
-      case "cancelled":
-        return "bg-gray-50 border-gray-200";
-      default:
-        return "bg-gray-50 border-gray-200";
-    }
-  };
-
-  if (!isOpen) return null;
 
   const activeDownloads = downloads.active.filter(
-    (d) => d.status === "pending" || d.status === "downloading"
+    (d) => d.status === 'pending' || d.status === 'downloading'
   );
   const recentCompleted = downloads.history
-    .filter(
-      (d) =>
-        d.status === "completed" ||
-        d.status === "failed" ||
-        d.status === "cancelled"
-    )
+    .filter((d) => d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled')
     .slice(0, 10);
 
-  // Track mousedown to prevent closing when dragging text selection outside modal
-  const [mouseDownInside, setMouseDownInside] = useState(false);
+  const hasActiveDownloads = activeDownloads.length > 0;
+  const hasHistory = recentCompleted.length > 0;
+  const isEmpty = !hasActiveDownloads && !hasHistory;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
-      onMouseDown={(e) => {
-        // Track if mousedown was on backdrop (outside modal)
-        if (e.target === e.currentTarget) {
-          setMouseDownInside(false);
-        }
-      }}
-      onMouseUp={(e) => {
-        // Only close if both mousedown and mouseup were on backdrop
-        if (e.target === e.currentTarget && !mouseDownInside) {
-          onClose();
-        }
-        setMouseDownInside(false);
-      }}
-    >
-      <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col"
-        onMouseDown={(e) => {
-          // Track that mousedown was inside modal
-          setMouseDownInside(true);
-          e.stopPropagation();
-        }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="p-6 border-b border-gray-200 flex items-center justify-between flex-shrink-0">
-          <div className="flex items-center gap-3">
-            <Download size={24} className="text-primary-600" />
-            <div>
-              <h2 className="text-xl font-bold text-gray-900">Downloads</h2>
-              <p className="text-sm text-gray-500">
-                {activeDownloads.length > 0
-                  ? `${activeDownloads.length} active download${
-                      activeDownloads.length > 1 ? "s" : ""
-                    }`
-                  : "No active downloads"}
-              </p>
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent className="max-w-2xl max-h-[80vh] flex flex-col p-0 overflow-x-hidden" style={{ maxWidth: 'min(95vw, 42rem)', width: 'min(95vw, 42rem)' }}>
+        <DialogHeader className="p-6 border-b border-border flex-shrink-0 overflow-x-hidden max-w-full">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <Download size={24} className="text-primary" />
+              <div>
+                <DialogTitle>Downloads</DialogTitle>
+                <DialogDescription>
+                  <span className={cn("hidden", hasActiveDownloads && "block")}>
+                    {activeDownloads.length} active download{activeDownloads.length > 1 ? 's' : ''}
+                  </span>
+                  <span className={cn("hidden", !hasActiveDownloads && "block")}>
+                    No active downloads
+                  </span>
+                </DialogDescription>
+              </div>
             </div>
           </div>
-          <button
-            onClick={onClose}
-            className="p-2 rounded-lg hover:bg-gray-100 transition-colors"
-          >
-            <X size={24} className="text-gray-500" />
-          </button>
-        </div>
+        </DialogHeader>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6 min-h-0">
-          {loading ? (
-            <div className="flex justify-center items-center py-12">
-              <Loader2 size={32} className="animate-spin text-primary-600" />
+        <ScrollArea className="flex-1 min-h-0 overflow-x-hidden">
+          <div className="p-6 overflow-x-hidden max-w-full" style={{ width: '100%', maxWidth: '100%' }}>
+            <div className={cn("hidden", loading && "block flex justify-center items-center py-12")}>
+              <Loader2 size={32} className="animate-spin text-primary" />
             </div>
-          ) : (
-            <>
-              {/* Active Downloads */}
-              {activeDownloads.length > 0 && (
-                <div className="mb-6">
-                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide mb-3">
-                    Active Downloads
-                  </h3>
-                  <div className="space-y-3">
-                    {activeDownloads.map((download) => (
-                      <div
-                        key={download.id}
-                        className={`p-4 rounded-lg border ${getStatusColor(
-                          download.status
-                        )}`}
-                      >
-                        <div className="flex items-start justify-between mb-2">
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              {getStatusIcon(download.status)}
-                              <span className="font-medium text-gray-900 truncate">
-                                {download.filename}
-                              </span>
+            <div className={cn("hidden", !loading && "block space-y-6 overflow-x-hidden max-w-full")} style={{ width: '100%', maxWidth: '100%' }}>
+              <div className={cn("hidden", hasActiveDownloads && "block overflow-x-hidden max-w-full")} style={{ width: '100%', maxWidth: '100%' }}>
+                <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide mb-3">
+                  Active Downloads
+                </h3>
+                <div className="space-y-3 overflow-x-hidden max-w-full" style={{ width: '100%', maxWidth: '100%' }}>
+                  {activeDownloads.map((download) => {
+                    const progress = download.progress ?? 0;
+                    const bytesDownloaded = download.bytes_downloaded ?? 0;
+                    const totalBytes = download.total_bytes ?? 0;
+                    const speedMbps = download.speed_mbps ?? 0;
+                    const etaSeconds = download.eta_seconds ?? null;
+                    
+                    // Debug logging for individual download
+                    if (download.status === 'downloading') {
+                      console.log(`[DownloadManager] Rendering download ${download.id}:`, {
+                        progress,
+                        bytesDownloaded,
+                        totalBytes,
+                        speedMbps,
+                        etaSeconds,
+                        rawData: download
+                      });
+                    }
+                    
+                    return (
+                      <Card key={download.id} className="p-4 overflow-x-hidden max-w-full" style={{ width: '100%', maxWidth: '100%' }}>
+                        <CardContent className="p-0 space-y-2 overflow-x-hidden max-w-full" style={{ width: '100%', maxWidth: '100%' }}>
+                          <div className="flex items-start justify-between min-w-0 max-w-full overflow-x-hidden">
+                            <div className="flex-1 min-w-0 overflow-x-hidden" style={{ minWidth: 0, maxWidth: '100%' }}>
+                              <div className="flex items-center gap-2 min-w-0 overflow-x-hidden">
+                                {getStatusIcon(download.status)}
+                                <span className="font-medium truncate min-w-0" style={{ minWidth: 0 }}>{download.filename}</span>
+                              </div>
+                              <p className="text-xs text-muted-foreground truncate mt-0.5 min-w-0" style={{ minWidth: 0 }}>
+                                {download.repo_id}
+                              </p>
                             </div>
-                            <p className="text-xs text-gray-500 truncate mt-0.5">
-                              {download.repo_id}
-                            </p>
-                          </div>
-                          <button
-                            onClick={() => handleCancel(download.id)}
-                            className="p-1 rounded hover:bg-white/50 text-gray-500 hover:text-red-600"
-                            title="Cancel download"
-                          >
-                            <X size={16} />
-                          </button>
-                        </div>
-
-                        {/* Progress Bar */}
-                        <div className="w-full bg-gray-200 rounded-full h-2 mb-2">
-                          <div
-                            className="bg-blue-500 h-2 rounded-full transition-all duration-300"
-                            style={{ width: `${download.progress}%` }}
-                          />
-                        </div>
-
-                        {/* Stats */}
-                        <div className="flex items-center justify-between text-xs text-gray-600">
-                          <span>
-                            {formatBytes(download.bytes_downloaded)} /{" "}
-                            {formatBytes(download.total_bytes)} (
-                            {download.progress.toFixed(1)}%)
-                          </span>
-                          <div className="flex items-center gap-3">
-                            <span>{download.speed_mbps.toFixed(1)} MB/s</span>
-                            <span>ETA: {formatTime(download.eta_seconds)}</span>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Empty State */}
-              {activeDownloads.length === 0 && recentCompleted.length === 0 && (
-                <div className="text-center py-12 text-gray-500">
-                  <Download size={48} className="mx-auto mb-3 opacity-20" />
-                  <p className="text-lg font-medium">No downloads yet</p>
-                  <p className="text-sm">
-                    Downloads will appear here when you start downloading models
-                  </p>
-                </div>
-              )}
-
-              {/* History Section */}
-              {recentCompleted.length > 0 && (
-                <div>
-                  <button
-                    onClick={() => setShowHistory(!showHistory)}
-                    className="flex items-center justify-between w-full text-sm font-semibold text-gray-700 uppercase tracking-wide mb-3 hover:text-gray-900"
-                  >
-                    <span>Download History ({recentCompleted.length})</span>
-                    {showHistory ? (
-                      <ChevronUp size={16} />
-                    ) : (
-                      <ChevronDown size={16} />
-                    )}
-                  </button>
-
-                  {showHistory && (
-                    <div className="space-y-2">
-                      {recentCompleted.map((download) => (
-                        <div
-                          key={download.id}
-                          className={`p-3 rounded-lg border ${getStatusColor(
-                            download.status
-                          )}`}
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-2 flex-1 min-w-0">
-                              {getStatusIcon(download.status)}
-                              <span className="font-medium text-gray-900 truncate text-sm">
-                                {download.filename}
-                              </span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              {download.status === "failed" && (
-                                <button
-                                  onClick={() => handleRetry(download.id)}
-                                  className="p-1 rounded hover:bg-white/50 text-gray-500 hover:text-blue-600"
-                                  title="Retry download"
-                                >
-                                  <RefreshCw size={14} />
-                                </button>
-                              )}
-                              <span className="text-xs text-gray-500">
-                                {formatDate(download.completed_at)}
-                              </span>
-                            </div>
-                          </div>
-                          {download.error && (
-                            <p
-                              className="text-xs text-red-600 mt-1 truncate"
-                              title={download.error}
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => handleCancel(download.id)}
+                              className="h-6 w-6 flex-shrink-0"
+                              title="Cancel download"
                             >
-                              Error: {download.error}
-                            </p>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-            </>
-          )}
-        </div>
+                              <X size={16} />
+                            </Button>
+                          </div>
 
-        {/* Footer */}
-        <div className="p-4 border-t border-gray-200 bg-gray-50 rounded-b-2xl flex-shrink-0">
+                          <Progress value={progress} className="h-2 w-full" />
+
+                          <div className="flex items-center justify-between text-xs text-muted-foreground min-w-0 max-w-full overflow-x-hidden flex-wrap gap-2">
+                            <span className="truncate min-w-0">
+                              {formatBytes(bytesDownloaded)} / {formatBytes(totalBytes)} ({progress.toFixed(1)}%)
+                            </span>
+                            <div className="flex items-center gap-3 flex-shrink-0">
+                              <span className="whitespace-nowrap">{speedMbps > 0 ? `${speedMbps.toFixed(1)} MB/s` : '0.0 MB/s'}</span>
+                              <span className="whitespace-nowrap">ETA: {etaSeconds !== null && etaSeconds !== undefined ? formatTime(etaSeconds) : '--'}</span>
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className={cn("hidden", isEmpty && "block text-center py-12 text-muted-foreground")}>
+                <Download size={48} className="mx-auto mb-3 opacity-20" />
+                <p className="text-lg font-medium">No downloads yet</p>
+                <p className="text-sm">Downloads will appear here when you start downloading models</p>
+              </div>
+
+              <div className={cn("hidden", hasHistory && "block overflow-x-hidden max-w-full")} style={{ width: '100%', maxWidth: '100%' }}>
+                <Accordion type="single" collapsible value={showHistory ? 'history' : undefined}>
+                  <AccordionItem value="history">
+                    <AccordionTrigger
+                      onClick={() => setShowHistory(!showHistory)}
+                      className="text-sm font-semibold text-muted-foreground uppercase tracking-wide"
+                    >
+                      Download History ({recentCompleted.length})
+                    </AccordionTrigger>
+                    <AccordionContent>
+                      <div className="space-y-2 mt-3 overflow-x-hidden max-w-full" style={{ width: '100%', maxWidth: '100%' }}>
+                        {recentCompleted.map((download) => (
+                          <Card key={download.id} className="p-3 overflow-x-hidden max-w-full" style={{ width: '100%', maxWidth: '100%' }}>
+                            <CardContent className="p-0 overflow-x-hidden max-w-full" style={{ width: '100%', maxWidth: '100%' }}>
+                              <div className="flex items-center justify-between min-w-0 max-w-full overflow-x-hidden">
+                                <div className="flex items-center gap-2 flex-1 min-w-0 overflow-x-hidden" style={{ minWidth: 0 }}>
+                                  {getStatusIcon(download.status)}
+                                  <span className="font-medium truncate text-sm min-w-0" style={{ minWidth: 0 }}>{download.filename}</span>
+                                </div>
+                                <div className="flex items-center gap-2 flex-shrink-0">
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    onClick={() => handleRetry(download.id)}
+                                    className={cn("hidden h-6 w-6", download.status === 'failed' && "flex")}
+                                    title="Retry download"
+                                  >
+                                    <RefreshCw size={14} />
+                                  </Button>
+                                  <span className="text-xs text-muted-foreground whitespace-nowrap">
+                                    {formatDate(download.completed_at)}
+                                  </span>
+                                </div>
+                              </div>
+                              <p className={cn("hidden text-xs text-destructive mt-1 truncate min-w-0", download.error && "block")} style={{ minWidth: 0 }} title={download.error}>
+                                Error: {download.error}
+                              </p>
+                            </CardContent>
+                          </Card>
+                        ))}
+                      </div>
+                    </AccordionContent>
+                  </AccordionItem>
+                </Accordion>
+              </div>
+            </div>
+          </div>
+        </ScrollArea>
+
+        <div className="p-4 border-t border-border bg-muted/50 flex-shrink-0">
           <div className="flex items-center justify-between">
-            <button
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={handleClearHistory}
-              className="flex items-center gap-2 text-sm text-gray-600 hover:text-red-600 transition-colors"
+              className="flex items-center gap-2 text-destructive hover:text-destructive"
             >
               <Trash2 size={14} />
               Clear History
-            </button>
-            <button
-              onClick={onClose}
-              className="px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg text-sm font-medium transition-colors"
-            >
+            </Button>
+            <Button onClick={onClose} variant="outline" size="sm">
               Close
-            </button>
+            </Button>
           </div>
         </div>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
-// Mini badge for showing in header
 export function DownloadBadge({ onClick }: { onClick: () => void }) {
   const [activeCount, setActiveCount] = useState(0);
 
-  useEffect(() => {
-    const checkDownloads = async () => {
-      try {
-        const data = (await api.listDownloads()) as DownloadsResponse;
-        const active = data.active.filter(
-          (d) => d.status === "pending" || d.status === "downloading"
-        );
-        setActiveCount(active.length);
-      } catch {
-        // Ignore errors
-      }
-    };
+  const updateCount = async () => {
+    try {
+      const data = (await api.listDownloads()) as DownloadsResponse;
+      const active = data.active.filter(
+        (d) => d.status === 'pending' || d.status === 'downloading'
+      );
+      setActiveCount(active.length);
+    } catch {
+      // Ignore errors
+    }
+  };
 
-    checkDownloads();
-    const interval = setInterval(checkDownloads, 3000);
-    return () => clearInterval(interval);
+  // Update count from WebSocket events
+  useWebSocketEvent('download_progress', updateCount);
+  useWebSocketEvent('download_completed', updateCount);
+
+  useEffect(() => {
+    // Initial check only - then rely on WebSocket events
+    updateCount();
   }, []);
 
   return (
-    <button
-      onClick={onClick}
-      className="relative p-2 rounded-lg hover:bg-gray-100 transition-colors"
-      title="Downloads"
-    >
-      <Download
-        size={20}
-        className={activeCount > 0 ? "text-blue-600" : "text-gray-500"}
-      />
-      {activeCount > 0 && (
-        <span className="absolute -top-1 -right-1 w-5 h-5 bg-blue-600 text-white text-xs rounded-full flex items-center justify-center font-medium animate-pulse">
-          {activeCount}
-        </span>
-      )}
-    </button>
+    <Button variant="ghost" size="icon" onClick={onClick} className="relative" title="Downloads">
+      <Download size={20} className={cn(activeCount > 0 ? 'text-primary' : 'text-muted-foreground')} />
+      <Badge
+        variant="destructive"
+        className={cn(
+          "hidden absolute -top-1 -right-1 h-5 w-5 p-0 flex items-center justify-center text-xs animate-pulse",
+          activeCount > 0 && "flex"
+        )}
+      >
+        {activeCount}
+      </Badge>
+    </Button>
   );
 }

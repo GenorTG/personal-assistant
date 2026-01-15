@@ -32,17 +32,27 @@ export default function ToolSettings() {
     try {
       setLoading(true);
       const data = await api.listTools() as any;
+      console.log('[ToolSettings] Received tools data:', data);
+      
       const toolsList: Tool[] = Array.isArray(data?.tools) ? (data.tools as Tool[]) : [];
-      setTools(toolsList);
+      console.log('[ToolSettings] Parsed tools list:', toolsList.map(t => ({ name: t.name, hasDescription: !!t.description })));
+      
+      // Validate tools have required fields
+      const validTools = toolsList.filter(t => t.name && t.name.trim() !== '');
+      if (validTools.length !== toolsList.length) {
+        console.warn('[ToolSettings] Some tools missing name field:', toolsList.filter(t => !t.name || t.name.trim() === ''));
+      }
+      
+      setTools(validTools);
       
       // Check if tool service is available
-      setToolServiceAvailable(toolsList.length > 0);
+      setToolServiceAvailable(validTools.length > 0);
       
       // Initialize all tools as enabled by default
-      const enabled = new Set<string>(toolsList.map((t: Tool) => String(t.name)));
+      const enabled = new Set<string>(validTools.map((t: Tool) => String(t.name)));
       setEnabledTools(enabled);
     } catch (error) {
-      console.error('Error loading tools:', error);
+      console.error('[ToolSettings] Error loading tools:', error);
       setToolServiceAvailable(false);
     } finally {
       setLoading(false);
@@ -72,7 +82,7 @@ export default function ToolSettings() {
 
   if (!toolServiceAvailable) {
     return (
-      <div className="p-4 border border-yellow-200 rounded-lg bg-yellow-50">
+      <div className="p-4 border border-yellow-200 rounded bg-yellow-50">
         <div className="flex items-center gap-2 text-yellow-800">
           <XCircle size={20} />
           <div>
@@ -106,7 +116,7 @@ export default function ToolSettings() {
           return (
             <div
               key={tool.name}
-              className={`p-4 border rounded-lg transition-all ${
+              className={`p-4 border rounded transition-all ${
                 isEnabled
                   ? 'border-blue-300 bg-blue-50'
                   : 'border-gray-200 bg-gray-50'
@@ -114,7 +124,7 @@ export default function ToolSettings() {
             >
               <div className="flex items-start justify-between">
                 <div className="flex items-start gap-3 flex-1">
-                  <div className={`p-2 rounded-lg ${
+                  <div className={`p-2 rounded ${
                     isEnabled ? 'bg-blue-100' : 'bg-gray-200'
                   }`}>
                     <Icon
@@ -125,7 +135,7 @@ export default function ToolSettings() {
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1">
                       <h4 className="font-medium text-gray-900 capitalize">
-                        {tool.name.replace(/_/g, ' ')}
+                        {tool?.name?.replace(/_/g, ' ') || 'Unknown Tool'}
                       </h4>
                       {isEnabled ? (
                         <CheckCircle size={16} className="text-green-500" />
@@ -134,7 +144,7 @@ export default function ToolSettings() {
                       )}
                     </div>
                     <p className="text-sm text-gray-600 mb-2">
-                      {tool.description}
+                      {tool?.description || 'No description available'}
                     </p>
                     {tool.parameters && (
                       <div className="text-xs text-gray-500 bg-white p-2 rounded border border-gray-200 mt-2">
@@ -161,7 +171,7 @@ export default function ToolSettings() {
                     onChange={() => toggleTool(tool.name)}
                     className="sr-only peer"
                   />
-                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
                 </label>
               </div>
             </div>

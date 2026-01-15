@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Personal Assistant
+Comment=Your personal AI assistant desktop application
+Exec=/home/genortg/Github Personal/personal-assistant/Personal-Assistant
+Icon=application-x-executable
+Terminal=false
+Categories=Utility;Application;
+StartupNotify=true
+Path=/home/genortg/Github Personal/personal-assistant

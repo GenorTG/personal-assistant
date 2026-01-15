@@ -4,6 +4,7 @@ import subprocess
 import asyncio
 import logging
 import shutil
+import collections
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -13,10 +14,14 @@ try:
 except ImportError:
     psutil = None
 
+# Import extracted modules
+from .chatterbox.python_finder import find_system_python, get_venv_python, find_python_exe
+from .chatterbox.installation_checker import check_installation, check_dependencies_installed
+from .chatterbox.cuda_detector import detect_cuda_and_get_pytorch_cmd, check_device_info
+from .chatterbox.port_checker import check_port_available
+from ...config.settings import settings
+
 logger = logging.getLogger(__name__)
-
-
-import collections
 
 class ChatterboxServiceManager:
     """Manages the Chatterbox TTS API server process."""
@@ -26,9 +31,13 @@ class ChatterboxServiceManager:
         self.api_url = "http://localhost:4123/v1"
         self.api_port = 4123
         self.frontend_port = 4321
-        self.base_dir = Path(__file__).parent.parent.parent.parent.parent.parent / "external_services" / "chatterbox-tts-api"
-        # Use shared venv from main project instead of separate venv
-        self.venv_dir = Path(__file__).parent.parent.parent.parent.parent / "venv"
+        # Repo service lives at: <project root>/services/tts-chatterbox
+        self.base_dir = settings.base_dir / "services" / "tts-chatterbox"
+        # Prefer `.venv` but support `venv/` (this repo uses `venv/`)
+        if (self.base_dir / ".venv").exists():
+            self.venv_dir = self.base_dir / ".venv"
+        else:
+            self.venv_dir = self.base_dir / "venv"
         self.python_exe: Optional[str] = None
         self._status = "stopped"  # stopped, starting, running, stopping, error
         self._error_message: Optional[str] = None
@@ -112,167 +121,46 @@ class ChatterboxServiceManager:
     
     def _check_port_available(self) -> bool:
         """Check if the service port is actually accessible."""
-        import socket
-        
-        # Try localhost first
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(('localhost', self.api_port))
-            sock.close()
-            if result == 0:
-                return True
-        except Exception:
-            pass
-            
-        # Try 127.0.0.1 explicitly
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(('127.0.0.1', self.api_port))
-            sock.close()
-            if result == 0:
-                return True
-        except Exception:
-            pass
-            
-        return False
+        return check_port_available(self.api_port)
     
     def _find_system_python(self) -> Optional[str]:
         """Find system Python executable (3.11+) for creating venv."""
-        import re
-        
-        def check_python_version(python_exe: str) -> bool:
-            """Check if Python executable is version 3.11+."""
-            try:
-                if python_exe.startswith("py "):
-                    # Handle py launcher format
-                    cmd = python_exe.split()
-                else:
-                    cmd = [python_exe]
-                result = subprocess.run(
-                    cmd + ["--version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    check=False
-                )
-                if result.returncode != 0:
-                    return False
-                version_str = result.stdout.strip()
-                match = re.search(r'(\d+)\.(\d+)', version_str)
-                if match:
-                    major, minor = int(match.group(1)), int(match.group(2))
-                    return (major == 3 and minor >= 11) or major > 3
-            except Exception:
-                pass
-            return False
-        
-        # On Windows, check Python Launcher first
-        if os.name == 'nt':
-            for version in ["3.13", "3.12", "3.11"]:
-                try:
-                    result = subprocess.run(
-                        ["py", f"-{version}", "--version"],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                        check=False
-                    )
-                    if result.returncode == 0:
-                        return f"py -{version}"
-                except Exception:
-                    pass
-        
-        # Try system Python commands
-        for cmd in ["python3.13", "python3.12", "python3.11", "python3", "python"]:
-            try:
-                if check_python_version(cmd):
-                    return cmd
-            except Exception:
-                pass
-        
-        # On Windows, check common installation locations
-        if os.name == 'nt':
-            common_paths = [
-                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Python",
-            ]
-            
-            for base_path in common_paths:
-                if not base_path.exists():
-                    continue
-                try:
-                    for python_dir in base_path.iterdir():
-                        if python_dir.is_dir() and "Python" in python_dir.name:
-                            python_exe = python_dir / "python.exe"
-                            if python_exe.exists() and check_python_version(str(python_exe)):
-                                return str(python_exe)
-                except Exception:
-                    continue
-        
-        return None
+        return find_system_python()
     
     def _get_venv_python(self) -> Optional[str]:
         """Get Python executable from Chatterbox venv."""
-        if os.name == 'nt':
-            venv_python = self.venv_dir / "Scripts" / "python.exe"
-        else:
-            venv_python = self.venv_dir / "bin" / "python"
-        
-        if venv_python.exists():
-            return str(venv_python)
-        return None
+        return get_venv_python(self.venv_dir)
     
     def _find_python_exe(self) -> Optional[str]:
         """Find Python executable for Chatterbox - prefer venv, fallback to system."""
-        # First, try to use the Chatterbox venv Python
-        venv_python = self._get_venv_python()
-        if venv_python:
-            return venv_python
-        
-        # Fallback to system Python (for creating venv)
-        return self._find_system_python()
+        return find_python_exe(self.venv_dir)
     
     def _check_installation(self) -> bool:
         """Check if Chatterbox TTS API is installed."""
-        if not self.base_dir.exists():
-            return False
-        # Check for various entry point files
-        return (
-            (self.base_dir / "api.py").exists() or 
-            (self.base_dir / "main.py").exists() or
-            (self.base_dir / "src" / "main.py").exists()
-        )
+        return check_installation(self.base_dir)
     
     def _check_dependencies_installed(self) -> bool:
         """Check if dependencies are installed in shared venv."""
-        try:
-            venv_python = self._get_venv_python()
-            if not venv_python:
-                return False
-            
-            # Check for key packages needed by chatterbox server (uvicorn, fastapi)
-            cmd = [venv_python, "-c", "import uvicorn, fastapi; print('OK')"]
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False
-            )
-            return result.returncode == 0 and "OK" in result.stdout
-        except Exception:
-            return False
+        venv_python = self._get_venv_python()
+        return check_dependencies_installed(venv_python)
 
     
     async def _ensure_venv(self) -> bool:
-        """Ensure shared venv exists (it should already exist from main project)."""
+        """Ensure service venv exists."""
         if not self.venv_dir.exists():
-            logger.error("Shared venv not found at %s. Please ensure main project venv is created.", str(self.venv_dir))
+            # Try alternate venv folder name
+            alt = (self.base_dir / "venv") if self.venv_dir.name == ".venv" else (self.base_dir / ".venv")
+            if alt.exists():
+                self.venv_dir = alt
+            else:
+                logger.error(
+                    "Service venv not found at %s (or %s). Install the service via the launcher.",
+                    str(self.base_dir / ".venv"),
+                    str(self.base_dir / "venv"),
+                )
             return False
         
-        logger.info("Using shared venv at: %s", str(self.venv_dir))
+        logger.info("Using service venv at: %s", str(self.venv_dir))
         return True
 
     
@@ -606,145 +494,19 @@ class ChatterboxServiceManager:
                 self._installing = False
     
     async def install(self) -> Dict[str, Any]:
-        """Install Chatterbox TTS API from GitHub."""
+        """Check if Chatterbox TTS API is installed (now a local service)."""
         if self._check_installation():
             return {
                 "status": "success",
-                "message": "Chatterbox TTS API already installed",
+                "message": "Chatterbox TTS API is installed",
                 "path": str(self.base_dir)
             }
         
-        try:
-            # Check if directory exists but might be incomplete
-            if self.base_dir.exists():
-                # Check if it looks like a valid installation
-                if self._check_installation():
-                    return {
-                        "status": "success",
-                        "message": "Chatterbox TTS API already installed",
-                        "path": str(self.base_dir)
-                    }
-                # If directory exists but isn't a valid installation, try to update it
-                logger.info("Directory exists but may be incomplete. Attempting to update...")
-                self._logs.append("Directory exists but may be incomplete. Attempting to update...")
-                try:
-                    # Try to pull updates if it's a git repo
-                    returncode, _, _ = await self._run_command(
-                        ["git", "pull"],
-                        timeout=60,
-                        cwd=str(self.base_dir)
-                    )
-                    if returncode == 0:
-                        if self._check_installation():
-                            return {
-                                "status": "success",
-                                "message": "Chatterbox TTS API updated successfully",
-                                "path": str(self.base_dir)
-                            }
-                except Exception:
-                    # If git pull fails, continue with clone attempt
-                    pass
-            
-            logger.info("Cloning Chatterbox TTS API repository...")
-            self._logs.append("Cloning Chatterbox TTS API repository...")
-            
-            async def _clone():
-                # Clone the repository
-                parent_dir = self.base_dir.parent
-                parent_dir.mkdir(parents=True, exist_ok=True)
-                
-                # If directory exists, remove it first (but only if it's not a valid installation)
-                if self.base_dir.exists() and not self._check_installation():
-                    logger.warning(f"Removing incomplete installation at {self.base_dir}")
-                    self._logs.append(f"Removing incomplete installation at {self.base_dir}")
-                    shutil.rmtree(self.base_dir, ignore_errors=True)
-                
-                returncode, _, stderr = await self._run_command(
-                    ["git", "clone", "https://github.com/travisvn/chatterbox-tts-api.git", str(self.base_dir)],
-                    timeout=300,
-                    cwd=str(parent_dir)
-                )
-                
-                if returncode != 0:
-                    # Check if error is because directory already exists and is valid
-                    if "already exists" in stderr and self._check_installation():
-                        # Directory exists and is valid - that's fine
-                        return True
-                    raise RuntimeError(f"Git clone failed: {stderr}")
-                
-                return True
-            
-            await _clone()
-            
-            # Check if installation was successful
-            if not self._check_installation():
-                raise RuntimeError("Installation verification failed")
-            
-            # Install dependencies
-            logger.info("Installing Chatterbox TTS API dependencies...")
-            self._logs.append("Installing Chatterbox TTS API dependencies...")
-            
-            python_exe = self._find_python_exe()
-            if not python_exe:
-                raise RuntimeError("Python 3.11+ not found. Chatterbox TTS requires Python 3.11 or 3.12")
-            
-            async def _install_deps():
-                # Check if uv is available (preferred method)
-                returncode, _, _ = await self._run_command(
-                    ["uv", "--version"],
-                    timeout=5
-                )
-                has_uv = returncode == 0
-                
-                if has_uv:
-                    # Use uv sync
-                    self._logs.append("Using uv to sync dependencies...")
-                    returncode, _, stderr = await self._run_command(
-                        ["uv", "sync"],
-                        timeout=600,
-                        cwd=str(self.base_dir)
-                    )
-                    if returncode != 0:
-                        raise RuntimeError(f"uv sync failed: {stderr}")
-                else:
-                    # Fallback to pip
-                    if (self.base_dir / "requirements.txt").exists():
-                        # Handle py launcher format
-                        if python_exe.startswith("py "):
-                            cmd = python_exe.split() + ["-m", "pip", "install", "-r", "requirements.txt"]
-                        else:
-                            cmd = [python_exe, "-m", "pip", "install", "-r", "requirements.txt"]
-                        
-                        self._logs.append(f"Installing dependencies with pip: {' '.join(cmd)}")
-                        returncode, _, stderr = await self._run_command(
-                            cmd,
-                            timeout=600,
-                            cwd=str(self.base_dir)
-                        )
-                        if returncode != 0:
-                            raise RuntimeError(f"pip install failed: {stderr}")
-                    else:
-                        logger.warning("No requirements.txt found, skipping dependency installation")
-                        self._logs.append("No requirements.txt found, skipping dependency installation")
-                
-                return True
-            
-            await _install_deps()
-            
-            return {
-                "status": "success",
-                "message": "Chatterbox TTS API installed successfully",
-                "path": str(self.base_dir)
-            }
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Failed to install Chatterbox TTS API: {error_msg}")
-            self._logs.append(f"Failed to install Chatterbox TTS API: {error_msg}")
-            return {
-                "status": "error",
-                "message": f"Installation failed: {error_msg}",
-                "error": error_msg
-            }
+        return {
+            "status": "error",
+            "message": "Chatterbox TTS API not found. Please install via the launcher.",
+            "path": None
+        }
     
     async def start(self) -> Dict[str, Any]:
         """Start the Chatterbox TTS API server."""
@@ -1030,66 +792,8 @@ class ChatterboxServiceManager:
     
     def _check_device_info(self) -> Dict[str, Any]:
         """Check if CUDA is available in the venv."""
-        device_info = {
-            "device": "unknown",
-            "cuda_available": False,
-            "gpu_name": None,
-            "pytorch_version": None
-        }
-        
-        try:
-            venv_python = self._get_venv_python()
-            if not venv_python:
-                return device_info
-            
-            # Check PyTorch CUDA availability
-            check_cmd = [
-                venv_python, "-c",
-                "import torch; "
-                "print('VERSION:', torch.__version__); "
-                "print('CUDA_AVAILABLE:', torch.cuda.is_available()); "
-                "print('CUDA_VERSION:', torch.version.cuda if torch.version.cuda else 'None'); "
-                "print('DEVICE_COUNT:', torch.cuda.device_count() if torch.cuda.is_available() else 0); "
-                "print('GPU_NAME:', torch.cuda.get_device_name(0) if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 'None')"
-            ]
-            
-            result = subprocess.run(
-                check_cmd,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False
-            )
-            
-            if result.returncode == 0:
-                output = result.stdout.strip()
-                for line in output.split('\n'):
-                    if line.startswith('VERSION:'):
-                        device_info["pytorch_version"] = line.split('VERSION:')[1].strip()
-                    elif line.startswith('CUDA_AVAILABLE:'):
-                        cuda_available = line.split('CUDA_AVAILABLE:')[1].strip()
-                        device_info["cuda_available"] = cuda_available == "True"
-                    elif line.startswith('CUDA_VERSION:'):
-                        cuda_version = line.split('CUDA_VERSION:')[1].strip()
-                        if cuda_version != "None":
-                            device_info["cuda_version"] = cuda_version
-                    elif line.startswith('DEVICE_COUNT:'):
-                        device_count = int(line.split('DEVICE_COUNT:')[1].strip())
-                        device_info["device_count"] = device_count
-                    elif line.startswith('GPU_NAME:'):
-                        gpu_name = line.split('GPU_NAME:')[1].strip()
-                        if gpu_name != "None":
-                            device_info["gpu_name"] = gpu_name
-                
-                # Determine device type
-                if device_info["cuda_available"]:
-                    device_info["device"] = "cuda"
-                else:
-                    device_info["device"] = "cpu"
-        except Exception as e:
-            logger.debug("Failed to check device info: %s", str(e))
-        
-        return device_info
+        venv_python = self._get_venv_python()
+        return check_device_info(venv_python)
     
     def _get_service_device_info(self) -> Optional[Dict[str, Any]]:
         """Get device info from the running service via health endpoint."""

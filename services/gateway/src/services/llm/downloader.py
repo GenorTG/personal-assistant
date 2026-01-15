@@ -1,13 +1,19 @@
 """Model downloader from HuggingFace."""
 from typing import Optional, List, Dict, Any, Callable
 from pathlib import Path
-from datetime import datetime
 import asyncio
 import logging
 from huggingface_hub import hf_hub_download, HfApi
 from huggingface_hub.utils import HfHubHTTPError
 from ...config.settings import settings
-from ...utils.helpers import sanitize_filename
+from .hf_api_client import HuggingFaceAPIClient
+from .model_metadata import extract_size_info
+from .model_file_utils import (
+    list_downloaded_models,
+    get_model_info as get_model_info_util,
+    delete_model as delete_model_util,
+    link_and_organize_model as link_and_organize_model_util
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +24,7 @@ class ModelDownloader:
     def __init__(self):
         self.models_dir = settings.models_dir
         self.models_dir.mkdir(parents=True, exist_ok=True)
-        self._api = HfApi()
+        self._api_client = HuggingFaceAPIClient()
     
     async def download_model(
         self,
@@ -45,12 +51,8 @@ class ModelDownloader:
         # If filename not specified, find GGUF files in repo
         if filename is None:
             try:
-                # Use HfApi instance method instead of standalone function
-                files = await loop.run_in_executor(
-                    None,
-                    lambda: self._api.list_repo_files(repo_id, repo_type="model")
-                )
-                gguf_files = [f for f in files if f.endswith(".gguf")]
+                file_list, _ = await self._api_client.get_repo_files(repo_id)
+                gguf_files = [f for f in file_list if f.endswith(".gguf")]
                 
                 if not gguf_files:
                     raise ValueError(f"No GGUF files found in repository: {repo_id}")
@@ -88,62 +90,11 @@ class ModelDownloader:
         Args:
             query: Search query (e.g., "llama-2-7b gguf")
             limit: Maximum number of results
-        
+            
         Returns:
             List of model information dictionaries
         """
-        loop = asyncio.get_event_loop()
-        
-        try:
-            models = await loop.run_in_executor(
-                None,
-                lambda: self._api.list_models(
-                    search=query,
-                    filter="gguf",
-                    sort="downloads",
-                    direction=-1,
-                    limit=limit
-                )
-            )
-            
-            results = []
-            for model in models:
-                model_id = model.id
-                # Extract author from model ID (format: "author/model-name")
-                author = model_id.split("/")[0] if "/" in model_id else "Unknown"
-                name = model_id.split("/")[-1] if "/" in model_id else model_id
-                
-                # Format last_modified date properly
-                last_modified = None
-                if hasattr(model, "lastModified") and model.lastModified:
-                    try:
-                        from datetime import datetime
-                        # If it's a datetime object, convert to ISO string
-                        if isinstance(model.lastModified, datetime):
-                            last_modified = model.lastModified.isoformat()
-                        # If it's already a string, use it
-                        elif isinstance(model.lastModified, str):
-                            last_modified = model.lastModified
-                        # Otherwise try to convert to string
-                        else:
-                            last_modified = str(model.lastModified)
-                    except Exception as e:
-                        logger.debug(f"Could not format lastModified for {model_id}: {e}")
-                        last_modified = None
-                
-                results.append({
-                    "model_id": model_id,
-                    "name": name,
-                    "author": author,
-                    "downloads": getattr(model, "downloads", 0),
-                    "tags": list(getattr(model, "tags", [])),
-                    "likes": getattr(model, "likes", 0),
-                    "last_modified": last_modified,
-                })
-            
-            return results
-        except Exception as e:
-            raise RuntimeError(f"Failed to search models: {str(e)}") from e
+        return await self._api_client.search_models(query, limit)
     
     async def get_model_files(
         self,
@@ -308,6 +259,16 @@ class ModelDownloader:
         except ValueError:
             # Re-raise ValueError as-is
             raise
+        except (ConnectionError, OSError) as e:
+            # Handle network errors gracefully
+            error_msg = str(e)
+            logger.error("Network error listing files for %s: %s", repo_id, error_msg)
+            if "Network is unreachable" in error_msg or "Connection" in type(e).__name__:
+                raise RuntimeError(
+                    f"Network error: Unable to connect to HuggingFace. "
+                    f"Please check your internet connection and try again."
+                ) from e
+            raise RuntimeError(f"Network error accessing '{repo_id}': {error_msg}") from e
         except Exception as e:
             # Log the actual exception for debugging
             logger.error("Unexpected error listing files for %s: %s (type: %s)", repo_id, str(e), type(e).__name__)
@@ -322,6 +283,11 @@ class ModelDownloader:
                 raise ValueError(f"Repository '{repo_id}' not found on HuggingFace. Please verify the repository ID.") from e
             elif "403" in error_msg or "Forbidden" in error_type:
                 raise ValueError(f"Access denied to repository '{repo_id}'. The repository may be private.") from e
+            elif "Connection" in error_type or "Network" in error_type or "unreachable" in error_msg.lower():
+                raise RuntimeError(
+                    f"Network error: Unable to connect to HuggingFace. "
+                    f"Please check your internet connection and try again."
+                ) from e
             
             raise RuntimeError(f"Failed to list model files for '{repo_id}': {error_msg} (type: {error_type})") from e
     
@@ -545,37 +511,7 @@ class ModelDownloader:
         Returns:
             List of paths to downloaded model files
         """
-        gguf_files = []
-        
-        # Scan new folder structure: models/{author}/{repo}/*.gguf
-        for author_dir in self.models_dir.iterdir():
-            if author_dir.is_dir():
-                for repo_dir in author_dir.iterdir():
-                    if repo_dir.is_dir():
-                        gguf_files.extend(repo_dir.glob("*.gguf"))
-        
-        # Also scan flat structure for legacy/manually added models
-        gguf_files.extend(self.models_dir.glob("*.gguf"))
-        
-        # Filter out ARM-specific quantizations on non-ARM systems
-        # Q4_0_4_4, Q4_0_4_8, Q4_0_8_8 are ARM NEON/i8mm/SVE optimizations
-        import platform
-        machine = platform.machine().lower()
-        is_arm = machine in ('arm64', 'aarch64', 'armv8', 'armv7l')
-        
-        if not is_arm:
-            arm_quant_patterns = ['q4_0_4_4', 'q4_0_4_8', 'q4_0_8_8']
-            original_count = len(gguf_files)
-            gguf_files = [
-                f for f in gguf_files 
-                if not any(pattern in f.name.lower() for pattern in arm_quant_patterns)
-            ]
-            filtered_count = original_count - len(gguf_files)
-            if filtered_count > 0:
-                logger.debug("Filtered out %d ARM-specific quantizations from downloaded models list", 
-                           filtered_count)
-        
-        return gguf_files
+        return list_downloaded_models(self.models_dir)
     
     def get_model_info(self, model_path: Path) -> Dict[str, Any]:
         """Get information about a downloaded model.
@@ -588,50 +524,24 @@ class ModelDownloader:
         Returns:
             Dictionary with model information including metadata
         """
-        if not model_path.exists():
-            raise FileNotFoundError(f"Model file not found: {model_path}")
-        
-        size_bytes = model_path.stat().st_size
-        size_mb = size_bytes / (1024 * 1024)
-        size_gb = size_bytes / (1024 * 1024 * 1024)
-        
-        # Basic info
-        info = {
-            "path": str(model_path),
-            "name": model_path.name,
-            "size_bytes": size_bytes,
-            "size_mb": round(size_mb, 2),
-            "size_gb": round(size_gb, 2),
-            "exists": True,
-            "has_metadata": False,
-        }
-        
-        # Try to read metadata from model_info.json in the same directory
-        metadata_file = model_path.parent / "model_info.json"
-        if metadata_file.exists():
-            try:
-                import json
-                with open(metadata_file, 'r', encoding='utf-8') as f:
-                    metadata = json.load(f)
-                
-                info["has_metadata"] = True
-                info["repo_id"] = metadata.get("repo_id")
-                info["author"] = metadata.get("author")
-                info["repo_name"] = metadata.get("name")
-                info["description"] = metadata.get("description", "")[:500]
-                info["downloads"] = metadata.get("downloads", 0)
-                info["likes"] = metadata.get("likes", 0)
-                info["tags"] = metadata.get("tags", [])
-                info["huggingface_url"] = metadata.get("huggingface_url")
-                info["downloaded_at"] = metadata.get("downloaded_at")
-                info["source"] = metadata.get("source", "unknown")
-                # Include MoE info from metadata if available
-                if "moe" in metadata:
-                    info["moe"] = metadata["moe"]
-                
-            except Exception as e:
-                logger.warning(f"Failed to read metadata for {model_path}: {e}")
-        
+        info = get_model_info_util(model_path)
+        # Add compatibility fields
+        info["exists"] = True
+        info["has_metadata"] = "metadata" in info
+        if "metadata" in info:
+            metadata = info["metadata"]
+            info["repo_id"] = metadata.get("repo_id")
+            info["author"] = metadata.get("author")
+            info["repo_name"] = metadata.get("name")
+            info["description"] = metadata.get("description", "")[:500]
+            info["downloads"] = metadata.get("downloads", 0)
+            info["likes"] = metadata.get("likes", 0)
+            info["tags"] = metadata.get("tags", [])
+            info["huggingface_url"] = metadata.get("huggingface_url")
+            info["downloaded_at"] = metadata.get("downloaded_at")
+            info["source"] = metadata.get("source", "unknown")
+            if "moe" in metadata:
+                info["moe"] = metadata["moe"]
         return info
     
     def get_model_folder(self, model_path: Path) -> Optional[Path]:
@@ -686,44 +596,7 @@ class ModelDownloader:
             else:
                 return False
         
-        try:
-            if model_path.exists():
-                model_folder = model_path.parent
-                
-                # Delete the model file
-                model_path.unlink()
-                logger.info("Deleted model file: %s", model_path)
-                
-                # Delete metadata file if exists
-                metadata_file = model_folder / "model_info.json"
-                if metadata_file.exists():
-                    metadata_file.unlink()
-                    logger.info("Deleted metadata file: %s", metadata_file)
-                
-                # Delete folder if empty and not the root models dir
-                if model_folder != self.models_dir:
-                    try:
-                        # Check if folder is empty (no files, only maybe empty subdirs)
-                        remaining_files = list(model_folder.glob("*"))
-                        if not remaining_files:
-                            model_folder.rmdir()
-                            logger.info("Deleted empty folder: %s", model_folder)
-                            
-                            # Also try to delete parent (author folder) if empty
-                            author_folder = model_folder.parent
-                            if author_folder != self.models_dir:
-                                remaining = list(author_folder.glob("*"))
-                                if not remaining:
-                                    author_folder.rmdir()
-                                    logger.info("Deleted empty author folder: %s", author_folder)
-                    except OSError:
-                        pass  # Folder not empty or other issue, ignore
-                
-                return True
-            return False
-        except Exception as e:
-            logger.error("Failed to delete model %s: %s", model_path, e)
-            raise RuntimeError(f"Failed to delete model: {str(e)}") from e
+        return delete_model_util(model_path, self.models_dir)
     
     async def link_and_organize_model(
         self,
@@ -747,155 +620,4 @@ class ModelDownloader:
         Returns:
             Dict with new path and metadata
         """
-        from huggingface_hub import HfApi
-        import shutil
-        
-        # Find the model file
-        model_path = None
-        for path in self.list_downloaded_models():
-            relative_path = path.relative_to(self.models_dir) if path.is_relative_to(self.models_dir) else path
-            if (path.name == model_id or 
-                str(path) == model_id or 
-                str(relative_path) == model_id):
-                model_path = path
-                break
-        
-        if not model_path:
-            potential_path = self.models_dir / model_id
-            if potential_path.exists():
-                model_path = potential_path
-            else:
-                raise FileNotFoundError(f"Model not found: {model_id}")
-        
-        # Parse repo_id
-        if '/' not in repo_id:
-            raise ValueError(f"Invalid repo_id format: {repo_id}. Expected: author/model-name")
-        
-        author, repo_name = repo_id.split('/', 1)
-        
-        # Create target folder
-        target_folder = self.models_dir / author / repo_name
-        target_folder.mkdir(parents=True, exist_ok=True)
-        
-        # Determine target filename
-        new_filename = target_filename or model_path.name
-        target_path = target_folder / new_filename
-        
-        # Move the file if not already in the right place
-        if model_path != target_path:
-            if target_path.exists():
-                raise FileExistsError(f"Target file already exists: {target_path}")
-            
-            shutil.move(str(model_path), str(target_path))
-            logger.info("Moved model: %s -> %s", model_path, target_path)
-            
-            # Clean up old folder if empty
-            old_folder = model_path.parent
-            if old_folder != self.models_dir:
-                try:
-                    if not list(old_folder.glob("*")):
-                        old_folder.rmdir()
-                        # Try parent too
-                        if old_folder.parent != self.models_dir:
-                            if not list(old_folder.parent.glob("*")):
-                                old_folder.parent.rmdir()
-                except OSError:
-                    pass
-        
-        # Fetch metadata from HuggingFace
-        loop = asyncio.get_event_loop()
-        
-        def fetch_metadata():
-            api = HfApi()
-            try:
-                model_info = api.model_info(repo_id)
-                
-                description = ""
-                try:
-                    if hasattr(model_info, 'cardData') and model_info.cardData:
-                        description = getattr(model_info.cardData, 'text', '') or ''
-                except Exception:
-                    pass
-                
-                # Try to fetch config.json from HuggingFace to get MoE info
-                moe_info = None
-                try:
-                    from huggingface_hub import hf_hub_download
-                    import tempfile
-                    import json as json_module
-                    
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        config_path = hf_hub_download(
-                            repo_id=repo_id,
-                            filename="config.json",
-                            local_dir=tmpdir,
-                            local_dir_use_symlinks=False
-                        )
-                        
-                        with open(config_path, 'r', encoding='utf-8') as f:
-                            config = json_module.load(f)
-                            
-                            # Extract MoE info from config.json
-                            num_experts = config.get("num_local_experts") or config.get("num_experts")
-                            experts_per_token = config.get("num_experts_per_tok")
-                            
-                            if num_experts and num_experts > 1:
-                                moe_info = {
-                                    "is_moe": True,
-                                    "num_experts": num_experts,
-                                    "experts_per_token": experts_per_token or 2
-                                }
-                                logger.info(f"Extracted MoE info from HuggingFace config.json: {num_experts} experts")
-                except Exception as e:
-                    logger.debug(f"Could not fetch config.json from HuggingFace for {repo_id}: {e}")
-                
-                metadata = {
-                    "repo_id": repo_id,
-                    "author": author,
-                    "name": repo_name,
-                    "filename": new_filename,
-                    "description": description[:2000] if description else "",
-                    "downloads": getattr(model_info, 'downloads', 0) or 0,
-                    "likes": getattr(model_info, 'likes', 0) or 0,
-                    "tags": list(getattr(model_info, 'tags', [])),
-                    "last_modified": str(getattr(model_info, 'lastModified', '')) if hasattr(model_info, 'lastModified') else None,
-                    "source": "huggingface",
-                    "organized_at": datetime.now().isoformat(),
-                    "huggingface_url": f"https://huggingface.co/{repo_id}",
-                }
-                
-                # Add MoE info if found
-                if moe_info:
-                    metadata["moe"] = moe_info
-                
-                return metadata
-            except Exception as e:
-                logger.warning(f"Could not fetch full metadata for {repo_id}: {e}")
-                return {
-                    "repo_id": repo_id,
-                    "author": author,
-                    "name": repo_name,
-                    "filename": new_filename,
-                    "source": "huggingface",
-                    "organized_at": datetime.now().isoformat(),
-                    "huggingface_url": f"https://huggingface.co/{repo_id}",
-                }
-        
-        metadata = await loop.run_in_executor(None, fetch_metadata)
-        
-        # Save metadata
-        metadata_file = target_folder / "model_info.json"
-        import json
-        with open(metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
-        
-        logger.info("Saved metadata for organized model: %s", target_path)
-        
-        # Return info about the new location
-        relative_path = target_path.relative_to(self.models_dir)
-        return {
-            "old_path": str(model_path),
-            "new_path": str(target_path),
-            "model_id": str(relative_path),
-            "metadata": metadata
-        }
+        return await link_and_organize_model_util(model_id, repo_id, self.models_dir, target_filename)

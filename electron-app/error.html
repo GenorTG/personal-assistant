@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Personal Assistant - Connection Error</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+        }
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 1rem;
+        }
+        p {
+            font-size: 1.1rem;
+            color: #aaa;
+            margin-bottom: 2rem;
+        }
+        .url {
+            background: #2a2a2a;
+            padding: 1rem;
+            border-radius: 8px;
+            font-family: monospace;
+            color: #4a9eff;
+            margin: 1rem 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚠️ Connection Error</h1>
+        <p>Unable to connect to the Personal Assistant frontend.</p>
+        <p>Please make sure the Next.js frontend is running:</p>
+        <div class="url">http://localhost:8002</div>
+        <p>Start it with: <code>cd services/frontend && npm run dev</code></p>
+    </div>
+</body>
+</html>

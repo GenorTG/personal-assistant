@@ -35,7 +35,8 @@ export const ServiceStatusPanel: React.FC = () => {
 
   useEffect(() => {
     fetchServices();
-    const interval = setInterval(fetchServices, 10000);
+    // Poll every 30 seconds for TTS backend status (no WebSocket events for this)
+    const interval = setInterval(fetchServices, 30000);
     return () => clearInterval(interval);
   }, []);
 
@@ -65,7 +66,7 @@ export const ServiceStatusPanel: React.FC = () => {
   };
 
   return (
-    <div className="bg-gray-800/50 rounded-xl p-6 border border-gray-700/50 backdrop-blur-sm">
+    <div className="bg-gray-800/50 rounded p-6 border border-gray-700/50 backdrop-blur-sm">
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-xl font-semibold text-white flex items-center gap-2">
           <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
@@ -73,7 +74,7 @@ export const ServiceStatusPanel: React.FC = () => {
         </h2>
         <button 
           onClick={fetchServices}
-          className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
+          className="p-2 hover:bg-gray-700 rounded transition-colors"
         >
           <RefreshCw className="w-4 h-4 text-gray-400" />
         </button>
@@ -83,7 +84,7 @@ export const ServiceStatusPanel: React.FC = () => {
         {services.map((service) => (
           <div 
             key={service.name}
-            className={`p-4 rounded-lg border transition-all ${
+            className={`p-4 rounded border transition-all ${
               service.is_current 
                 ? 'bg-blue-500/10 border-blue-500/50' 
                 : 'bg-gray-900/50 border-gray-700'
@@ -91,7 +92,7 @@ export const ServiceStatusPanel: React.FC = () => {
           >
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <div className={`w-3 h-3 rounded-full ${
+                <div className={`w-3 h-3 rounded ${
                   service.status === 'ready' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' :
                   service.status === 'initializing' ? 'bg-yellow-500 animate-pulse' :
                   'bg-red-500'
@@ -111,7 +112,7 @@ export const ServiceStatusPanel: React.FC = () => {
                   <button
                     onClick={() => handleStartService(service.name)}
                     disabled={!!actionLoading}
-                    className="px-3 py-1.5 bg-green-600 hover:bg-green-500 text-white text-sm rounded-lg flex items-center gap-2 transition-colors disabled:opacity-50"
+                    className="px-3 py-1.5 bg-green-600 hover:bg-green-500 text-white text-sm rounded flex items-center gap-2 transition-colors disabled:opacity-50"
                   >
                     {actionLoading === service.name ? (
                       <RefreshCw className="w-3 h-3 animate-spin" />
@@ -126,7 +127,7 @@ export const ServiceStatusPanel: React.FC = () => {
                   <button
                     onClick={() => handleSwitch(service.name)}
                     disabled={!!actionLoading}
-                    className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-lg transition-colors disabled:opacity-50"
+                    className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded transition-colors disabled:opacity-50"
                   >
                     Switch To
                   </button>

@@ -1,10 +1,14 @@
 """Settings and configuration routes."""
-import time
+# Standard library
 import asyncio
 import logging
+import time
 from typing import Dict, Optional, Any
+
+# Third-party
 from fastapi import APIRouter, HTTPException, Request
 
+# Local
 from ..schemas import AISettings, AISettingsResponse, ModelLoadOptions, CharacterCard, UserProfile
 from ...services.service_manager import service_manager
 
@@ -15,6 +19,13 @@ router = APIRouter(tags=["settings"])
 _settings_cache: Optional[Dict[str, Any]] = None
 _settings_cache_time: float = 0
 _SETTINGS_CACHE_TTL = 5.0
+
+def invalidate_settings_cache():
+    """Invalidate the settings cache (called when model is loaded/unloaded)."""
+    global _settings_cache, _settings_cache_time
+    _settings_cache = None
+    _settings_cache_time = 0
+    logger.debug("Settings cache invalidated")
 
 
 @router.get("/api/settings", response_model=AISettingsResponse)
@@ -61,7 +72,10 @@ async def get_settings():
     system_prompt = system_prompt_data.get("content", "") if system_prompt_data else service_manager.llm_manager.get_system_prompt()
     
     model_loaded = service_manager.llm_manager.is_model_loaded()
-    current_model = service_manager.llm_manager.get_current_model_path()
+    # Get current model - prefer model name for display, fallback to path
+    current_model_path = service_manager.llm_manager.get_current_model_path()
+    current_model_name = getattr(service_manager.llm_manager, 'current_model_name', None)
+    current_model = current_model_name if current_model_name else current_model_path
     
     default_load_options = service_manager.llm_manager.get_default_load_options()
     
@@ -71,13 +85,15 @@ async def get_settings():
     llm_remote_url = await service_manager.memory_store.settings_store.get_setting("llm_remote_url", None)
     llm_remote_api_key = await service_manager.memory_store.settings_store.get_setting("llm_remote_api_key", None)
     llm_remote_model = await service_manager.memory_store.settings_store.get_setting("llm_remote_model", None)
+    streaming_mode = await service_manager.memory_store.settings_store.get_setting("streaming_mode", "non-streaming")
     
     response = AISettingsResponse(
         settings=AISettings(
-            temperature=settings_dict["temperature"],
-            top_p=settings_dict["top_p"],
-            top_k=settings_dict["top_k"],
-            repeat_penalty=settings_dict["repeat_penalty"],
+            temperature=settings_dict.get("temperature", 0.7),
+            top_p=settings_dict.get("top_p", 0.9),
+            top_k=settings_dict.get("top_k", 40),
+            repeat_penalty=settings_dict.get("repeat_penalty", 1.1),
+            stop=settings_dict.get("stop", ["\n*{{user}}", "\n{{user}}", "{{user}}:", "User:"]),
             system_prompt=system_prompt,
             character_card=CharacterCard(**character_card) if character_card else None,
             user_profile=UserProfile(**user_profile) if user_profile else None,
@@ -85,7 +101,8 @@ async def get_settings():
             llm_endpoint_mode=llm_endpoint_mode,
             llm_remote_url=llm_remote_url,
             llm_remote_api_key=llm_remote_api_key,
-            llm_remote_model=llm_remote_model
+            llm_remote_model=llm_remote_model,
+            streaming_mode=streaming_mode
         ),
         model_loaded=model_loaded,
         current_model=current_model,
@@ -105,7 +122,7 @@ async def get_settings():
 
 @router.put("/api/settings", response_model=AISettingsResponse)
 async def update_settings(settings_update: AISettings):
-    """Update AI settings."""
+    """Update AI settings and broadcast via WebSocket."""
     if not service_manager.llm_manager:
         raise HTTPException(
             status_code=503,
@@ -121,6 +138,8 @@ async def update_settings(settings_update: AISettings):
         settings_dict["top_k"] = settings_update.top_k
     if settings_update.repeat_penalty is not None:
         settings_dict["repeat_penalty"] = settings_update.repeat_penalty
+    if settings_update.stop is not None:
+        settings_dict["stop"] = settings_update.stop
     
     if settings_dict:
         service_manager.llm_manager.update_settings(settings_dict)
@@ -162,6 +181,23 @@ async def update_settings(settings_update: AISettings):
         await service_manager.memory_store.settings_store.set_setting("llm_remote_api_key", settings_update.llm_remote_api_key, encrypted=True)
     if settings_update.llm_remote_model is not None:
         await service_manager.memory_store.settings_store.set_setting("llm_remote_model", settings_update.llm_remote_model)
+    if settings_update.streaming_mode is not None:
+        await service_manager.memory_store.settings_store.set_setting("streaming_mode", settings_update.streaming_mode)
+    
+    # Broadcast settings update via WebSocket
+    try:
+        from ...services.websocket_manager import get_websocket_manager
+        ws_manager = get_websocket_manager()
+        settings_response = await get_settings()
+        # Convert Pydantic model to dict for broadcasting
+        if hasattr(settings_response, 'dict'):
+            await ws_manager.broadcast_settings_update(settings_response.dict())
+        elif hasattr(settings_response, 'model_dump'):
+            await ws_manager.broadcast_settings_update(settings_response.model_dump())
+        else:
+            await ws_manager.broadcast_settings_update(dict(settings_response))
+    except Exception as e:
+        logger.debug(f"Failed to broadcast settings update: {e}")
     
     return await get_settings()
 
@@ -272,3 +308,254 @@ async def delete_system_prompt(prompt_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete system prompt: {str(e)}") from e
+
+
+# Character Card Management Endpoints
+@router.get("/api/character-cards")
+async def list_character_cards():
+    """List all character cards."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        cards = await service_manager.memory_store.character_card_store.list_character_cards()
+        return {"cards": cards}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list character cards: {str(e)}") from e
+
+
+@router.get("/api/character-cards/{card_id}")
+async def get_character_card(card_id: str):
+    """Get a specific character card by ID."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        card = await service_manager.memory_store.character_card_store.get_character_card(card_id)
+        if not card:
+            raise HTTPException(status_code=404, detail="Character card not found")
+        return card
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get character card: {str(e)}") from e
+
+
+@router.post("/api/character-cards")
+async def create_character_card(request: Request):
+    """Create a new character card."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        body = await request.json()
+        card_id = await service_manager.memory_store.character_card_store.create_character_card(body)
+        card = await service_manager.memory_store.character_card_store.get_character_card(card_id)
+        
+        # Update LLM manager if this becomes the current card
+        current_id = await service_manager.memory_store.character_card_store.get_current_character_card_id()
+        if current_id == card_id and card:
+            service_manager.llm_manager.update_character_card(card)
+        
+        return {"id": card_id, **card}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create character card: {str(e)}") from e
+
+
+@router.put("/api/character-cards/{card_id}")
+async def update_character_card(card_id: str, request: Request):
+    """Update an existing character card."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        body = await request.json()
+        success = await service_manager.memory_store.character_card_store.update_character_card(card_id, body)
+        if not success:
+            raise HTTPException(status_code=404, detail="Character card not found")
+        
+        # Update LLM manager if this is the current card
+        current_id = await service_manager.memory_store.character_card_store.get_current_character_card_id()
+        if current_id == card_id:
+            card = await service_manager.memory_store.character_card_store.get_character_card(card_id)
+            if card:
+                service_manager.llm_manager.update_character_card(card)
+        
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update character card: {str(e)}") from e
+
+
+@router.delete("/api/character-cards/{card_id}")
+async def delete_character_card(card_id: str):
+    """Delete a character card."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        success = await service_manager.memory_store.character_card_store.delete_character_card(card_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Character card not found")
+        
+        # Clear LLM manager if this was the current card
+        current_id = await service_manager.memory_store.character_card_store.get_current_character_card_id()
+        if current_id == card_id:
+            service_manager.llm_manager.update_character_card(None)
+        
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete character card: {str(e)}") from e
+
+
+@router.post("/api/character-cards/{card_id}/set-current")
+async def set_current_character_card(card_id: str):
+    """Set a character card as the current active card."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        success = await service_manager.memory_store.character_card_store.set_current_character_card(card_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Character card not found")
+        
+        # Update LLM manager with the new current card
+        card = await service_manager.memory_store.character_card_store.get_character_card(card_id)
+        if card:
+            service_manager.llm_manager.update_character_card(card)
+        
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set current character card: {str(e)}") from e
+
+
+# User Profile Management Endpoints
+@router.get("/api/user-profiles")
+async def list_user_profiles():
+    """List all user profiles."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        profiles = await service_manager.memory_store.user_profile_store.list_user_profiles()
+        return {"profiles": profiles}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list user profiles: {str(e)}") from e
+
+
+@router.get("/api/user-profiles/{profile_id}")
+async def get_user_profile(profile_id: str):
+    """Get a specific user profile by ID."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        profile = await service_manager.memory_store.user_profile_store.get_user_profile(profile_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="User profile not found")
+        return profile
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get user profile: {str(e)}") from e
+
+
+@router.post("/api/user-profiles")
+async def create_user_profile(request: Request):
+    """Create a new user profile."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        body = await request.json()
+        profile_id = await service_manager.memory_store.user_profile_store.create_user_profile(body)
+        profile = await service_manager.memory_store.user_profile_store.get_user_profile(profile_id)
+        
+        # Update LLM manager if this becomes the current profile
+        current_id = await service_manager.memory_store.user_profile_store.get_current_user_profile_id()
+        if current_id == profile_id and profile:
+            service_manager.llm_manager.update_user_profile(profile)
+        
+        return {"id": profile_id, **profile}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create user profile: {str(e)}") from e
+
+
+@router.put("/api/user-profiles/{profile_id}")
+async def update_user_profile(profile_id: str, request: Request):
+    """Update an existing user profile."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        body = await request.json()
+        success = await service_manager.memory_store.user_profile_store.update_user_profile(profile_id, body)
+        if not success:
+            raise HTTPException(status_code=404, detail="User profile not found")
+        
+        # Update LLM manager if this is the current profile
+        current_id = await service_manager.memory_store.user_profile_store.get_current_user_profile_id()
+        if current_id == profile_id:
+            profile = await service_manager.memory_store.user_profile_store.get_user_profile(profile_id)
+            if profile:
+                service_manager.llm_manager.update_user_profile(profile)
+        
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update user profile: {str(e)}") from e
+
+
+@router.delete("/api/user-profiles/{profile_id}")
+async def delete_user_profile(profile_id: str):
+    """Delete a user profile."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        success = await service_manager.memory_store.user_profile_store.delete_user_profile(profile_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="User profile not found")
+        
+        # Clear LLM manager if this was the current profile
+        current_id = await service_manager.memory_store.user_profile_store.get_current_user_profile_id()
+        if current_id == profile_id:
+            service_manager.llm_manager.update_user_profile(None)
+        
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete user profile: {str(e)}") from e
+
+
+@router.post("/api/user-profiles/{profile_id}/set-current")
+async def set_current_user_profile(profile_id: str):
+    """Set a user profile as the current active profile."""
+    if not service_manager.memory_store:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+    
+    try:
+        success = await service_manager.memory_store.user_profile_store.set_current_user_profile(profile_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="User profile not found")
+        
+        # Update LLM manager with the new current profile
+        profile = await service_manager.memory_store.user_profile_store.get_user_profile(profile_id)
+        if profile:
+            service_manager.llm_manager.update_user_profile(profile)
+        
+        # Update vector store to use the new user's collection
+        # The vector store will automatically use the new user_profile_id on next access
+        
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set current user profile: {str(e)}") from e

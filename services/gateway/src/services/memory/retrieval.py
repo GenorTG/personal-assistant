@@ -19,7 +19,8 @@ class ContextRetriever:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         exclude_conversation_id: Optional[str] = None,
-        recency_bias: bool = True
+        recency_bias: bool = True,
+        user_profile_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Retrieve relevant context for a query.
         
@@ -29,6 +30,7 @@ class ContextRetriever:
             min_score: Minimum similarity score threshold (default from settings)
             exclude_conversation_id: Conversation ID to exclude from results
             recency_bias: Whether to apply recency bias to ranking
+            user_profile_id: User profile ID (uses current user if None)
         
         Returns:
             Dictionary with retrieved messages, scores, and metadata
@@ -37,7 +39,7 @@ class ContextRetriever:
         min_score = min_score or self.similarity_threshold
         
         # Perform semantic search
-        results = await self.vector_store.search(query=query, top_k=top_k * 2)  # Get more for filtering
+        results = await self.vector_store.search(query=query, top_k=top_k * 2, user_profile_id=user_profile_id)  # Get more for filtering
         
         # Filter by similarity threshold and exclude conversation if needed
         filtered_results = []

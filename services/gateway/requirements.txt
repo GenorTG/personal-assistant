@@ -13,13 +13,32 @@ aiofiles>=23.2.1
 # Database
 aiosqlite>=0.20.0
 
-# Memory/Embeddings (for chat context)
+# Memory/Embeddings (for chat context) - merged from memory service
 sentence-transformers>=2.2.0
 chromadb>=0.4.0
 sympy>=1.0.0
+numpy>=1.22.0,<2.0.0  # ChromaDB requires NumPy < 2.0
 
-# LLM Client
+# LLM - merged from LLM service
+# NOTE: Install with CUDA support: CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python[server]
+llama-cpp-python[server]>=0.3.16
 openai>=1.0.0
+gguf>=0.1.0
+
+# Tools - merged from tools service
+Pillow>=10.0.0
+
+# STT/TTS - integrated from separate services
+faster-whisper>=1.0.0
+piper-tts>=1.2.0
+kokoro-onnx>=0.3.1
+soundfile>=0.12.1
+
+# PyTorch ecosystem (for CUDA support and audio processing)
+# NOTE: PyTorch is installed separately by install.sh with CUDA support if available
+# Do NOT install via requirements.txt - install.sh handles this
+# torch>=2.0.0
+# torchaudio>=2.0.0
 
 # Utilities
 jsonschema>=4.0.0
@@ -28,5 +47,4 @@ psutil>=5.9.0
 nvidia-ml-py>=12.535.0
 cryptography>=41.0.0
 pyttsx3>=2.90
-gguf>=0.1.0
 

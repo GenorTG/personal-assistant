@@ -1,11 +1,13 @@
 """Text-to-speech routes."""
 import logging
-from typing import Dict
+from typing import Dict, Optional
 import httpx
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Response
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Response, UploadFile, File, Form
+from pathlib import Path
 
-from ..schemas import TTSRequest
+from ..schemas import TTSRequest, VoiceModelDownloadRequest, VoiceModelDownloadStatus
 from ...services.service_manager import service_manager
+from ...config.settings import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["tts"])
@@ -58,40 +60,107 @@ async def text_to_speech(request: TTSRequest, response: Response):
 @router.get("/api/voice/tts/backends")
 async def get_tts_backends():
     """Get list of all available TTS backends with their status."""
+    # Return graceful response if TTS service not initialized
     if not service_manager.tts_service:
-        raise HTTPException(
-            status_code=503,
-            detail="TTS service not initialized"
-        )
+        return [
+            {
+                "name": "piper",
+                "status": "not_initialized",
+                "is_ready": False,
+                "is_current": False,
+                "error_message": "TTS service not initialized"
+            },
+            {
+                "name": "kokoro",
+                "status": "not_initialized",
+                "is_ready": False,
+                "is_current": False,
+                "error_message": "TTS service not initialized"
+            },
+            {
+                "name": "chatterbox",
+                "status": "not_initialized",
+                "is_ready": False,
+                "is_current": False,
+                "error_message": "TTS service not initialized"
+            }
+        ]
     
     try:
+        # Backends are integrated into the gateway process (no per-backend HTTP services),
+        # except chatterbox which is optional and only started when explicitly selected.
         backends = service_manager.tts_service.get_available_backends()
-        
-        service_urls = {
-            "chatterbox": "http://localhost:4123",
-            "kokoro": "http://localhost:8880",
-            "piper": "http://localhost:8004"
-        }
-        
-        for backend in backends:
-            backend_name = backend.get("name", "")
-            if backend.get("status") == "not_initialized" and backend_name in service_urls:
-                try:
-                    async with httpx.AsyncClient(timeout=2.0) as client:
-                        resp = await client.get(f"{service_urls[backend_name]}/health")
-                        if resp.status_code == 200:
-                            backend["status"] = "ready"
-                            backend["is_ready"] = True
-                            backend["error_message"] = None
-                except Exception:
-                    pass
-        
         return {"backends": backends}
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Error getting TTS backends: {str(e)}"
         ) from e
+
+
+@router.post("/api/voice/tts/backends/piper/voices/download", response_model=VoiceModelDownloadStatus)
+async def download_piper_voice(request: VoiceModelDownloadRequest):
+    """Download a Piper voice (onnx + optional json config) for later use."""
+    if not service_manager.tts_service:
+        raise HTTPException(status_code=503, detail="TTS service not initialized")
+
+    voice_id = request.model_id
+    if not voice_id:
+        raise HTTPException(status_code=400, detail="model_id is required (voice id)")
+
+    backend = service_manager.tts_service.manager.backends.get("piper")
+    if not backend:
+        raise HTTPException(status_code=404, detail="Piper backend not available")
+
+    result = await backend.download_voice(
+        voice_id=voice_id,
+        onnx_url=request.url,
+        config_url=request.aux_url,
+        force=request.force,
+    )
+    return VoiceModelDownloadStatus(**result)
+
+
+@router.get("/api/voice/tts/backends/piper/voices/download/status", response_model=VoiceModelDownloadStatus)
+async def get_piper_voice_download_status(voice_id: str):
+    """Get Piper voice download status."""
+    if not service_manager.tts_service:
+        raise HTTPException(status_code=503, detail="TTS service not initialized")
+
+    backend = service_manager.tts_service.manager.backends.get("piper")
+    if not backend:
+        raise HTTPException(status_code=404, detail="Piper backend not available")
+
+    result = backend.get_download_status(voice_id)
+    return VoiceModelDownloadStatus(**result)
+
+
+@router.post("/api/voice/tts/backends/kokoro/model/download", response_model=VoiceModelDownloadStatus)
+async def download_kokoro_model(request: VoiceModelDownloadRequest):
+    """Download Kokoro model assets (onnx + voices.json)."""
+    if not service_manager.tts_service:
+        raise HTTPException(status_code=503, detail="TTS service not initialized")
+
+    backend = service_manager.tts_service.manager.backends.get("kokoro")
+    if not backend:
+        raise HTTPException(status_code=404, detail="Kokoro backend not available")
+
+    result = await backend.download_model(force=request.force)
+    return VoiceModelDownloadStatus(**result)
+
+
+@router.get("/api/voice/tts/backends/kokoro/model/download/status", response_model=VoiceModelDownloadStatus)
+async def get_kokoro_model_download_status():
+    """Get Kokoro model download status."""
+    if not service_manager.tts_service:
+        raise HTTPException(status_code=503, detail="TTS service not initialized")
+
+    backend = service_manager.tts_service.manager.backends.get("kokoro")
+    if not backend:
+        raise HTTPException(status_code=404, detail="Kokoro backend not available")
+
+    result = backend.get_download_status()
+    return VoiceModelDownloadStatus(**result)
 
 
 @router.get("/api/voice/tts/backends/{backend_name}")
@@ -124,10 +193,12 @@ async def get_tts_backend_info(backend_name: str):
 async def switch_tts_backend(backend_name: str):
     """Switch to a different TTS backend."""
     if not service_manager.tts_service:
-        raise HTTPException(
-            status_code=503,
-            detail="TTS service not initialized"
-        )
+        return {
+            "status": "error",
+            "message": "TTS service not initialized",
+            "initialized": False,
+            "backend_info": None
+        }
     
     try:
         success = await service_manager.tts_service.switch_backend(backend_name)
@@ -173,6 +244,13 @@ async def switch_tts_backend(backend_name: str):
 @router.post("/api/voice/tts/backends/{backend_name}/start")
 async def start_tts_backend(backend_name: str):
     """Start a TTS backend service (if supported)."""
+    if not service_manager.tts_service:
+        return {
+            "status": "error",
+            "message": "TTS service not initialized",
+            "initialized": False
+        }
+    
     backend = service_manager.tts_service.manager.get_backend(backend_name)
     if not backend:
         raise HTTPException(status_code=404, detail="Backend not found")
@@ -196,10 +274,11 @@ async def get_tts_voices(backend_name: str, response: Response):
     response.headers["Access-Control-Allow-Headers"] = "*"
     
     if not service_manager.tts_service:
-        raise HTTPException(
-            status_code=503,
-            detail="TTS service not initialized"
-        )
+        return {
+            "voices": [],
+            "status": "not_initialized",
+            "message": "TTS service not initialized"
+        }
     
     try:
         voices = await service_manager.tts_service.get_available_voices(backend_name)
@@ -219,10 +298,12 @@ async def refresh_tts_voices(backend_name: str, response: Response):
     response.headers["Access-Control-Allow-Headers"] = "*"
     
     if not service_manager.tts_service:
-        raise HTTPException(
-            status_code=503,
-            detail="TTS service not initialized"
-        )
+        return {
+            "message": "TTS service not initialized",
+            "voices": [],
+            "status": "error",
+            "initialized": False
+        }
     
     try:
         if backend_name == "chatterbox":
@@ -324,11 +405,17 @@ async def get_tts_backend_models(backend_name: str):
 @router.get("/api/voice/tts/settings")
 async def get_tts_settings():
     """Get all TTS settings including current backend, voices, and options."""
+    # Return default response if TTS service not initialized (graceful degradation)
     if not service_manager.tts_service:
-        raise HTTPException(
-            status_code=503,
-            detail="TTS service not initialized"
-        )
+        return {
+            "current_backend": None,
+            "current_backend_info": None,
+            "available_backends": [
+                {"name": "piper", "status": "not_initialized", "is_current": False},
+                {"name": "kokoro", "status": "not_initialized", "is_current": False},
+                {"name": "chatterbox", "status": "not_initialized", "is_current": False}
+            ]
+        }
     
     try:
         current_backend = service_manager.tts_service.get_current_backend_name()
@@ -336,7 +423,10 @@ async def get_tts_settings():
         
         current_info = None
         if service_manager.tts_service.manager.current_backend:
-            current_info = await service_manager.tts_service.get_backend_info(current_backend)
+            try:
+                current_info = await service_manager.tts_service.get_backend_info(current_backend)
+            except Exception as e:
+                logger.warning(f"Error getting backend info: {e}")
         
         return {
             "current_backend": current_backend,
@@ -344,10 +434,17 @@ async def get_tts_settings():
             "available_backends": backends
         }
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error getting TTS settings: {str(e)}"
-        ) from e
+        logger.error(f"Error getting TTS settings: {e}", exc_info=True)
+        # Return default response on error instead of raising
+        return {
+            "current_backend": None,
+            "current_backend_info": None,
+            "available_backends": [
+                {"name": "piper", "status": "error", "is_current": False, "error": str(e)},
+                {"name": "kokoro", "status": "error", "is_current": False, "error": str(e)},
+                {"name": "chatterbox", "status": "error", "is_current": False, "error": str(e)}
+            ]
+        }
 
 
 @router.get("/api/voice/tts/backends/{backend_name}/health")
@@ -574,3 +671,491 @@ async def configure_openai_tts(config: Dict[str, str]):
         await backend.initialize()
     
     return {"status": "success", "message": "OpenAI TTS configured"}
+
+
+@router.get("/api/voice/tts/backends/{backend_name}/model/status")
+async def get_tts_backend_model_status(backend_name: str):
+    """Get model status for a TTS backend."""
+    # Return default response if TTS service not initialized (graceful degradation)
+    if not service_manager.tts_service:
+        return {
+            "loaded": False,
+            "status": "not_initialized",
+            "model_path": None,
+            "message": "TTS service not initialized"
+        }
+    
+    try:
+        backend = service_manager.tts_service.manager.get_backend(backend_name)
+        if not backend:
+            raise HTTPException(
+                status_code=404,
+                detail=f"TTS backend '{backend_name}' not found"
+            )
+        
+        if hasattr(backend, 'get_model_status'):
+            status = backend.get_model_status()
+            return status
+        else:
+            return {
+                "loaded": backend.is_ready,
+                "status": "unknown",
+                "message": "Model status not available for this backend"
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting TTS backend model status: {str(e)}"
+        ) from e
+
+
+@router.post("/api/voice/tts/backends/{backend_name}/model/unload")
+async def unload_tts_backend_model(backend_name: str):
+    """Unload TTS model for a backend."""
+    if not service_manager.tts_service:
+        return {
+            "status": "error",
+            "message": "TTS service not initialized",
+            "initialized": False
+        }
+    
+    try:
+        backend = service_manager.tts_service.manager.get_backend(backend_name)
+        if not backend:
+            raise HTTPException(
+                status_code=404,
+                detail=f"TTS backend '{backend_name}' not found"
+            )
+        
+        if hasattr(backend, 'unload_model'):
+            success = backend.unload_model()
+            if success:
+                return {
+                    "status": "success",
+                    "message": f"{backend_name} model unloaded from memory"
+                }
+            else:
+                return {
+                    "status": "error",
+                    "message": f"Failed to unload {backend_name} model"
+                }
+        else:
+            return {
+                "status": "info",
+                "message": f"Model unloading not supported for {backend_name} backend"
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error unloading TTS backend model: {str(e)}"
+        ) from e
+
+
+@router.post("/api/voice/tts/backends/{backend_name}/model/reload")
+async def reload_tts_backend_model(backend_name: str):
+    """Reload TTS model for a backend."""
+    if not service_manager.tts_service:
+        return {
+            "status": "error",
+            "message": "TTS service not initialized",
+            "initialized": False
+        }
+    
+    try:
+        backend = service_manager.tts_service.manager.get_backend(backend_name)
+        if not backend:
+            raise HTTPException(
+                status_code=404,
+                detail=f"TTS backend '{backend_name}' not found"
+            )
+        
+        # Unload first
+        if hasattr(backend, 'unload_model'):
+            backend.unload_model()
+        
+        # Reinitialize
+        success = await backend.initialize()
+        if success:
+            return {
+                "status": "success",
+                "message": f"{backend_name} model reloaded"
+            }
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to reload {backend_name} model: {backend.error_message if hasattr(backend, 'error_message') else 'Unknown error'}"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error reloading TTS backend model: {str(e)}"
+        ) from e
+
+
+@router.get("/api/voice/tts/backends/{backend_name}/models/available")
+async def get_tts_backend_available_models(backend_name: str):
+    """Get available models for a TTS backend."""
+    if not service_manager.tts_service:
+        raise HTTPException(
+            status_code=503,
+            detail="TTS service not initialized"
+        )
+    
+    try:
+        from ...services.model_catalog import get_piper_voices, get_kokoro_model
+        
+        if backend_name == "piper":
+            models = get_piper_voices()
+            return {"models": models}
+        elif backend_name == "kokoro":
+            model = get_kokoro_model()
+            return {"models": [model]}
+        else:
+            # For other backends, return empty or check if they have a method
+            backend = service_manager.tts_service.manager.get_backend(backend_name)
+            if backend and hasattr(backend, 'get_available_models'):
+                models = backend.get_available_models()
+                return {"models": models}
+            else:
+                return {"models": []}
+    except Exception as e:
+        logger.error(f"Error getting available TTS models: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting available TTS models: {str(e)}"
+        ) from e
+
+
+@router.get("/api/voice/tts/memory")
+async def get_tts_memory():
+    """Get memory usage for all TTS backends."""
+    # Return default response if TTS service not initialized (graceful degradation)
+    if not service_manager.tts_service:
+        return {
+            "backends": {
+                "piper": {
+                    "total_memory_mb": 0,
+                    "model_memory_mb": 0,
+                    "base_memory_mb": 0
+                },
+                "kokoro": {
+                    "total_memory_mb": 0,
+                    "model_memory_mb": 0,
+                    "base_memory_mb": 0
+                },
+                "chatterbox": {
+                    "total_memory_mb": 0,
+                    "model_memory_mb": 0,
+                    "base_memory_mb": 0
+                }
+            },
+            "total_memory_mb": 0,
+            "total_model_memory_mb": 0
+        }
+    
+    try:
+        memory_usage = {}
+        total_memory_mb = 0
+        total_model_memory_mb = 0
+        
+        for backend_name, backend in service_manager.tts_service.manager.backends.items():
+            if hasattr(backend, 'get_memory_usage'):
+                memory = backend.get_memory_usage()
+                memory_usage[backend_name] = memory
+                total_memory_mb += memory.get("total_memory_mb", 0)
+                total_model_memory_mb += memory.get("model_memory_mb", 0)
+            else:
+                memory_usage[backend_name] = {
+                    "total_memory_mb": 0,
+                    "model_memory_mb": 0,
+                    "base_memory_mb": 0,
+                    "message": "Memory tracking not available"
+                }
+        
+        return {
+            "backends": memory_usage,
+            "total_memory_mb": round(total_memory_mb, 2),
+            "total_model_memory_mb": round(total_model_memory_mb, 2)
+        }
+    except Exception as e:
+        logger.error(f"Error getting TTS memory usage: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting TTS memory usage: {str(e)}"
+        ) from e
+
+
+@router.post("/api/voice/tts/backends/piper/model/switch")
+async def switch_piper_model(request: Dict[str, str], response: Response):
+    """Switch Piper TTS model (voice)."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    
+    if not service_manager.tts_service:
+        return {
+            "status": "error",
+            "message": "TTS service not initialized"
+        }
+    
+    model_id = request.get("model_id")
+    if not model_id:
+        raise HTTPException(
+            status_code=400,
+            detail="model_id is required"
+        )
+    
+    try:
+        backend = service_manager.tts_service.manager.get_backend("piper")
+        if not backend:
+            raise HTTPException(
+                status_code=404,
+                detail="Piper backend not found"
+            )
+        
+        # Check if backend has switch_model method
+        if hasattr(backend, 'switch_model'):
+            success = await backend.switch_model(model_id)
+            if success:
+                return {
+                    "status": "success",
+                    "message": f"Switched to Piper model: {model_id}",
+                    "model_id": model_id
+                }
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to switch to model: {model_id}"
+                )
+        else:
+            raise HTTPException(
+                status_code=501,
+                detail="Model switching not implemented for Piper backend"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error switching Piper model: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error switching Piper model: {str(e)}"
+        ) from e
+
+
+@router.post("/api/voice/tts/backends/chatterbox/voices/upload")
+async def upload_chatterbox_voice(
+    file: UploadFile = File(...),
+    name: Optional[str] = Form(None),
+    response: Response = None
+):
+    """Upload a voice file for Chatterbox TTS."""
+    if response:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+    
+    if not service_manager.tts_service:
+        raise HTTPException(
+            status_code=503,
+            detail="TTS service not initialized"
+        )
+    
+    # Validate file type
+    allowed_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.ogg'}
+    file_ext = Path(file.filename).suffix.lower() if file.filename else ''
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}"
+        )
+    
+    # Generate voice name if not provided
+    if not name:
+        name = Path(file.filename).stem if file.filename else "voice"
+    
+    # Sanitize name
+    name = "".join(c for c in name if c.isalnum() or c in ('-', '_')).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Invalid voice name")
+    
+    try:
+        # Use the existing upload endpoint logic
+        chatterbox_dir = settings.base_dir.parent.parent / "services" / "tts-chatterbox"
+        voices_dir = chatterbox_dir / "voices"
+        voices_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save file
+        output_filename = f"{name}{file_ext}"
+        output_path = voices_dir / output_filename
+        
+        # Read file content
+        content = await file.read()
+        
+        # Validate file size (max 10MB)
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail="File size exceeds 10MB limit"
+            )
+        
+        # Write file
+        with open(output_path, "wb") as f:
+            f.write(content)
+        
+        # If Chatterbox service is running, trigger voice reload
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post("http://localhost:4123/voices/reload")
+        except Exception as e:
+            logger.warning(f"Could not reload Chatterbox voices: {e}")
+        
+        return {
+            "status": "success",
+            "message": f"Voice '{name}' uploaded successfully",
+            "voice_id": name,
+            "path": str(output_path),
+            "filename": output_filename
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading voice: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error uploading voice: {str(e)}"
+        ) from e
+
+
+@router.get("/api/voice/tts/backends/chatterbox/voices/custom")
+async def get_chatterbox_custom_voices(response: Response):
+    """Get list of custom voices uploaded to Chatterbox."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    
+    if not service_manager.tts_service:
+        return {
+            "voices": [],
+            "status": "not_initialized",
+            "message": "TTS service not initialized"
+        }
+    
+    try:
+        # Try to get voices from Chatterbox API
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                api_response = await client.get("http://localhost:4123/v1/voices")
+                if api_response.status_code == 200:
+                    data = api_response.json()
+                    voices = data.get("voices", [])
+                    return {
+                        "voices": voices,
+                        "status": "success",
+                        "count": len(voices)
+                    }
+            except Exception as e:
+                logger.debug(f"Could not fetch from Chatterbox API: {e}")
+        
+        # Fallback: scan voices directory directly
+        chatterbox_dir = settings.base_dir.parent.parent / "services" / "tts-chatterbox"
+        voices_dir = chatterbox_dir / "voices"
+        
+        custom_voices = []
+        if voices_dir.exists():
+            for voice_file in voices_dir.glob("*"):
+                if voice_file.is_file() and voice_file.suffix.lower() in {'.wav', '.mp3', '.flac', '.m4a', '.ogg'}:
+                    custom_voices.append({
+                        "name": voice_file.stem,
+                        "filename": voice_file.name,
+                        "path": str(voice_file),
+                        "file_size": voice_file.stat().st_size
+                    })
+        
+        return {
+            "voices": custom_voices,
+            "status": "success",
+            "count": len(custom_voices)
+        }
+    except Exception as e:
+        logger.error(f"Error getting custom voices: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting custom voices: {str(e)}"
+        ) from e
+
+
+@router.delete("/api/voice/tts/backends/chatterbox/voices/{voice_name}")
+async def delete_chatterbox_voice(voice_name: str, response: Response):
+    """Delete a custom voice from Chatterbox."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    
+    if not service_manager.tts_service:
+        raise HTTPException(
+            status_code=503,
+            detail="TTS service not initialized"
+        )
+    
+    # Sanitize voice name
+    voice_name = "".join(c for c in voice_name if c.isalnum() or c in ('-', '_')).strip()
+    if not voice_name:
+        raise HTTPException(status_code=400, detail="Invalid voice name")
+    
+    try:
+        # Try to delete via Chatterbox API first
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                api_response = await client.delete(f"http://localhost:4123/v1/voices/{voice_name}")
+                if api_response.status_code == 200:
+                    return {
+                        "status": "success",
+                        "message": f"Voice '{voice_name}' deleted successfully"
+                    }
+            except Exception as e:
+                logger.debug(f"Could not delete via Chatterbox API: {e}")
+        
+        # Fallback: delete file directly
+        chatterbox_dir = settings.base_dir.parent.parent / "services" / "tts-chatterbox"
+        voices_dir = chatterbox_dir / "voices"
+        
+        # Try different file extensions
+        deleted = False
+        for ext in ['.wav', '.mp3', '.flac', '.m4a', '.ogg']:
+            voice_path = voices_dir / f"{voice_name}{ext}"
+            if voice_path.exists():
+                voice_path.unlink()
+                deleted = True
+                break
+        
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice '{voice_name}' not found"
+            )
+        
+        # Trigger voice reload
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post("http://localhost:4123/voices/reload")
+        except Exception as e:
+            logger.warning(f"Could not reload Chatterbox voices: {e}")
+        
+        return {
+            "status": "success",
+            "message": f"Voice '{voice_name}' deleted successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting voice: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error deleting voice: {str(e)}"
+        ) from e

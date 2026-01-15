@@ -2,6 +2,7 @@
 
 import { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
 import { api } from '@/lib/api';
+import { useWebSocketEvent } from '@/contexts/WebSocketContext';
 
 export interface AppSettings {
   model_loaded?: boolean;
@@ -48,6 +49,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     try {
       setIsLoading(true);
       setError(null);
+      // API client will automatically use WebSocket if available, fallback to HTTP
       const data = await api.getSettings() as AppSettings;
       setSettings(data);
     } catch (err) {
@@ -73,13 +75,29 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     }
   }, []); // Remove settings dependency to prevent infinite loops
 
-  useEffect(() => {
-    // Initial load
+  // Subscribe to WebSocket events for real-time updates
+  useWebSocketEvent('settings_updated', (payload) => {
+    if (payload) {
+      setSettings(payload);
+      setError(null);
+      setIsLoading(false);
+    }
+  });
+
+  // Subscribe to model loaded/unloaded events
+  useWebSocketEvent('model_loaded', () => {
+    // Refresh settings to get updated model status
     refresh();
-    
-    // Refresh settings every 30 seconds to keep in sync
-    const interval = setInterval(refresh, 30000);
-    return () => clearInterval(interval);
+  });
+
+  useWebSocketEvent('model_unloaded', () => {
+    // Refresh settings to get updated model status
+    refresh();
+  });
+
+  useEffect(() => {
+    // Initial load only - then rely on WebSocket events
+    refresh();
   }, [refresh]);
 
   // Computed values

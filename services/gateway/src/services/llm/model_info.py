@@ -15,6 +15,13 @@ import json
 import logging
 import time
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    np = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -354,6 +361,88 @@ class ModelInfoExtractor:
             embd_key = f"{arch_key}.embedding_length"
             if embd_key in reader.fields:
                 info["hidden_size"] = int(reader.fields[embd_key].parts[-1][0])
+            
+            # Extract chat template from GGUF metadata
+            # Try multiple possible keys for chat template
+            chat_template_keys = [
+                "tokenizer.chat_template",
+                "tokenizer.chat.template",
+                "general.chat_template",
+                "chat_template",
+            ]
+            
+            chat_template = None
+            for key in chat_template_keys:
+                if key in reader.fields:
+                    logger.debug(f"Found chat_template key: {key}")
+                    try:
+                        field_value = reader.fields[key]
+                        logger.debug(f"Field value type: {type(field_value)}")
+                        # Extract string value from GGUF field
+                        # GGUF fields can have different structures
+                        if hasattr(field_value, 'parts') and field_value.parts:
+                            # Get the last part (usually contains the actual data)
+                            last_part = field_value.parts[-1]
+                            logger.debug(f"Last part type: {type(last_part)}, hasattr numpy: {HAS_NUMPY}")
+                            if HAS_NUMPY:
+                                logger.debug(f"Is numpy array: {isinstance(last_part, np.ndarray)}")
+                                if isinstance(last_part, np.ndarray):
+                                    logger.debug(f"  dtype: {last_part.dtype}, shape: {last_part.shape}")
+                            
+                            # Handle different data types
+                            if isinstance(last_part, bytes):
+                                chat_template = last_part.decode("utf-8")
+                            elif isinstance(last_part, str):
+                                chat_template = last_part
+                            else:
+                                # Try to handle numpy arrays, memmaps, lists, tuples
+                                try:
+                                    if HAS_NUMPY:
+                                        # Check if it's a numpy array (including memmap)
+                                        # memmap is a subclass of ndarray, so this should work
+                                        if isinstance(last_part, np.ndarray):
+                                            logger.debug(f"Found numpy array for {key}: dtype={last_part.dtype}, shape={last_part.shape}")
+                                            # Convert numpy array to bytes
+                                            if last_part.dtype == np.uint8:
+                                                chat_template = bytes(last_part).decode("utf-8")
+                                            else:
+                                                # Convert to uint8 first
+                                                chat_template = bytes(last_part.astype(np.uint8)).decode("utf-8")
+                                        elif isinstance(last_part, (list, tuple)) and len(last_part) > 0:
+                                            # List/tuple of bytes or ints
+                                            if isinstance(last_part[0], bytes):
+                                                chat_template = b''.join(last_part).decode("utf-8")
+                                            elif isinstance(last_part[0], (int, np.integer)):
+                                                chat_template = bytes(last_part).decode("utf-8")
+                                            else:
+                                                # Try to decode as bytes anyway
+                                                chat_template = bytes(last_part).decode("utf-8")
+                                    else:
+                                        # No numpy - try to handle as list/tuple
+                                        if isinstance(last_part, (list, tuple)) and len(last_part) > 0:
+                                            if isinstance(last_part[0], bytes):
+                                                chat_template = b''.join(last_part).decode("utf-8")
+                                            elif isinstance(last_part[0], int):
+                                                chat_template = bytes(last_part).decode("utf-8")
+                                            else:
+                                                chat_template = ''.join(str(x) for x in last_part)
+                                except (ValueError, UnicodeDecodeError, TypeError, AttributeError) as e:
+                                    logger.debug(f"Error decoding array field {key}: {e}")
+                                    # Try alternative: convert to string
+                                    try:
+                                        chat_template = ''.join(str(x) for x in last_part) if hasattr(last_part, '__iter__') else str(last_part)
+                                    except:
+                                        pass
+                            
+                            if chat_template:
+                                logger.debug(f"Extracted chat template from GGUF key: {key} (length: {len(chat_template)})")
+                                break
+                    except (ValueError, IndexError, KeyError, TypeError, AttributeError, UnicodeDecodeError) as e:
+                        logger.debug(f"Error extracting chat template from key {key}: {e}")
+                        continue
+            
+            if chat_template:
+                info["chat_template"] = chat_template
                 
             return info
             
@@ -396,6 +485,27 @@ class ModelInfoExtractor:
         
         model_path = self.models_dir / model_name
         
+        # If model_path doesn't exist, try to find it recursively
+        if not model_path.exists():
+            # Search for the file recursively in models_dir
+            found_files = list(self.models_dir.glob(f"**/{model_name}"))
+            if found_files:
+                model_path = found_files[0]
+                logger.debug(f"Found model file at: {model_path}")
+        
+        # Check for cached metadata in model_info.json first
+        metadata_file = model_path.parent / "model_info.json" if model_path.is_file() else model_path / "model_info.json"
+        cached_tool_calling = None
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    cached_metadata = json.load(f)
+                    cached_tool_calling = cached_metadata.get("tool_calling")
+                    if cached_tool_calling:
+                        logger.debug(f"Found cached tool calling info in {metadata_file}")
+            except Exception as e:
+                logger.debug(f"Could not read cached metadata: {e}")
+        
         # Load config if available (for HF models)
         config = None
         if model_path.is_dir():
@@ -411,8 +521,7 @@ class ModelInfoExtractor:
         # Only fetch if we didn't get info from GGUF and don't have local config
         hf_config = None
         if not config and not gguf_info:
-            # Check for model_info.json to get repo_id
-            metadata_file = model_path.parent / "model_info.json" if model_path.is_file() else model_path / "model_info.json"
+            # Check for model_info.json to get repo_id (already loaded above)
             if metadata_file.exists():
                 try:
                     with open(metadata_file, 'r', encoding='utf-8') as f:
@@ -483,6 +592,56 @@ class ModelInfoExtractor:
             if total_size > 0:
                 file_size_gb = total_size / (1024 ** 3)
         
+        # Detect tool calling support - use cached if available, otherwise detect
+        tool_calling_info = cached_tool_calling
+        if not tool_calling_info:
+            chat_template = gguf_info.get("chat_template")
+            if chat_template:
+                from .tool_calling_detector import detect_tool_calling_from_chat_template
+                supports, suggested_format = detect_tool_calling_from_chat_template(chat_template)
+                tool_calling_info = {
+                    "supports_tool_calling": supports,
+                    "suggested_chat_format": suggested_format,
+                    "detection_method": "chat_template",
+                    "chat_template_length": len(chat_template)
+                }
+            else:
+                # Fallback to pattern matching if no chat template
+                from .tool_calling_detector import detect_tool_calling_from_metadata
+                supports, suggested_format = detect_tool_calling_from_metadata(
+                    model_id=str(model_path),
+                    model_name=model_name,
+                    architecture=architecture,
+                    tags=None,
+                    repo_id=None,
+                    remote_fetch=False,
+                    chat_template=None
+                )
+                tool_calling_info = {
+                    "supports_tool_calling": supports,
+                    "suggested_chat_format": suggested_format,
+                    "detection_method": "pattern_matching"
+                }
+            
+            # Save tool calling info to model_info.json for future use
+            if tool_calling_info and model_path.is_file():
+                try:
+                    if metadata_file.exists():
+                        with open(metadata_file, 'r', encoding='utf-8') as f:
+                            metadata = json.load(f)
+                    else:
+                        metadata = {}
+                    
+                    metadata["tool_calling"] = tool_calling_info
+                    
+                    with open(metadata_file, 'w', encoding='utf-8') as f:
+                        json.dump(metadata, f, indent=2, ensure_ascii=False)
+                    
+                    logger.debug(f"Saved tool calling info to {metadata_file}")
+                except Exception as e:
+                    logger.debug(f"Could not save tool calling info to {metadata_file}: {e}")
+        
+        # Store chat_template in result for potential saving
         result = {
             "name": model_name,
             "architecture": architecture,
@@ -497,7 +656,9 @@ class ModelInfoExtractor:
                 "recommended": min(context_length, 4096),  # Recommend 4K for most use cases
             },
             "moe": moe_info,
-            "config": config
+            "config": config,
+            "chat_template": gguf_info.get("chat_template"),  # Chat template from GGUF metadata
+            "tool_calling": tool_calling_info  # Tool calling detection results
         }
         
         # Cache the result
@@ -506,6 +667,96 @@ class ModelInfoExtractor:
             self._cache_timestamps[model_name] = time.time()
         
         return result
+    
+    def extract_and_save_template(self, model_name: str, force: bool = False, repo_id: Optional[str] = None) -> Optional[Path]:
+        """Extract chat template from GGUF and save as .jinja file.
+        
+        If template is not found in GGUF metadata, attempts to fetch from HuggingFace
+        using the get_chat_template utility.
+        
+        Args:
+            model_name: Name of the model (folder name or file name)
+            force: If True, overwrite existing template file
+            repo_id: Optional HuggingFace repo ID to fetch template from (if not in GGUF)
+            
+        Returns:
+            Path to saved template file, or None if extraction/saving failed
+        """
+        # Extract model info (this includes chat_template)
+        model_info = self.extract_info(model_name, use_cache=True)
+        chat_template = model_info.get("chat_template")
+        
+        # If no template found in GGUF, try fetching from HuggingFace
+        if not chat_template:
+            logger.debug(f"No chat template found in GGUF metadata for {model_name}, attempting to fetch from HuggingFace...")
+            
+            # Get repo_id from parameter or try to find it in metadata
+            if not repo_id:
+                model_path = self.models_dir / model_name
+                if not model_path.exists():
+                    found_files = list(self.models_dir.glob(f"**/{model_name}"))
+                    if found_files:
+                        model_path = found_files[0]
+                
+                metadata_file = model_path.parent / "model_info.json" if model_path.is_file() else model_path / "model_info.json"
+                if metadata_file.exists():
+                    try:
+                        with open(metadata_file, 'r', encoding='utf-8') as f:
+                            metadata = json.load(f)
+                            repo_id = metadata.get("repo_id")
+                            if repo_id:
+                                logger.debug(f"Found repo_id {repo_id} in metadata, fetching template from HuggingFace...")
+                    except Exception as e:
+                        logger.debug(f"Could not read metadata to get repo_id: {e}")
+            
+            # Try to fetch template from HuggingFace
+            if repo_id:
+                try:
+                    from ...utils.get_chat_template import get_chat_template
+                    chat_template = get_chat_template(repo_id)
+                    logger.info(f"✓ Successfully fetched chat template from HuggingFace for {repo_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch chat template from HuggingFace for {repo_id}: {e}")
+                    return None
+            else:
+                logger.debug(f"No repo_id available to fetch template from HuggingFace for {model_name}")
+            return None
+        
+        # Determine model path and template file path
+        model_path = self.models_dir / model_name
+        if not model_path.exists():
+            found_files = list(self.models_dir.glob(f"**/{model_name}"))
+            if found_files:
+                model_path = found_files[0]
+            else:
+                logger.warning(f"Model path not found: {model_name}")
+                return None
+        
+        # Template file should be in the same directory as the model
+        if model_path.is_file():
+            template_dir = model_path.parent
+            template_filename = model_path.stem + ".jinja"
+        else:
+            template_dir = model_path
+            template_filename = model_name + ".jinja"
+        
+        template_file = template_dir / template_filename
+        
+        # Check if template file already exists
+        if template_file.exists() and not force:
+            logger.debug(f"Template file already exists: {template_file}")
+            return template_file
+        
+        # Save template to file
+        try:
+            template_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(template_file, 'w', encoding='utf-8') as f:
+                f.write(chat_template)
+            logger.info(f"✓ Saved chat template to: {template_file}")
+            return template_file
+        except Exception as e:
+            logger.error(f"Failed to save chat template to {template_file}: {e}")
+            return None
     
     def clear_cache(self, model_name: Optional[str] = None):
         """Clear model info cache.

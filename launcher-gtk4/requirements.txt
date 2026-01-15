@@ -1,0 +1,11 @@
+# Launcher dependencies are now in the main requirements.txt
+# This file is kept for reference but dependencies should be installed
+# from the main requirements.txt in the project root
+# 
+# Main dependencies:
+# - PyGObject>=4.0.0 (for GTK4)
+# - psutil>=5.9.0 (for process management)
+#
+# Install from main requirements.txt:
+#   pip install -r ../requirements.txt
+

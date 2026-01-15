@@ -1,7 +1,7 @@
-"""Sampler settings for LLM generation with llama-cpp-python server.
+"""Sampler settings for LLM generation with OpenAI-compatible server.
 
 These settings control text generation behavior and match the parameters
-accepted by the llama-cpp-python server's OpenAI-compatible API.
+accepted by the OpenAI-compatible server API.
 
 See: https://llama-cpp-python.readthedocs.io/en/latest/api-reference/
 """
@@ -19,10 +19,10 @@ from .sampler_blocks import (
 
 @dataclass
 class SamplerSettings:
-    """Complete sampler configuration for llama-cpp-python server.
+    """Complete sampler configuration for OpenAI-compatible server.
     
     These parameters control text generation and are passed to the
-    /v1/chat/completions or /v1/completions endpoints.
+    /v1/chat/completions endpoint.
     """
     
     # Basic sampling parameters
@@ -110,10 +110,17 @@ class SamplerSettings:
     n_probs: Optional[int] = None
     """Return top N token probabilities (for debugging)."""
     
+    # Smooth Sampling - quadratic/cubic probability distribution transformation
+    smoothing_factor: float = 0.0
+    """Smoothing factor (0.0-1.0). Lower values (0.2-0.3) = more creative. 0.0 = disabled."""
+    
+    smoothing_curve: float = 1.0
+    """Smoothing curve (1.0+). Higher values = steeper curve, punishes low probability choices more aggressively. 1.0 = equivalent to only using smoothing_factor."""
+    
     def __post_init__(self):
         """Initialize default stop sequences if not provided."""
         if self.stop is None:
-            self.stop = []
+            self.stop = ["\n*{{user}}", "\n{{user}}", "{{user}}:", "User:"]
     
     def to_api_params(self) -> Dict[str, Any]:
         """Convert to parameters for the llama-cpp-python API.
@@ -209,7 +216,8 @@ class SamplerSettings:
             "typical_p", "tfs_z",
             "mirostat_mode", "mirostat_tau", "mirostat_eta",
             "max_tokens", "stop", "seed", "stream", "grammar",
-            "logit_bias", "penalty_range", "penalty_alpha", "n_probs"
+            "logit_bias", "penalty_range", "penalty_alpha", "n_probs",
+            "smoothing_factor", "smoothing_curve"  # Smooth Sampling
         }
         filtered = {k: v for k, v in data.items() if k in valid_fields and v is not None}
         return cls(**filtered)

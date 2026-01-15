@@ -1,5 +1,6 @@
 """FastAPI application entry point."""
 import os
+import sys
 import logging
 import platform
 import asyncio
@@ -103,9 +104,7 @@ from .api.routes import router
 import_time = time.time() - import_start
 logger.info("API routes imported (took %.2fs)", import_time)
 
-logger.info("Importing WebSocket router...")
-from .api.websocket import ws_router
-logger.info("WebSocket router imported")
+# WebSocket router is included via api.routes
 
 # Create FastAPI app
 logger.info("Creating FastAPI app...")
@@ -179,10 +178,20 @@ app.add_middleware(
 # Add exception handler to ensure CORS headers on error responses
 @app.exception_handler(StarletteHTTPException)
 async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    """Handle HTTP exceptions with CORS headers."""
+    """Handle HTTP exceptions with CORS headers and logs."""
+    from .utils.request_logger import get_request_log_store
+    
+    # Get logs if available
+    log_store = get_request_log_store()
+    logs = log_store.get_logs() if log_store else None
+    
+    content = {"detail": exc.detail}
+    if logs:
+        content["logs"] = logs
+    
     return JSONResponse(
         status_code=exc.status_code,
-        content={"detail": exc.detail},
+        content=content,
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "*",
@@ -192,12 +201,23 @@ async def custom_http_exception_handler(request: Request, exc: StarletteHTTPExce
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Handle all uncaught exceptions with CORS headers."""
+    """Global exception handler that includes logs in error responses."""
+    from .utils.request_logger import get_request_log_store
+    
+    # Get logs if available
+    log_store = get_request_log_store()
+    logs = log_store.get_logs() if log_store else None
+    
     import traceback
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    
+    content = {"detail": f"Internal server error: {str(exc)}"}
+    if logs:
+        content["logs"] = logs
+    
     return JSONResponse(
         status_code=500,
-        content={"detail": f"Internal server error: {str(exc)}"},
+        content=content,
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "*",
@@ -214,24 +234,79 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         "/api/voice/tts/settings",
         "/api/conversations",
         "/health",
+        "/api/downloads",  # Frequently polled by frontend
+        "/api/system/status",  # Frequently polled by frontend
+        "/api/services/status",  # Frequently polled by frontend
+        "/api/models",  # Frequently polled by frontend
     ]
+    
+    def __init__(self, app, enable_logging: bool = True):
+        super().__init__(app)
+        self.enable_logging = enable_logging
+        self.log_handler = None
+        if enable_logging:
+            from .utils.request_logger import RequestScopedLogHandler, create_request_log_store, set_request_log_store
+            self.RequestScopedLogHandler = RequestScopedLogHandler
+            self.create_request_log_store = create_request_log_store
+            self.set_request_log_store = set_request_log_store
     
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
         
+        # Check if client wants logs (via header or query param)
+        include_logs = (
+            request.headers.get("X-Include-Logs", "").lower() == "true" or
+            request.query_params.get("include_logs", "").lower() == "true"
+        )
+        
+        # Set up request-scoped logging if enabled and requested
+        log_store = None
+        log_handler = None
+        if self.enable_logging and include_logs and settings.enable_request_logging:
+            log_store = self.create_request_log_store(max_logs=settings.max_logs_per_request)
+            self.set_request_log_store(log_store)
+            
+            # Create and attach log handler
+            log_handler = self.RequestScopedLogHandler(max_logs=settings.max_logs_per_request)
+            # Set log level based on settings
+            if settings.include_debug_logs:
+                log_handler.setLevel(logging.DEBUG)
+            else:
+                log_handler.setLevel(logging.INFO)
+            
+            # Add handler to root logger to capture all logs
+            root_logger = logging.getLogger()
+            root_logger.addHandler(log_handler)
+        
         # Completely suppress logging for quiet paths
         is_quiet = any(path.startswith(quiet_path) for quiet_path in self.QUIET_PATHS)
-        if is_quiet:
-            # Just process the request without any logging
-            return await call_next(request)
+        if not is_quiet:
+            # For other paths, log normally
+            logger = logging.getLogger(__name__)
+            logger.info("%s %s", request.method, path)
         
-        # For other paths, log normally
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info("%s %s", request.method, path)
-        response = await call_next(request)
-        logger.info("%s %s -> %s", request.method, path, response.status_code)
-        return response
+        try:
+            response = await call_next(request)
+            
+            if not is_quiet:
+                logger.info("%s %s -> %s", request.method, path, response.status_code)
+            
+            # Attach logs to response if available
+            if log_store and log_store.logs:
+                # Add log summary to headers
+                summary = log_store.get_summary()
+                response.headers["X-Logs-Summary"] = str(summary)
+                response.headers["X-Logs-Count"] = str(len(log_store.logs))
+            
+            return response
+        finally:
+            # Clean up log handler
+            if log_handler:
+                root_logger = logging.getLogger()
+                root_logger.removeHandler(log_handler)
+            # Clear request log store
+            if log_store:
+                self.set_request_log_store(None)
 
 # Always enable request logging
 app.add_middleware(RequestLoggingMiddleware)
@@ -244,7 +319,7 @@ app.add_middleware(RequestLoggingMiddleware)
 app.include_router(router, tags=["api"])
 from .api import upload
 app.include_router(upload.router, tags=["voice"])
-app.include_router(ws_router, tags=["websocket"])
+# WebSocket router is included via api.routes
 
 # Log registered routes - always enabled
 import_time = time.time() - startup_start
@@ -277,6 +352,7 @@ if False and frontend_path.exists() and not frontend_next_path.exists():
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup."""
+    # Debug logging removed - use standard logger instead
     startup_start_time = time.time()
     
     # Set asyncio exception handler on Windows to suppress connection errors
@@ -321,12 +397,14 @@ async def startup_event():
     logger.info(f"Health check: http://{settings.host}:{settings.port}/health")
     logger.info(f"API docs: http://{settings.host}:{settings.port}/docs")
     logger.info("=" * 60)
+    # Debug logging removed - use standard logger instead
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
     import logging
+    import signal
     logger = logging.getLogger(__name__)
     logger.info("=" * 60)
     logger.info("SHUTDOWN: Initiating graceful shutdown")
@@ -342,3 +420,47 @@ async def shutdown_event():
         logger.info("=" * 60)
         logger.info("Shutdown complete")
         logger.info("=" * 60)
+
+# Register signal handlers for cleanup on SIGTERM/SIGINT
+def setup_signal_handlers():
+    """Setup signal handlers to cleanup processes on exit."""
+    import signal
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, initiating cleanup...")
+        from .services.service_manager import service_manager
+        
+        # Try to cleanup LLM server process synchronously
+        try:
+            if service_manager.llm_manager and hasattr(service_manager.llm_manager, 'server_manager'):
+                if service_manager.llm_manager.server_manager.process:
+                    logger.info("Killing LLM server process...")
+                    try:
+                        service_manager.llm_manager.server_manager.process.terminate()
+                        service_manager.llm_manager.server_manager.process.wait(timeout=2)
+                    except Exception:
+                        try:
+                            service_manager.llm_manager.server_manager.process.kill()
+                            service_manager.llm_manager.server_manager.process.wait(timeout=1)
+                        except Exception:
+                            pass
+                    logger.info("✓ LLM server process terminated")
+        except Exception as e:
+            logger.error(f"Error in signal handler cleanup: {e}", exc_info=True)
+        finally:
+            # Exit after cleanup
+            sys.exit(0)
+    
+    # Register handlers for SIGTERM and SIGINT (only on Unix-like systems)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, signal_handler)
+    if hasattr(signal, 'SIGINT'):
+        signal.signal(signal.SIGINT, signal_handler)
+
+# Setup signal handlers on module load
+try:
+    setup_signal_handlers()
+except Exception as e:
+    logger.warning(f"Could not setup signal handlers: {e}")

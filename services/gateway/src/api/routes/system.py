@@ -9,6 +9,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["system"])
 
 
+def _detect_gpu_layers() -> int:
+    """Detect GPU layers availability (replaces loader._gpu_layers)."""
+    try:
+        from llama_cpp import llama_cpp
+        has_cuda = hasattr(llama_cpp, 'llama_supports_gpu_offload') or hasattr(llama_cpp, 'llama_gpu_offload')
+        return -1 if has_cuda else 0
+    except ImportError:
+        return 0
+
+
 @router.get("/api/services/status")
 async def get_services_status():
     """Get real-time status for all services from cached polling data."""
@@ -69,11 +79,20 @@ async def get_system_info():
     except Exception as e:
         gpu_info = {"available": False, "reason": str(e)}
     
+    system_name = "unknown"
+    if hasattr(os, 'uname'):
+        try:
+            uname = os.uname()
+            # os.uname() returns a named tuple with: sysname, nodename, release, version, machine
+            system_name = uname.sysname if hasattr(uname, 'sysname') else str(uname[0]) if len(uname) > 0 else "unknown"
+        except Exception:
+            system_name = "unknown"
+    
     return {
         "cpu_count": cpu_count,
         "cpu_threads_available": cpu_count,
         "platform": os.name,
-        "system": os.uname().system if hasattr(os, 'uname') else "unknown",
+        "system": system_name,
         "gpu": gpu_info
     }
 
@@ -82,13 +101,18 @@ async def get_system_info():
 async def get_system_status():
     """Get real-time system status including per-service RAM/VRAM usage."""
     from ...services.system_monitor import system_monitor
-    return system_monitor.get_status()
+    status = system_monitor.get_status()
+    
+    # Add model memory breakdown
+    if service_manager:
+        model_memory = service_manager.get_service_memory_usage()
+        status["model_memory"] = model_memory
+    
+    return status
 
 
-@router.get("/api/debug/info")
-async def get_debug_info():
-    """Get debug information about system status."""
-    logger.info("GET /api/debug/info - Fetching debug information")
+async def _get_debug_info_internal():
+    """Internal function to get debug info (used by both API and WebSocket broadcasts)."""
     debug_info = {
         "services": {},
         "model": {},
@@ -96,21 +120,62 @@ async def get_debug_info():
         "conversations": {}
     }
     
+    # Enhanced service status with initialization details
     debug_info["services"] = {
-        "llm_manager": service_manager.llm_manager is not None,
-        "chat_manager": service_manager.chat_manager is not None,
-        "memory_store": service_manager.memory_store is not None,
-        "tool_manager": service_manager.tool_manager is not None,
-        "stt_service": service_manager.stt_service is not None,
-        "tts_service": service_manager.tts_service is not None
+        "llm_manager": {
+            "initialized": service_manager.llm_manager is not None,
+            "status": "ready" if service_manager.llm_manager and service_manager.llm_manager.is_model_loaded() else ("initialized" if service_manager.llm_manager else "not_initialized")
+        },
+        "chat_manager": {
+            "initialized": service_manager.chat_manager is not None,
+            "status": "ready" if service_manager.chat_manager else "not_initialized"
+        },
+        "memory_store": {
+            "initialized": service_manager.memory_store is not None,
+            "status": "ready" if service_manager.memory_store else "not_initialized"
+        },
+        "tool_manager": {
+            "initialized": service_manager.tool_manager is not None,
+            "status": "ready" if service_manager.tool_manager else "not_initialized"
+        },
+        "stt_service": {
+            "initialized": service_manager.stt_service is not None,
+            "status": "ready" if service_manager.stt_service and service_manager.stt_service._initialized else ("initialized" if service_manager.stt_service else "not_initialized"),
+            "provider": service_manager.stt_service.provider if service_manager.stt_service else None,
+            "model_size": service_manager.stt_service._current_model_size if service_manager.stt_service else None
+        },
+        "tts_service": {
+            "initialized": service_manager.tts_service is not None,
+            "status": "ready" if service_manager.tts_service else "not_initialized",
+            "backends": {}
+        }
     }
+    
+    # Add TTS backend details
+    if service_manager.tts_service:
+        try:
+            backends_list = service_manager.tts_service.manager.get_available_backends()
+            # get_available_backends() returns a list of dicts, not a dict
+            for backend_info in backends_list:
+                if isinstance(backend_info, dict):
+                    backend_name = backend_info.get("name", "unknown")
+                    debug_info["services"]["tts_service"]["backends"][backend_name] = {
+                        "available": True,
+                        "is_ready": backend_info.get("is_ready", False),
+                        "is_current": backend_info.get("is_current", False),
+                        "error_message": backend_info.get("error_message"),
+                        "status": backend_info.get("status", "unknown")
+                    }
+        except Exception as e:
+            logger.error(f"Error getting TTS backend info: {e}", exc_info=True)
+            debug_info["services"]["tts_service"]["backends_error"] = str(e)
     
     if service_manager.llm_manager:
         sampler_settings = service_manager.llm_manager.get_settings()
         debug_info["model"] = {
             "loaded": service_manager.llm_manager.is_model_loaded(),
             "current_model": service_manager.llm_manager.get_current_model_path(),
-            "gpu_layers": getattr(service_manager.llm_manager.loader, '_gpu_layers', 0) if hasattr(service_manager.llm_manager, 'loader') else 0,
+            "gpu_layers": _detect_gpu_layers(),
             "last_request_time": getattr(service_manager.llm_manager, '_last_request_time', None),
             "last_request_info": getattr(service_manager.llm_manager, '_last_request_info', None),
             "sampler_settings": sampler_settings
@@ -141,6 +206,44 @@ async def get_debug_info():
             }
     
     return debug_info
+
+
+@router.get("/api/debug/info")
+async def get_debug_info():
+    """Get debug information about system status."""
+    # Removed verbose logging - this endpoint is called frequently
+    return await _get_debug_info_internal()
+
+
+@router.get("/api/debug/llm-logs")
+async def get_llm_debug_logs(limit: int = 50):
+    """Get recent LLM request/response logs for debugging.
+    
+    Args:
+        limit: Maximum number of logs to return (default: 50, max: 100)
+    
+    Returns:
+        List of LLM request/response logs with full payloads
+    """
+    from ...services.llm.debug_logger import get_llm_logs
+    
+    limit = min(limit, 100)  # Cap at 100
+    logs = get_llm_logs(limit=limit)
+    
+    return {
+        "logs": logs,
+        "count": len(logs),
+        "limit": limit
+    }
+
+
+@router.delete("/api/debug/llm-logs")
+async def clear_llm_debug_logs():
+    """Clear all stored LLM debug logs."""
+    from ...services.llm.debug_logger import clear_llm_logs
+    
+    clear_llm_logs()
+    return {"message": "LLM debug logs cleared"}
 
 
 @router.post("/api/reset")
